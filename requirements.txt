@@ -1,0 +1,33 @@
+# Database
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.4
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+
+# Seed connectors
+PyMySQL>=1.1.0
+
+# API framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+slowapi>=0.1.9
+
+# Auth
+PyJWT>=2.8.0
+bcrypt>=4.1.0
+
+# Encryption
+cryptography>=41.0.0
+
+# HTTP client (Claude API + embeddings)
+httpx>=0.26.0
+
+# Scheduling
+croniter>=2.0.1
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0

@@ -1,0 +1,37 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (keep demo db)
+*.db
+!demo/demo_source.db
+
+# Staging data (generated at runtime)
+data/staging/
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Logs
+*.log

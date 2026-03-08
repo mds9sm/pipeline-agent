@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DAPOS</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            surface: '#ffffff',
+            bg: '#faf8f5',
+            border: '#e5e0d8',
+            text: {
+              primary: '#2d2a26',
+              secondary: '#6b6560',
+              muted: '#9c9590',
+              faint: '#b8b0a8',
+            },
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            ui: ['Outfit', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body {
+      font-family: 'Outfit', sans-serif;
+      background: #faf8f5;
+      color: #2d2a26;
+      margin: 0;
+    }
+    * { box-sizing: border-box; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #d5cfc7; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #c0b8ae; }
+    .shadow-green { box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.12); }
+    .shadow-red { box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.12); }
+    .shadow-amber { box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.12); }
+    pre { font-family: 'JetBrains Mono', monospace; }
+    input::placeholder { color: #b8b0a8; }
+    select { appearance: none; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" src="/static/App.jsx"></script>
+</body>
+</html>
