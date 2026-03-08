@@ -178,6 +178,10 @@ async def main():
         await registry.load_all_active()
         log.info("  Connectors loaded.")
 
+        # 7b. Bootstrap demo pipelines (first startup only)
+        from demo.bootstrap import bootstrap_demo_pipelines
+        await bootstrap_demo_pipelines(store, registry)
+
         pipelines = await store.list_pipelines(status="active")
         log.info("  Active pipelines: %d", len(pipelines))
 

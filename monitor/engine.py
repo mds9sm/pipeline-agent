@@ -408,7 +408,7 @@ class MonitorEngine:
                 status=status,
                 last_record_time=last_record,
             )
-            await self.store.save_freshness_snapshot(snapshot)
+            await self.store.save_freshness(snapshot)
 
             if status in (FreshnessStatus.WARNING, FreshnessStatus.CRITICAL):
                 digest_only = tier_cfg.get("digest_only", False)
@@ -423,11 +423,11 @@ class MonitorEngine:
                     pipeline_id=pipeline.pipeline_id,
                     pipeline_name=pipeline.pipeline_name,
                     summary=(
-                        f"Freshness {status.value}: {staleness:.0f}m stale "
+                        f"Freshness {status.value}: {min(staleness, 99999):.0f}m stale "
                         f"(SLA warn={sla_warn}m, critical={sla_critical}m)"
                     ),
                     detail={
-                        "staleness_minutes": round(staleness, 1),
+                        "staleness_minutes": round(min(staleness, 99999), 1),
                         "sla_warn_minutes": sla_warn,
                         "sla_critical_minutes": sla_critical,
                     },

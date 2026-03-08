@@ -1,8 +1,6 @@
 """
 FastAPI REST API server with JWT auth, rate limiting, and agent-routed commands.
 """
-from __future__ import annotations
-
 import logging
 import os
 from dataclasses import asdict
@@ -807,7 +805,7 @@ def create_app(
         return {
             "connector_id": record.connector_id,
             "connector_name": record.connector_name,
-            "status": record.status.value,
+            "status": record.status.value if hasattr(record.status, 'value') else record.status,
             "validation": record.test_results.get("validation"),
         }
 
@@ -1269,10 +1267,19 @@ def create_app(
         if not p:
             raise HTTPException(404, "Pipeline not found")
         deps = await store.list_dependencies(pipeline_id)
-        all_deps = await store.list_dependencies()
 
         upstream = [d for d in deps if d.pipeline_id == pipeline_id]
-        downstream_deps = [d for d in all_deps if d.depends_on_id == pipeline_id]
+
+        # Find downstream: pipelines that depend on this one
+        all_pipelines = await store.list_pipelines()
+        downstream_deps = []
+        for p in all_pipelines:
+            if p.pipeline_id == pipeline_id:
+                continue
+            p_deps = await store.list_dependencies(p.pipeline_id)
+            for d in p_deps:
+                if d.depends_on_id == pipeline_id:
+                    downstream_deps.append(d)
 
         async def enrich_upstream(dep):
             other_id = dep.depends_on_id

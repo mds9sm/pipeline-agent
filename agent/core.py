@@ -457,6 +457,10 @@ Respond with plain text (no JSON).
                 "Set ANTHROPIC_API_KEY to enable this feature."
             )
 
+        # Normalize connector_type to enum if passed as string
+        if isinstance(connector_type, str):
+            connector_type = ConnectorType(connector_type.lower())
+
         is_source = connector_type == ConnectorType.SOURCE
         base_class = "SourceEngine" if is_source else "TargetEngine"
 
@@ -885,7 +889,7 @@ Respond with JSON:
         text_lower = user_text.lower().strip()
 
         # Pipeline listing
-        if any(kw in text_lower for kw in ("list pipeline", "show pipeline", "all pipeline")):
+        if any(kw in text_lower for kw in ("list pipeline", "show pipeline", "all pipeline", "my pipeline")):
             status = None
             for s in ("active", "paused", "failed", "archived"):
                 if s in text_lower:

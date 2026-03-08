@@ -62,6 +62,14 @@ class ConnectorRegistry:
             REDSHIFT_TARGET_META,
             POSTGRES_TARGET_CODE,
             POSTGRES_TARGET_META,
+            MONGO_SOURCE_CODE,
+            MONGO_SOURCE_META,
+            STRIPE_SOURCE_CODE,
+            STRIPE_SOURCE_META,
+            GOOGLE_ADS_SOURCE_CODE,
+            GOOGLE_ADS_SOURCE_META,
+            FACEBOOK_INSIGHTS_SOURCE_CODE,
+            FACEBOOK_INSIGHTS_SOURCE_META,
         )
 
         seeds = [
@@ -69,6 +77,10 @@ class ConnectorRegistry:
             (SQLITE_SOURCE_META, SQLITE_SOURCE_CODE),
             (REDSHIFT_TARGET_META, REDSHIFT_TARGET_CODE),
             (POSTGRES_TARGET_META, POSTGRES_TARGET_CODE),
+            (MONGO_SOURCE_META, MONGO_SOURCE_CODE),
+            (STRIPE_SOURCE_META, STRIPE_SOURCE_CODE),
+            (GOOGLE_ADS_SOURCE_META, GOOGLE_ADS_SOURCE_CODE),
+            (FACEBOOK_INSIGHTS_SOURCE_META, FACEBOOK_INSIGHTS_SOURCE_CODE),
         ]
         for meta, code in seeds:
             name = meta["connector_name"]

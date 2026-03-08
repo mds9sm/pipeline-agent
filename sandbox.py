@@ -22,6 +22,7 @@ ALLOWED_IMPORTS = {
     "psycopg2", "psycopg2.extras", "psycopg2.sql",
     "cx_Oracle", "pyodbc", "sqlite3",
     "asyncpg", "aiomysql", "aiopg",
+    "pymongo",
     # HTTP / API clients
     "httpx", "requests", "urllib.parse", "urllib.request",
     # Data handling

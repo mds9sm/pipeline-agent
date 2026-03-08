@@ -520,10 +520,9 @@ pipeline-agent/
 │   ├── index.html
 │   └── App.jsx               # React SPA: 9 views (CDN React 18 + Tailwind)
 │
-├── tests/
-│   ├── conftest.py           # Shared fixtures (PostgreSQL pool, store, registry)
-│   ├── test_sandbox.py       # Sandbox validation and execution tests
-│   └── test_crypto.py        # Encryption round-trip tests
+├── test-pipeline-agent.sh    # Comprehensive curl-based test suite (127 tests)
+├── CLAUDE.md                 # Product context for Claude Code sessions
+├── CHANGELOG.md              # Change log across builds
 │
 └── alembic/                  # Database migrations (production)
     ├── env.py
@@ -573,26 +572,36 @@ For development and testing, `Store.create_tables()` creates all tables with `IF
 
 ## Testing
 
+The test strategy is to test the real running app via curl API calls -- no mocks, no pytest, no isolated unit tests. The agent is the product; test it the way users interact with it.
+
 ```bash
-# Run all tests
-pytest
+# Prerequisites: app must be running
+docker compose up -d
+ANTHROPIC_API_KEY=sk-... python main.py
 
-# Run with coverage
-pytest --cov=. --cov-report=term-missing
+# Full test suite (~127 tests, ~20 min with LLM calls)
+./test-pipeline-agent.sh
 
-# Run specific test files
-pytest tests/test_sandbox.py     # Sandbox AST validation + restricted execution
-pytest tests/test_crypto.py      # Fernet encryption round-trips
+# Targeted test modes
+./test-pipeline-agent.sh --api        # REST API endpoints only (fast, no LLM)
+./test-pipeline-agent.sh --sources    # All source connector requests + generation
+./test-pipeline-agent.sh --targets    # All target connector requests + generation
+./test-pipeline-agent.sh --chat       # Multi-turn conversations + agent understanding
 ```
 
-### Test Categories
+### Test Coverage
 
-- **Sandbox tests** -- AST validation for allowed/blocked imports, restricted builtins, blocked function calls
-- **Crypto tests** -- Encrypt/decrypt round-trips, field-level encryption/decryption of credential dicts
-- **Quality gate** -- PASS/WARN/FAIL for each of the 7 checks
-- **Connector registry** -- Load, validate, deprecate, hot-reload
-- **Store CRUD** -- All entity types against PostgreSQL
-- **API integration** -- Full endpoint testing with auth
+- **12 Core API endpoints** -- health, metrics, connectors, pipelines, approvals, freshness, alerts, costs, policies, preferences, web UI
+- **16 Database sources** -- Oracle, SQL Server, MySQL, PostgreSQL, MongoDB, MariaDB, Cassandra, DynamoDB, CockroachDB, Redis, Elasticsearch, Neo4j, ClickHouse, SQLite, Teradata, DB2
+- **30 SaaS/API sources** -- Stripe, Google Ads, Facebook Insights/Ads, Salesforce, HubSpot, Shopify, Google Analytics, Jira, Zendesk, Intercom, Twilio, SendGrid, Mailchimp, QuickBooks, Xero, Notion, Airtable, Slack, GitHub, LinkedIn Ads, Twitter Ads, TikTok Ads, Pinterest Ads, Marketo, Braze, Segment, Mixpanel, Amplitude, Snowplow
+- **5 File/Cloud sources** -- S3, GCS, Azure Blob, SFTP, FTP
+- **5 Streaming sources** -- Kafka, Kinesis, Pub/Sub, RabbitMQ, EventHub
+- **18 Targets** -- PostgreSQL, Snowflake, BigQuery, Redshift, Databricks, ClickHouse, MySQL, SQL Server, Oracle, S3, GCS, Azure Synapse, Firebolt, DuckDB, Delta Lake, Apache Iceberg, Elasticsearch, MongoDB
+- **20 Multi-turn pipeline conversations** -- e.g., Oracle->Snowflake, Stripe->Snowflake, Salesforce->Databricks
+- **10 Agent understanding tests** -- capabilities, scheduling, refresh strategy, quality gates, error budgets, schema drift
+- **9 Connector generation via API** -- Oracle, SQL Server, Stripe, Google Ads, Facebook, Snowflake, BigQuery, Redshift, Databricks
+- **10 Pipeline CRUD** -- create, get, update, pause, resume, preview, runs, quality, lineage, error budgets
+- **Approval workflow** -- list pending proposals, approve connectors
 
 ---
 

@@ -28,6 +28,30 @@ POSTGRES_TARGET_META = {
     "source_target_type": "postgres",
 }
 
+MONGO_SOURCE_META = {
+    "connector_name": "mongo-source-v1",
+    "connector_type": "source",
+    "source_target_type": "mongodb",
+}
+
+STRIPE_SOURCE_META = {
+    "connector_name": "stripe-source-v1",
+    "connector_type": "source",
+    "source_target_type": "stripe",
+}
+
+GOOGLE_ADS_SOURCE_META = {
+    "connector_name": "google-ads-source-v1",
+    "connector_type": "source",
+    "source_target_type": "google_ads",
+}
+
+FACEBOOK_INSIGHTS_SOURCE_META = {
+    "connector_name": "facebook-insights-source-v1",
+    "connector_type": "source",
+    "source_target_type": "facebook_insights",
+}
+
 
 MYSQL_SOURCE_CODE = '''
 # REQUIRES: PyMySQL>=1.1.0
@@ -76,12 +100,12 @@ TIMESTAMP_TYPES = {"datetime", "timestamp", "date"}
 
 class MySQLEngine(SourceEngine):
 
-    def __init__(self, host: str, port: int, database: str, user: str,
-                 password: str, ssl_ca: str = ""):
+    def __init__(self, host: str, port: int = 3306, database: str = "",
+                 user: str = "", password: str = "", ssl_ca: str = "", **kwargs):
         self.host = host
-        self.port = port
+        self.port = int(port)
         self.database = database
-        self.user = user
+        self.user = user or "root"
         self.password = password
         self.ssl_ca = ssl_ca
 
@@ -1059,4 +1083,871 @@ class PostgresTargetEngine(TargetEngine):
                 return {c: (row[i] or 0) for i, c in enumerate(columns)}
         finally:
             conn.close()
+'''
+
+
+# ===================================================================
+# MongoDB source connector
+# ===================================================================
+
+MONGO_SOURCE_CODE = '''
+# REQUIRES: pymongo>=4.6.0
+from __future__ import annotations
+import csv
+import hashlib
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+import pymongo
+
+from contracts.models import (
+    ConnectionResult, SchemaInfo, TableProfile, ColumnMapping,
+    PipelineContract, RunRecord, ExtractResult, RefreshType,
+    now_iso,
+)
+from source.base import SourceEngine
+
+log = logging.getLogger(__name__)
+
+TYPE_MAP = {
+    "int": "INTEGER", "int32": "INTEGER", "int64": "BIGINT",
+    "long": "BIGINT", "double": "FLOAT8", "decimal": "DECIMAL",
+    "string": "VARCHAR(65535)", "str": "VARCHAR(65535)",
+    "bool": "BOOLEAN",
+    "date": "TIMESTAMPTZ", "datetime": "TIMESTAMPTZ",
+    "objectId": "VARCHAR(24)",
+    "array": "VARCHAR(65535)", "list": "VARCHAR(65535)",
+    "object": "VARCHAR(65535)", "dict": "VARCHAR(65535)",
+}
+
+
+class MongoDBEngine(SourceEngine):
+
+    def __init__(self, host: str = "localhost", port: int = 27017,
+                 database: str = "test", **kwargs):
+        self.host = host
+        self.port = int(port)
+        self.database = database
+
+    def _client(self) -> pymongo.MongoClient:
+        return pymongo.MongoClient(self.host, self.port, serverSelectionTimeoutMS=5000)
+
+    def get_source_type(self) -> str:
+        return "mongodb"
+
+    async def test_connection(self) -> ConnectionResult:
+        t0 = time.monotonic()
+        try:
+            client = self._client()
+            info = client.server_info()
+            client.close()
+            return ConnectionResult(
+                success=True, version=info.get("version", "unknown"),
+                ssl_enabled=False, connection_count=1,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+        except Exception as e:
+            return ConnectionResult(success=False, error=str(e))
+
+    async def list_schemas(self) -> list[SchemaInfo]:
+        client = self._client()
+        try:
+            db = client[self.database]
+            collections = db.list_collection_names()
+            return [SchemaInfo(
+                schema_name="default",
+                table_count=len(collections),
+                tables=sorted(collections),
+            )]
+        finally:
+            client.close()
+
+    async def profile_table(self, schema: str, table: str) -> TableProfile:
+        client = self._client()
+        try:
+            db = client[self.database]
+            coll = db[table]
+            row_count = coll.estimated_document_count()
+            sample = list(coll.find().limit(100))
+
+            # Infer columns from sample
+            all_keys = {}
+            for doc in sample:
+                for k, v in doc.items():
+                    if k == "_id":
+                        continue
+                    t = type(v).__name__
+                    if k not in all_keys:
+                        all_keys[k] = t
+
+            mappings = []
+            ts_cols = []
+            for i, (col, pytype) in enumerate(all_keys.items()):
+                if pytype == "datetime":
+                    ts_cols.append(col)
+                target_type = TYPE_MAP.get(pytype, "VARCHAR(65535)")
+                mappings.append(ColumnMapping(
+                    source_column=col, source_type=pytype,
+                    target_column=col, target_type=target_type,
+                    is_nullable=True, is_primary_key=False,
+                    is_incremental_candidate=(pytype == "datetime"),
+                    ordinal_position=i,
+                ))
+
+            # Null rates and cardinality
+            null_rates = {}
+            cardinality = {}
+            total = max(len(sample), 1)
+            for col in all_keys:
+                nulls = sum(1 for d in sample if d.get(col) is None)
+                distinct = len(set(str(d.get(col)) for d in sample if d.get(col) is not None))
+                null_rates[col] = nulls / total
+                cardinality[col] = distinct
+
+            sample_rows = []
+            for doc in sample[:5]:
+                row = {}
+                for k, v in doc.items():
+                    if k == "_id":
+                        row[k] = str(v)
+                    elif isinstance(v, datetime):
+                        row[k] = v.isoformat()
+                    elif isinstance(v, (dict, list)):
+                        row[k] = json.dumps(v, default=str)
+                    else:
+                        row[k] = v
+                sample_rows.append(row)
+
+            return TableProfile(
+                schema_name=schema, table_name=table,
+                row_count_estimate=row_count, column_count=len(mappings),
+                columns=mappings, primary_keys=["_id"], timestamp_columns=ts_cols,
+                null_rates=null_rates, cardinality=cardinality,
+                sample_rows=sample_rows, foreign_keys=[],
+            )
+        finally:
+            client.close()
+
+    def map_type(self, source_type: str) -> str:
+        return TYPE_MAP.get(source_type.lower(), "VARCHAR(65535)")
+
+    async def extract(self, contract: PipelineContract, run: RunRecord,
+                      staging_dir: str, batch_size: int = 100_000) -> ExtractResult:
+        os.makedirs(staging_dir, exist_ok=True)
+        table = contract.source_table
+        inc_col = contract.incremental_column
+        extracted_at = now_iso()
+
+        query = {}
+        if contract.refresh_type == RefreshType.INCREMENTAL and inc_col and contract.last_watermark:
+            try:
+                wm = datetime.fromisoformat(contract.last_watermark)
+                query[inc_col] = {"$gt": wm}
+            except ValueError:
+                query[inc_col] = {"$gt": contract.last_watermark}
+
+        sort_spec = [(inc_col, pymongo.ASCENDING)] if inc_col else None
+
+        client = self._client()
+        total_rows = batch_num = total_bytes = 0
+        max_watermark = contract.last_watermark
+        manifest = {"batches": []}
+
+        try:
+            db = client[self.database]
+            coll = db[table]
+            cursor = coll.find(query, sort=sort_spec)
+
+            columns = None
+            batch_rows = []
+            for doc in cursor:
+                if columns is None:
+                    columns = [k for k in doc.keys() if k != "_id"]
+
+                row_values = []
+                for c in columns:
+                    v = doc.get(c)
+                    if isinstance(v, datetime):
+                        v = v.isoformat()
+                    elif isinstance(v, (dict, list)):
+                        v = json.dumps(v, default=str)
+                    elif hasattr(v, "__str__") and not isinstance(v, (str, int, float, bool, type(None))):
+                        v = str(v)
+                    row_values.append(v)
+
+                if inc_col and inc_col in doc and doc[inc_col] is not None:
+                    wm_val = doc[inc_col]
+                    wm_str = wm_val.isoformat() if isinstance(wm_val, datetime) else str(wm_val)
+                    if max_watermark is None or wm_str > max_watermark:
+                        max_watermark = wm_str
+
+                row_hash = hashlib.sha256(
+                    "|".join(str(v) for v in row_values).encode()
+                ).hexdigest()
+                row_values.extend([extracted_at, "default", table, row_hash])
+                batch_rows.append(row_values)
+                total_rows += 1
+
+                if len(batch_rows) >= batch_size:
+                    batch_num += 1
+                    fpath, fbytes = self._write_batch(staging_dir, batch_num, columns, batch_rows)
+                    total_bytes += fbytes
+                    manifest["batches"].append({"file": fpath, "rows": len(batch_rows), "bytes": fbytes})
+                    batch_rows = []
+
+            if batch_rows and columns:
+                batch_num += 1
+                fpath, fbytes = self._write_batch(staging_dir, batch_num, columns, batch_rows)
+                total_bytes += fbytes
+                manifest["batches"].append({"file": fpath, "rows": len(batch_rows), "bytes": fbytes})
+        finally:
+            client.close()
+
+        manifest.update({"total_rows": total_rows, "total_bytes": total_bytes})
+        with open(os.path.join(staging_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        return ExtractResult(rows_extracted=total_rows, max_watermark=max_watermark,
+                             staging_path=staging_dir, staging_size_bytes=total_bytes,
+                             batch_count=batch_num, manifest=manifest)
+
+    def _write_batch(self, staging_dir, batch_num, columns, rows):
+        meta_cols = ["_extracted_at", "_source_schema", "_source_table", "_row_hash"]
+        all_cols = columns + meta_cols
+        fname = f"batch_{batch_num:04d}.csv"
+        fpath = os.path.join(staging_dir, fname)
+        with open(fpath, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(all_cols)
+            writer.writerows(rows)
+        return fpath, os.path.getsize(fpath)
+'''
+
+
+# ===================================================================
+# Stripe source connector
+# ===================================================================
+
+STRIPE_SOURCE_CODE = '''
+# REQUIRES: httpx>=0.26.0
+from __future__ import annotations
+import csv
+import hashlib
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+import httpx
+
+from contracts.models import (
+    ConnectionResult, SchemaInfo, TableProfile, ColumnMapping,
+    PipelineContract, RunRecord, ExtractResult, RefreshType,
+    now_iso,
+)
+from source.base import SourceEngine
+
+log = logging.getLogger(__name__)
+
+STRIPE_RESOURCES = {
+    "charges": {"columns": ["id", "amount", "currency", "status", "customer",
+                             "description", "created", "paid", "refunded",
+                             "amount_refunded"]},
+    "customers": {"columns": ["id", "email", "name", "created", "currency",
+                               "balance", "delinquent"]},
+}
+
+
+class StripeEngine(SourceEngine):
+
+    def __init__(self, host: str = "https://api.stripe.com", database: str = "",
+                 **kwargs):
+        self.base_url = host.rstrip("/")
+        self.api_key = database  # API key passed via database field
+
+    def get_source_type(self) -> str:
+        return "stripe"
+
+    async def test_connection(self) -> ConnectionResult:
+        t0 = time.monotonic()
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(
+                    f"{self.base_url}/v1/charges",
+                    params={"limit": 1},
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                resp.raise_for_status()
+            return ConnectionResult(
+                success=True, version="stripe-api-v1",
+                ssl_enabled=self.base_url.startswith("https"),
+                connection_count=1,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+        except Exception as e:
+            return ConnectionResult(success=False, error=str(e))
+
+    async def list_schemas(self) -> list[SchemaInfo]:
+        return [SchemaInfo(
+            schema_name="stripe",
+            table_count=len(STRIPE_RESOURCES),
+            tables=sorted(STRIPE_RESOURCES.keys()),
+        )]
+
+    async def profile_table(self, schema: str, table: str) -> TableProfile:
+        resource = STRIPE_RESOURCES.get(table, {})
+        cols = resource.get("columns", [])
+
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(
+                    f"{self.base_url}/v1/{table}",
+                    params={"limit": 5},
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("data", [])
+                total = data.get("total_count", len(items))
+        except Exception:
+            items = []
+            total = 0
+
+        mappings = []
+        for i, col in enumerate(cols):
+            mappings.append(ColumnMapping(
+                source_column=col, source_type="string",
+                target_column=col, target_type="VARCHAR(65535)",
+                is_nullable=True, is_primary_key=(col == "id"),
+                is_incremental_candidate=(col == "created"),
+                ordinal_position=i,
+            ))
+
+        sample_rows = []
+        for item in items[:5]:
+            sample_rows.append({c: item.get(c) for c in cols if c in item})
+
+        return TableProfile(
+            schema_name=schema, table_name=table,
+            row_count_estimate=total, column_count=len(cols),
+            columns=mappings, primary_keys=["id"],
+            timestamp_columns=["created"],
+            null_rates={}, cardinality={},
+            sample_rows=sample_rows, foreign_keys=[],
+        )
+
+    def map_type(self, source_type: str) -> str:
+        return "VARCHAR(65535)"
+
+    async def extract(self, contract: PipelineContract, run: RunRecord,
+                      staging_dir: str, batch_size: int = 100_000) -> ExtractResult:
+        os.makedirs(staging_dir, exist_ok=True)
+        table = contract.source_table
+        extracted_at = now_iso()
+
+        resource = STRIPE_RESOURCES.get(table, {})
+        columns = resource.get("columns", [])
+        if not columns:
+            return ExtractResult(rows_extracted=0, max_watermark=None,
+                                 staging_path=staging_dir, staging_size_bytes=0,
+                                 batch_count=0, manifest={})
+
+        all_items = []
+        starting_after = None
+        with httpx.Client(timeout=30) as client:
+            while True:
+                params = {"limit": 100}
+                if starting_after:
+                    params["starting_after"] = starting_after
+                resp = client.get(
+                    f"{self.base_url}/v1/{table}",
+                    params=params,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("data", [])
+                all_items.extend(items)
+                if not data.get("has_more") or not items:
+                    break
+                starting_after = items[-1]["id"]
+
+        total_rows = batch_num = total_bytes = 0
+        max_watermark = contract.last_watermark
+        manifest = {"batches": []}
+        batch_rows = []
+
+        for item in all_items:
+            row_values = []
+            for col in columns:
+                v = item.get(col)
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, default=str)
+                row_values.append(v)
+
+            if "created" in item and item["created"] is not None:
+                wm = str(item["created"])
+                if max_watermark is None or wm > max_watermark:
+                    max_watermark = wm
+
+            row_hash = hashlib.sha256(
+                "|".join(str(v) for v in row_values).encode()
+            ).hexdigest()
+            row_values.extend([extracted_at, "stripe", table, row_hash])
+            batch_rows.append(row_values)
+            total_rows += 1
+
+            if len(batch_rows) >= batch_size:
+                batch_num += 1
+                fpath, fbytes = self._write_batch(staging_dir, batch_num, columns, batch_rows)
+                total_bytes += fbytes
+                manifest["batches"].append({"file": fpath, "rows": len(batch_rows), "bytes": fbytes})
+                batch_rows = []
+
+        if batch_rows:
+            batch_num += 1
+            fpath, fbytes = self._write_batch(staging_dir, batch_num, columns, batch_rows)
+            total_bytes += fbytes
+            manifest["batches"].append({"file": fpath, "rows": len(batch_rows), "bytes": fbytes})
+
+        manifest.update({"total_rows": total_rows, "total_bytes": total_bytes})
+        with open(os.path.join(staging_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        return ExtractResult(rows_extracted=total_rows, max_watermark=max_watermark,
+                             staging_path=staging_dir, staging_size_bytes=total_bytes,
+                             batch_count=batch_num, manifest=manifest)
+
+    def _write_batch(self, staging_dir, batch_num, columns, rows):
+        meta_cols = ["_extracted_at", "_source_schema", "_source_table", "_row_hash"]
+        all_cols = columns + meta_cols
+        fname = f"batch_{batch_num:04d}.csv"
+        fpath = os.path.join(staging_dir, fname)
+        with open(fpath, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(all_cols)
+            writer.writerows(rows)
+        return fpath, os.path.getsize(fpath)
+'''
+
+
+# ===================================================================
+# Google Ads source connector
+# ===================================================================
+
+GOOGLE_ADS_SOURCE_CODE = '''
+# REQUIRES: httpx>=0.26.0
+from __future__ import annotations
+import csv
+import hashlib
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+import httpx
+
+from contracts.models import (
+    ConnectionResult, SchemaInfo, TableProfile, ColumnMapping,
+    PipelineContract, RunRecord, ExtractResult, RefreshType,
+    now_iso,
+)
+from source.base import SourceEngine
+
+log = logging.getLogger(__name__)
+
+REPORT_TABLES = {
+    "campaign_performance": {
+        "columns": ["campaign_id", "campaign_name", "status", "date",
+                     "impressions", "clicks", "cost_micros", "conversions",
+                     "conversion_value", "ctr"],
+    },
+}
+
+
+class GoogleAdsEngine(SourceEngine):
+
+    def __init__(self, host: str = "https://googleads.googleapis.com",
+                 database: str = "", port: int = 0, **kwargs):
+        self.base_url = host.rstrip("/")
+        self.api_key = database  # API key / developer token
+        self.customer_id = str(port) if port else "0"
+
+    def get_source_type(self) -> str:
+        return "google_ads"
+
+    async def test_connection(self) -> ConnectionResult:
+        t0 = time.monotonic()
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(
+                    f"{self.base_url}/v1/customers/{self.customer_id}/googleAds",
+                    params={"page_size": 1},
+                )
+                resp.raise_for_status()
+            return ConnectionResult(
+                success=True, version="google-ads-api-v1",
+                ssl_enabled=self.base_url.startswith("https"),
+                connection_count=1,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+        except Exception as e:
+            return ConnectionResult(success=False, error=str(e))
+
+    async def list_schemas(self) -> list[SchemaInfo]:
+        return [SchemaInfo(
+            schema_name="google_ads",
+            table_count=len(REPORT_TABLES),
+            tables=sorted(REPORT_TABLES.keys()),
+        )]
+
+    async def profile_table(self, schema: str, table: str) -> TableProfile:
+        report = REPORT_TABLES.get(table, {})
+        cols = report.get("columns", [])
+
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(
+                    f"{self.base_url}/v1/customers/{self.customer_id}/googleAds",
+                    params={"page_size": 5},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("results", [])
+                total = data.get("total_results_count", len(items))
+        except Exception:
+            items = []
+            total = 0
+
+        mappings = []
+        for i, col in enumerate(cols):
+            target_type = "VARCHAR(65535)"
+            if col in ("impressions", "clicks", "conversions"):
+                target_type = "INTEGER"
+            elif col in ("cost_micros",):
+                target_type = "BIGINT"
+            elif col in ("conversion_value", "ctr"):
+                target_type = "FLOAT8"
+            mappings.append(ColumnMapping(
+                source_column=col, source_type="string",
+                target_column=col, target_type=target_type,
+                is_nullable=True,
+                is_primary_key=(col == "campaign_id"),
+                is_incremental_candidate=(col == "date"),
+                ordinal_position=i,
+            ))
+
+        sample_rows = [{c: item.get(c) for c in cols} for item in items[:5]]
+        return TableProfile(
+            schema_name=schema, table_name=table,
+            row_count_estimate=total, column_count=len(cols),
+            columns=mappings, primary_keys=["campaign_id"],
+            timestamp_columns=["date"],
+            null_rates={}, cardinality={},
+            sample_rows=sample_rows, foreign_keys=[],
+        )
+
+    def map_type(self, source_type: str) -> str:
+        return "VARCHAR(65535)"
+
+    async def extract(self, contract: PipelineContract, run: RunRecord,
+                      staging_dir: str, batch_size: int = 100_000) -> ExtractResult:
+        os.makedirs(staging_dir, exist_ok=True)
+        table = contract.source_table
+        extracted_at = now_iso()
+
+        report = REPORT_TABLES.get(table, {})
+        columns = report.get("columns", [])
+        if not columns:
+            return ExtractResult(rows_extracted=0, max_watermark=None,
+                                 staging_path=staging_dir, staging_size_bytes=0,
+                                 batch_count=0, manifest={})
+
+        all_items = []
+        page_token = None
+        with httpx.Client(timeout=30) as client:
+            while True:
+                params = {"page_size": 100}
+                if page_token:
+                    params["page_token"] = page_token
+                resp = client.get(
+                    f"{self.base_url}/v1/customers/{self.customer_id}/googleAds",
+                    params=params,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("results", [])
+                all_items.extend(items)
+                page_token = data.get("next_page_token")
+                if not page_token or not items:
+                    break
+
+        total_rows = batch_num = total_bytes = 0
+        max_watermark = contract.last_watermark
+        manifest = {"batches": []}
+        batch_rows = []
+
+        for item in all_items:
+            row_values = [item.get(c) for c in columns]
+
+            if "date" in item and item["date"] is not None:
+                wm = str(item["date"])
+                if max_watermark is None or wm > max_watermark:
+                    max_watermark = wm
+
+            row_hash = hashlib.sha256(
+                "|".join(str(v) for v in row_values).encode()
+            ).hexdigest()
+            row_values.extend([extracted_at, "google_ads", table, row_hash])
+            batch_rows.append(row_values)
+            total_rows += 1
+
+            if len(batch_rows) >= batch_size:
+                batch_num += 1
+                fpath, fbytes = self._write_batch(staging_dir, batch_num, columns, batch_rows)
+                total_bytes += fbytes
+                manifest["batches"].append({"file": fpath, "rows": len(batch_rows), "bytes": fbytes})
+                batch_rows = []
+
+        if batch_rows:
+            batch_num += 1
+            fpath, fbytes = self._write_batch(staging_dir, batch_num, columns, batch_rows)
+            total_bytes += fbytes
+            manifest["batches"].append({"file": fpath, "rows": len(batch_rows), "bytes": fbytes})
+
+        manifest.update({"total_rows": total_rows, "total_bytes": total_bytes})
+        with open(os.path.join(staging_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        return ExtractResult(rows_extracted=total_rows, max_watermark=max_watermark,
+                             staging_path=staging_dir, staging_size_bytes=total_bytes,
+                             batch_count=batch_num, manifest=manifest)
+
+    def _write_batch(self, staging_dir, batch_num, columns, rows):
+        meta_cols = ["_extracted_at", "_source_schema", "_source_table", "_row_hash"]
+        all_cols = columns + meta_cols
+        fname = f"batch_{batch_num:04d}.csv"
+        fpath = os.path.join(staging_dir, fname)
+        with open(fpath, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(all_cols)
+            writer.writerows(rows)
+        return fpath, os.path.getsize(fpath)
+'''
+
+
+# ===================================================================
+# Facebook Insights source connector
+# ===================================================================
+
+FACEBOOK_INSIGHTS_SOURCE_CODE = '''
+# REQUIRES: httpx>=0.26.0
+from __future__ import annotations
+import csv
+import hashlib
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+import httpx
+
+from contracts.models import (
+    ConnectionResult, SchemaInfo, TableProfile, ColumnMapping,
+    PipelineContract, RunRecord, ExtractResult, RefreshType,
+    now_iso,
+)
+from source.base import SourceEngine
+
+log = logging.getLogger(__name__)
+
+INSIGHT_TABLES = {
+    "ad_insights": {
+        "columns": ["ad_id", "ad_name", "adset_id", "adset_name",
+                     "campaign_id", "campaign_name", "date_start", "date_stop",
+                     "impressions", "clicks", "spend"],
+    },
+}
+
+
+class FacebookInsightsEngine(SourceEngine):
+
+    def __init__(self, host: str = "https://graph.facebook.com",
+                 database: str = "", port: int = 0, **kwargs):
+        self.base_url = host.rstrip("/")
+        self.access_token = database  # access token via database field
+        self.ad_account_id = str(port) if port else "act_demo"
+
+    def get_source_type(self) -> str:
+        return "facebook_insights"
+
+    async def test_connection(self) -> ConnectionResult:
+        t0 = time.monotonic()
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(
+                    f"{self.base_url}/v1/{self.ad_account_id}/insights",
+                    params={"limit": 1, "access_token": self.access_token},
+                )
+                resp.raise_for_status()
+            return ConnectionResult(
+                success=True, version="facebook-insights-api-v1",
+                ssl_enabled=self.base_url.startswith("https"),
+                connection_count=1,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+        except Exception as e:
+            return ConnectionResult(success=False, error=str(e))
+
+    async def list_schemas(self) -> list[SchemaInfo]:
+        return [SchemaInfo(
+            schema_name="facebook",
+            table_count=len(INSIGHT_TABLES),
+            tables=sorted(INSIGHT_TABLES.keys()),
+        )]
+
+    async def profile_table(self, schema: str, table: str) -> TableProfile:
+        report = INSIGHT_TABLES.get(table, {})
+        cols = report.get("columns", [])
+
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(
+                    f"{self.base_url}/v1/{self.ad_account_id}/insights",
+                    params={"limit": 5, "access_token": self.access_token},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("data", [])
+        except Exception:
+            items = []
+
+        mappings = []
+        for i, col in enumerate(cols):
+            target_type = "VARCHAR(65535)"
+            if col in ("impressions", "clicks"):
+                target_type = "INTEGER"
+            elif col in ("spend",):
+                target_type = "DECIMAL(12,2)"
+            mappings.append(ColumnMapping(
+                source_column=col, source_type="string",
+                target_column=col, target_type=target_type,
+                is_nullable=True,
+                is_primary_key=(col == "ad_id"),
+                is_incremental_candidate=(col == "date_start"),
+                ordinal_position=i,
+            ))
+
+        sample_rows = [{c: item.get(c) for c in cols} for item in items[:5]]
+        return TableProfile(
+            schema_name=schema, table_name=table,
+            row_count_estimate=len(items), column_count=len(cols),
+            columns=mappings, primary_keys=["ad_id"],
+            timestamp_columns=["date_start"],
+            null_rates={}, cardinality={},
+            sample_rows=sample_rows, foreign_keys=[],
+        )
+
+    def map_type(self, source_type: str) -> str:
+        return "VARCHAR(65535)"
+
+    async def extract(self, contract: PipelineContract, run: RunRecord,
+                      staging_dir: str, batch_size: int = 100_000) -> ExtractResult:
+        os.makedirs(staging_dir, exist_ok=True)
+        table = contract.source_table
+        extracted_at = now_iso()
+
+        report = INSIGHT_TABLES.get(table, {})
+        columns = report.get("columns", [])
+        if not columns:
+            return ExtractResult(rows_extracted=0, max_watermark=None,
+                                 staging_path=staging_dir, staging_size_bytes=0,
+                                 batch_count=0, manifest={})
+
+        all_items = []
+        after_cursor = None
+        with httpx.Client(timeout=30) as client:
+            while True:
+                params = {"limit": 100, "access_token": self.access_token}
+                if after_cursor:
+                    params["after"] = after_cursor
+                resp = client.get(
+                    f"{self.base_url}/v1/{self.ad_account_id}/insights",
+                    params=params,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("data", [])
+                all_items.extend(items)
+                paging = data.get("paging", {})
+                after_cursor = paging.get("cursors", {}).get("after")
+                if not paging.get("next") or not items:
+                    break
+
+        total_rows = batch_num = total_bytes = 0
+        max_watermark = contract.last_watermark
+        manifest = {"batches": []}
+        batch_rows = []
+
+        for item in all_items:
+            row_values = []
+            for col in columns:
+                v = item.get(col)
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, default=str)
+                row_values.append(v)
+
+            if "date_start" in item and item["date_start"] is not None:
+                wm = str(item["date_start"])
+                if max_watermark is None or wm > max_watermark:
+                    max_watermark = wm
+
+            row_hash = hashlib.sha256(
+                "|".join(str(v) for v in row_values).encode()
+            ).hexdigest()
+            row_values.extend([extracted_at, "facebook", table, row_hash])
+            batch_rows.append(row_values)
+            total_rows += 1
+
+            if len(batch_rows) >= batch_size:
+                batch_num += 1
+                fpath, fbytes = self._write_batch(staging_dir, batch_num, columns, batch_rows)
+                total_bytes += fbytes
+                manifest["batches"].append({"file": fpath, "rows": len(batch_rows), "bytes": fbytes})
+                batch_rows = []
+
+        if batch_rows:
+            batch_num += 1
+            fpath, fbytes = self._write_batch(staging_dir, batch_num, columns, batch_rows)
+            total_bytes += fbytes
+            manifest["batches"].append({"file": fpath, "rows": len(batch_rows), "bytes": fbytes})
+
+        manifest.update({"total_rows": total_rows, "total_bytes": total_bytes})
+        with open(os.path.join(staging_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        return ExtractResult(rows_extracted=total_rows, max_watermark=max_watermark,
+                             staging_path=staging_dir, staging_size_bytes=total_bytes,
+                             batch_count=batch_num, manifest=manifest)
+
+    def _write_batch(self, staging_dir, batch_num, columns, rows):
+        meta_cols = ["_extracted_at", "_source_schema", "_source_table", "_row_hash"]
+        all_cols = columns + meta_cols
+        fname = f"batch_{batch_num:04d}.csv"
+        fpath = os.path.join(staging_dir, fname)
+        with open(fpath, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(all_cols)
+            writer.writerows(rows)
+        return fpath, os.path.getsize(fpath)
 '''
