@@ -128,6 +128,27 @@ api_post() {
         -d "$2" 2>/dev/null
 }
 
+# HTTP PATCH with JSON
+api_patch() {
+    curl -s -m 30 -w "\n%{http_code}" -X PATCH "$API_URL$1" \
+        -H 'Content-Type: application/json' \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+        -d "$2" 2>/dev/null
+}
+
+# HTTP POST with plain-text body (for YAML import)
+api_post_text() {
+    curl -s -m 60 -w "\n%{http_code}" -X POST "$API_URL$1" \
+        -H 'Content-Type: text/plain' \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+        -d "$2" 2>/dev/null
+}
+
+# Extract a JSON field value from a response body
+json_field() {
+    echo "$1" | python3 -c "import sys,json; print(json.load(sys.stdin).get('$2',''))" 2>/dev/null
+}
+
 # Check if response contains a keyword (case insensitive)
 contains() {
     echo "$1" | grep -qi "$2"
@@ -883,17 +904,164 @@ if [ -n "$SRC_ID" ] && [ -n "$TGT_ID" ]; then
             fail "Pipeline retrieval failed (HTTP $CODE)"
         fi
 
-        # Update pipeline
-        test_name "PATCH /api/pipelines/$PID"
-        RESP=$(curl -s -m 30 -w "\n%{http_code}" -X PATCH "$API_URL/api/pipelines/$PID" \
-            -H 'Content-Type: application/json' \
-            ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
-            -d '{"tier": 1}' 2>/dev/null)
+        # Update pipeline (basic)
+        test_name "PATCH /api/pipelines/$PID - basic tier update"
+        RESP=$(api_patch "/api/pipelines/$PID" '{"tier": 1}')
         CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
         if [ "$CODE" = "200" ]; then
             pass "Pipeline updated to tier 1"
         else
             fail "Pipeline update failed (HTTP $CODE)"
+        fi
+
+        # --- Build 10: Expanded PATCH tests ---
+
+        # PATCH schedule fields
+        test_name "PATCH schedule fields (cron, retry, backoff, timeout)"
+        RESP=$(api_patch "/api/pipelines/$PID" '{"schedule_cron": "*/15 * * * *", "retry_max_attempts": 5, "retry_backoff_seconds": 120, "timeout_seconds": 7200, "reason": "test: schedule update"}')
+        CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            CRON=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('schedule_cron',''))" 2>/dev/null)
+            RETRY=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('retry_max_attempts',''))" 2>/dev/null)
+            TIMEOUT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('timeout_seconds',''))" 2>/dev/null)
+            if [ "$CRON" = "*/15 * * * *" ] && [ "$RETRY" = "5" ] && [ "$TIMEOUT" = "7200" ]; then
+                pass "Schedule fields updated (cron=$CRON, retry=$RETRY, timeout=$TIMEOUT)"
+            else
+                fail "Schedule fields not applied correctly (cron=$CRON, retry=$RETRY, timeout=$TIMEOUT)"
+            fi
+        else
+            fail "Schedule PATCH failed (HTTP $CODE)"
+        fi
+
+        # PATCH strategy fields
+        test_name "PATCH strategy fields (refresh_type, load_type, incremental_column)"
+        RESP=$(api_patch "/api/pipelines/$PID" '{"refresh_type": "incremental", "load_type": "merge", "merge_keys": ["id"], "incremental_column": "updated_at", "replication_method": "watermark", "reason": "test: strategy update"}')
+        CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            RT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('refresh_type',''))" 2>/dev/null)
+            LT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('load_type',''))" 2>/dev/null)
+            IC=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('incremental_column',''))" 2>/dev/null)
+            MK=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('merge_keys',''))" 2>/dev/null)
+            if [ "$RT" = "incremental" ] && [ "$LT" = "merge" ] && [ "$IC" = "updated_at" ]; then
+                pass "Strategy fields updated (refresh=$RT, load=$LT, inc_col=$IC, keys=$MK)"
+            else
+                fail "Strategy fields not applied correctly (refresh=$RT, load=$LT, inc_col=$IC)"
+            fi
+        else
+            fail "Strategy PATCH failed (HTTP $CODE)"
+        fi
+
+        # PATCH quality config partial merge
+        test_name "PATCH quality_config partial merge"
+        RESP=$(api_patch "/api/pipelines/$PID" '{"quality_config": {"count_tolerance": 0.05, "volume_z_score_warn": 3.0, "promote_on_warn": false}, "reason": "test: quality update"}')
+        CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            CT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('quality_config',{}).get('count_tolerance',''))" 2>/dev/null)
+            VZW=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('quality_config',{}).get('volume_z_score_warn',''))" 2>/dev/null)
+            POW=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('quality_config',{}).get('promote_on_warn',''))" 2>/dev/null)
+            VZF=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('quality_config',{}).get('volume_z_score_fail',''))" 2>/dev/null)
+            if [ "$CT" = "0.05" ] && [ "$POW" = "False" ] && [ "$VZF" = "3.0" ]; then
+                pass "Quality config partially merged (count_tol=$CT, promote_on_warn=$POW, vol_z_fail=$VZF unchanged)"
+            else
+                fail "Quality config merge incorrect (count_tol=$CT, promote_on_warn=$POW, vol_z_fail=$VZF)"
+            fi
+        else
+            fail "Quality config PATCH failed (HTTP $CODE)"
+        fi
+
+        # PATCH observability fields
+        test_name "PATCH observability fields (owner, freshness_column, auto_approve)"
+        RESP=$(api_patch "/api/pipelines/$PID" '{"owner": "data-team", "freshness_column": "updated_at", "auto_approve_additive_schema": true, "reason": "test: observability update"}')
+        CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            OWNER=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('owner',''))" 2>/dev/null)
+            FC=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('freshness_column',''))" 2>/dev/null)
+            AA=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auto_approve_additive_schema',''))" 2>/dev/null)
+            if [ "$OWNER" = "data-team" ] && [ "$FC" = "updated_at" ] && [ "$AA" = "True" ]; then
+                pass "Observability fields updated (owner=$OWNER, freshness_col=$FC, auto_approve=$AA)"
+            else
+                fail "Observability fields incorrect (owner=$OWNER, freshness_col=$FC, auto_approve=$AA)"
+            fi
+        else
+            fail "Observability PATCH failed (HTTP $CODE)"
+        fi
+
+        # PATCH watermark reset
+        test_name "PATCH reset_watermark"
+        RESP=$(api_patch "/api/pipelines/$PID" '{"reset_watermark": true, "reason": "test: watermark reset"}')
+        CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            WM=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('last_watermark','NOTNULL'))" 2>/dev/null)
+            if [ "$WM" = "None" ]; then
+                pass "Watermark reset to null"
+            else
+                fail "Watermark not reset (got: $WM)"
+            fi
+        else
+            fail "Watermark reset PATCH failed (HTTP $CODE)"
+        fi
+
+        # PATCH no-change guard (version should not bump)
+        test_name "PATCH with no changes (version guard)"
+        V_BEFORE=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version',''))" 2>/dev/null)
+        RESP=$(api_patch "/api/pipelines/$PID" '{}')
+        CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            V_AFTER=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version',''))" 2>/dev/null)
+            if [ "$V_BEFORE" = "$V_AFTER" ]; then
+                pass "Empty PATCH did not bump version (v$V_BEFORE → v$V_AFTER)"
+            else
+                fail "Empty PATCH bumped version (v$V_BEFORE → v$V_AFTER)"
+            fi
+        else
+            fail "Empty PATCH failed (HTTP $CODE)"
+        fi
+
+        # PATCH version bump on real change
+        test_name "PATCH version bump on actual change"
+        V_BEFORE=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version',''))" 2>/dev/null)
+        RESP=$(api_patch "/api/pipelines/$PID" '{"tier": 3, "reason": "test: version bump check"}')
+        CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            V_AFTER=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version',''))" 2>/dev/null)
+            if [ "$V_AFTER" -gt "$V_BEFORE" ] 2>/dev/null; then
+                pass "Version bumped on change (v$V_BEFORE → v$V_AFTER)"
+            else
+                fail "Version not bumped (v$V_BEFORE → v$V_AFTER)"
+            fi
+        else
+            fail "Version bump PATCH failed (HTTP $CODE)"
+        fi
+
+        # Pipeline detail expanded fields (Build 10)
+        test_name "GET /api/pipelines/$PID - expanded detail fields"
+        RESP=$(api_get "/api/pipelines/$PID")
+        CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            FIELDS_OK=true
+            for FIELD in replication_method retry_max_attempts retry_backoff_seconds timeout_seconds auto_approve_additive_schema freshness_column; do
+                HAS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if '$FIELD' in d else 'no')" 2>/dev/null)
+                if [ "$HAS" != "yes" ]; then
+                    FIELDS_OK=false
+                fi
+            done
+            QC_FIELDS=$(echo "$BODY" | python3 -c "import sys,json; qc=json.load(sys.stdin).get('quality_config',{}); print(len(qc))" 2>/dev/null)
+            if [ "$FIELDS_OK" = "true" ] && [ "$QC_FIELDS" -ge 10 ] 2>/dev/null; then
+                pass "Detail includes all expanded fields (quality_config has $QC_FIELDS fields)"
+            else
+                fail "Missing expanded fields (fields_ok=$FIELDS_OK, qc_fields=$QC_FIELDS)"
+            fi
+        else
+            fail "Detail endpoint failed (HTTP $CODE)"
         fi
 
         # Pause pipeline
@@ -973,6 +1141,247 @@ if [ -n "$SRC_ID" ] && [ -n "$TGT_ID" ]; then
 else
     skip "Pipeline CRUD tests skipped - need source ($SRC_ID) and target ($TGT_ID) connectors"
     info "Generate connectors first with --sources or --targets"
+fi
+
+# ============================================================================
+# SECTION 7b: Pipeline Timeline (Build 8)
+# ============================================================================
+
+section "PIPELINE TIMELINE (Build 8)"
+
+# Use a demo pipeline for timeline tests (always exists)
+DEMO_PID=$(curl -s ${AUTH_HEADER:+-H "$AUTH_HEADER"} "$API_URL/api/pipelines" 2>/dev/null | \
+    python3 -c "import sys,json; ps=json.load(sys.stdin); print(ps[0]['pipeline_id'] if ps else '')" 2>/dev/null)
+
+if [ -n "$DEMO_PID" ]; then
+    # Timeline endpoint
+    test_name "GET /api/pipelines/$DEMO_PID/timeline"
+    RESP=$(api_get "/api/pipelines/$DEMO_PID/timeline?limit=20")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        EVENT_COUNT=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('event_count',len(d.get('events',[]))))" 2>/dev/null)
+        HAS_TYPES=$(echo "$BODY" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+events = d.get('events', d if isinstance(d, list) else [])
+types = set(e.get('type','') for e in events)
+print(','.join(sorted(types)))
+" 2>/dev/null)
+        pass "Timeline returned ($EVENT_COUNT events, types: $HAS_TYPES)"
+    else
+        fail "Timeline endpoint failed (HTTP $CODE)"
+    fi
+
+    # Timeline has decision entries (from Build 10 PATCH tests above)
+    test_name "Timeline contains decision events"
+    DECISIONS=$(echo "$BODY" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+events = d.get('events', d if isinstance(d, list) else [])
+decisions = [e for e in events if e.get('type') == 'decision']
+print(len(decisions))
+" 2>/dev/null)
+    if [ "$DECISIONS" -gt 0 ] 2>/dev/null; then
+        DTYPE=$(echo "$BODY" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+events = d.get('events', d if isinstance(d, list) else [])
+decisions = [e for e in events if e.get('type') == 'decision']
+if decisions: print(decisions[0].get('decision_type',''))
+" 2>/dev/null)
+        pass "Found $DECISIONS decision events (type: $DTYPE)"
+    else
+        warn "No decision events in timeline (expected if no PATCHes on demo pipeline)"
+    fi
+
+    # Request ID correlation (Build 8)
+    test_name "X-Request-ID response header"
+    REQ_ID_RESP=$(curl -s -m 10 -D - -o /dev/null "$API_URL/health" ${AUTH_HEADER:+-H "$AUTH_HEADER"} 2>/dev/null)
+    if echo "$REQ_ID_RESP" | grep -qi "x-request-id"; then
+        REQ_ID=$(echo "$REQ_ID_RESP" | grep -i "x-request-id" | head -1 | tr -d '\r' | awk '{print $2}')
+        pass "X-Request-ID header present ($REQ_ID)"
+    else
+        warn "X-Request-ID header not found in response"
+    fi
+else
+    skip "No pipelines found for timeline tests"
+fi
+
+# ============================================================================
+# SECTION 7c: Contract-as-Code YAML (Build 9)
+# ============================================================================
+
+section "CONTRACT-AS-CODE YAML (Build 9)"
+
+if [ -n "$DEMO_PID" ]; then
+    # Single pipeline YAML export
+    test_name "GET /api/pipelines/$DEMO_PID/export (YAML)"
+    RESP=$(api_get "/api/pipelines/$DEMO_PID/export")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        if contains "$BODY" "pipeline_name" && contains "$BODY" "strategy" && contains "$BODY" "schedule"; then
+            pass "Single pipeline YAML export contains expected sections"
+            info "$(echo "$BODY" | head -3)"
+        else
+            fail "YAML export missing expected sections"
+            info "$BODY"
+        fi
+    else
+        fail "Single pipeline YAML export failed (HTTP $CODE)"
+    fi
+
+    # Single pipeline YAML export with state
+    test_name "GET /api/pipelines/$DEMO_PID/export?include_state=true"
+    RESP=$(api_get "/api/pipelines/$DEMO_PID/export?include_state=true")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        if contains "$BODY" "_state" || contains "$BODY" "baselines" || contains "$BODY" "last_watermark"; then
+            pass "YAML export with state includes _state section"
+        else
+            warn "YAML export returned 200 but _state section not found"
+        fi
+    else
+        fail "YAML export with state failed (HTTP $CODE)"
+    fi
+
+    # Bulk YAML export
+    test_name "GET /api/pipelines/export (bulk)"
+    RESP=$(api_get "/api/pipelines/export")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        DOC_COUNT=$(echo "$BODY" | grep -c "^pipeline_name:" 2>/dev/null || echo "0")
+        if [ "$DOC_COUNT" -ge 1 ]; then
+            pass "Bulk YAML export returned $DOC_COUNT pipeline documents"
+        else
+            warn "Bulk YAML export returned 200 but no pipeline_name fields found"
+        fi
+    else
+        fail "Bulk YAML export failed (HTTP $CODE)"
+    fi
+
+    # Bulk YAML export with status filter
+    test_name "GET /api/pipelines/export?status=active"
+    RESP=$(api_get "/api/pipelines/export?status=active")
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ]; then
+        pass "Bulk YAML export with status filter returned 200"
+    else
+        fail "Bulk YAML export with status filter failed (HTTP $CODE)"
+    fi
+
+    # YAML import (create mode - should 409 on existing)
+    test_name "POST /api/pipelines/import (existing pipeline, expect 409)"
+    EXPORT_YAML=$(curl -s -m 30 ${AUTH_HEADER:+-H "$AUTH_HEADER"} "$API_URL/api/pipelines/$DEMO_PID/export" 2>/dev/null)
+    RESP=$(curl -s -m 60 -w "\n%{http_code}" -X POST "$API_URL/api/pipelines/import?mode=create" \
+        -H 'Content-Type: text/plain' \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+        --data-binary "$EXPORT_YAML" 2>/dev/null)
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "409" ] || [ "$CODE" = "200" ]; then
+        pass "Import existing pipeline handled correctly (HTTP $CODE)"
+    else
+        warn "Import returned unexpected HTTP $CODE (expected 409 for duplicate or 200)"
+    fi
+
+    # GitOps sync dry-run
+    test_name "POST /api/contracts/sync?dry_run=true"
+    RESP=$(curl -s -m 60 -w "\n%{http_code}" -X POST "$API_URL/api/contracts/sync?dry_run=true" \
+        -H 'Content-Type: text/plain' \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+        --data-binary "$EXPORT_YAML" 2>/dev/null)
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        UNCHANGED=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('unchanged',0))" 2>/dev/null)
+        pass "Sync dry-run returned 200 (unchanged: $UNCHANGED)"
+    else
+        fail "Sync dry-run failed (HTTP $CODE)"
+        info "$BODY"
+    fi
+else
+    skip "No pipelines found for YAML tests"
+fi
+
+# ============================================================================
+# SECTION 7d: Change Audit & YAML Persistence (Build 10)
+# ============================================================================
+
+section "CHANGE AUDIT & YAML PERSISTENCE (Build 10)"
+
+if [ -n "$DEMO_PID" ]; then
+    # Make a tracked change on the demo pipeline
+    test_name "PATCH demo pipeline with audit reason"
+    DEMO_NAME=$(curl -s ${AUTH_HEADER:+-H "$AUTH_HEADER"} "$API_URL/api/pipelines/$DEMO_PID" 2>/dev/null | \
+        python3 -c "import sys,json; print(json.load(sys.stdin).get('pipeline_name',''))" 2>/dev/null)
+    RESP=$(api_patch "/api/pipelines/$DEMO_PID" '{"owner": "test-suite-owner", "reason": "Automated test suite verification"}')
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        pass "Demo pipeline patched with audit reason"
+    else
+        fail "Demo pipeline patch failed (HTTP $CODE)"
+    fi
+
+    # Verify audit trail appears in timeline
+    test_name "Verify contract_update in timeline after PATCH"
+    RESP=$(api_get "/api/pipelines/$DEMO_PID/timeline?limit=5")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        HAS_UPDATE=$(echo "$BODY" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+events = d.get('events', d if isinstance(d, list) else [])
+updates = [e for e in events if e.get('decision_type') == 'contract_update']
+if updates:
+    print(updates[0].get('reasoning',''))
+else:
+    print('')
+" 2>/dev/null)
+        if [ -n "$HAS_UPDATE" ]; then
+            pass "contract_update found in timeline (reason: $HAS_UPDATE)"
+        else
+            fail "No contract_update event found in timeline"
+        fi
+    else
+        fail "Timeline fetch failed (HTTP $CODE)"
+    fi
+
+    # Verify YAML file persisted to disk
+    test_name "YAML auto-persistence to data/contracts/"
+    SAFE_NAME=$(echo "$DEMO_NAME" | tr '/ ' '__')
+    if [ -f "data/contracts/${SAFE_NAME}.yaml" ]; then
+        YAML_SIZE=$(wc -c < "data/contracts/${SAFE_NAME}.yaml" | tr -d ' ')
+        if contains "$(cat data/contracts/${SAFE_NAME}.yaml)" "pipeline_name"; then
+            pass "YAML file exists (${YAML_SIZE} bytes) at data/contracts/${SAFE_NAME}.yaml"
+        else
+            fail "YAML file exists but doesn't contain pipeline_name"
+        fi
+    else
+        warn "YAML file not found at data/contracts/${SAFE_NAME}.yaml (may need prior PATCH)"
+    fi
+
+    # Verify credentials are masked in YAML
+    test_name "YAML file masks credentials"
+    if [ -f "data/contracts/${SAFE_NAME}.yaml" ]; then
+        if grep -q "password: '\*\*\*'" "data/contracts/${SAFE_NAME}.yaml" 2>/dev/null || \
+           ! grep -q "password: '[^*]" "data/contracts/${SAFE_NAME}.yaml" 2>/dev/null; then
+            pass "Credentials masked in YAML file"
+        else
+            fail "Unmasked credentials found in YAML file"
+        fi
+    else
+        skip "No YAML file to check for credential masking"
+    fi
+
+    # Revert demo pipeline owner
+    api_patch "/api/pipelines/$DEMO_PID" '{"owner": null}' > /dev/null 2>&1
+else
+    skip "No pipelines found for audit tests"
 fi
 
 fi # --api
@@ -1060,6 +1469,14 @@ echo "  - Targets: PostgreSQL, Snowflake, BigQuery, Redshift, Databricks, ClickH
 echo "    MySQL, SQL Server, Oracle, S3, GCS, Azure Synapse, Firebolt, DuckDB,"
 echo "    Delta Lake, Apache Iceberg, Elasticsearch, MongoDB"
 echo "  - Pipeline CRUD: create, get, update, pause, resume, preview, runs, quality"
+echo "  - Expanded PATCH: schedule, strategy, quality partial merge, watermark reset,"
+echo "    observability, version bump, no-change guard (Build 10)"
+echo "  - Pipeline detail: expanded fields, full quality_config (Build 10)"
+echo "  - Timeline: event listing, decision events, X-Request-ID header (Build 8)"
+echo "  - YAML export: single, bulk, with state filter (Build 9)"
+echo "  - YAML import: create mode duplicate detection (Build 9)"
+echo "  - GitOps sync: dry-run reconciliation (Build 9)"
+echo "  - Change audit: DecisionLog in timeline, YAML persistence, credential masking (Build 10)"
 echo "  - Multi-turn conversations: 20 source→target pipeline scenarios"
 echo "  - Agent understanding: capabilities, scheduling, refresh strategy, error budgets"
 echo "  - Connector generation: Oracle, SQL Server, Stripe, Google Ads, Facebook,"

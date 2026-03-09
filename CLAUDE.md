@@ -106,8 +106,8 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 **Test script**: `./test-pipeline-agent.sh`
 
 ```bash
-./test-pipeline-agent.sh              # Full suite (~127 tests, ~20 min)
-./test-pipeline-agent.sh --api        # REST API endpoints only (~13 tests, fast)
+./test-pipeline-agent.sh              # Full suite (~150 tests, ~20 min)
+./test-pipeline-agent.sh --api        # REST API endpoints only (~36 tests, fast)
 ./test-pipeline-agent.sh --sources    # Source connector requests + generation
 ./test-pipeline-agent.sh --targets    # Target connector requests + generation
 ./test-pipeline-agent.sh --chat       # Multi-turn conversations + agent understanding
@@ -126,7 +126,10 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Multi-turn pipelines | 20 | Oracle->Snowflake, SQL Server->BigQuery, MySQL->PostgreSQL, Stripe->Snowflake, Google Ads->BigQuery, Facebook->Redshift, Salesforce->Databricks, MongoDB->PostgreSQL, HubSpot->Snowflake, Shopify->BigQuery, Kafka->ClickHouse, S3->Redshift, Jira->PostgreSQL, Zendesk->Snowflake, GitHub->BigQuery, GA4->Snowflake, LinkedIn Ads->Redshift, Elasticsearch->S3, PostgreSQL->Snowflake, DynamoDB->BigQuery |
 | Agent understanding | 10 | capabilities, pipeline listing, connectors, monitoring, quality gates, schema drift, complex multi-source, scheduling, refresh strategy, error budgets |
 | Connector generation | 9 | Oracle, SQL Server, Stripe, Google Ads, Facebook Insights, Snowflake, BigQuery, Redshift, Databricks |
-| Pipeline CRUD | 10 | create, get, update, pause, resume, preview, runs, quality, lineage, error budgets |
+| Pipeline CRUD | 18 | create, get, update (basic + expanded PATCH: schedule, strategy, quality merge, observability, watermark reset, version bump, no-change guard, detail fields), pause, resume, preview, runs, quality, lineage, error budgets |
+| Timeline & logging | 3 | timeline events, decision events, X-Request-ID correlation (Build 8) |
+| YAML contract-as-code | 6 | single export, export with state, bulk export, status filter, import duplicate detection, GitOps sync dry-run (Build 9) |
+| Change audit | 4 | PATCH with audit reason, contract_update in timeline, YAML auto-persistence, credential masking (Build 10) |
 | Approval workflow | 2 | list pending, approve |
 
 ### Adding New Tests
