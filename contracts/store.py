@@ -224,6 +224,12 @@ class ContractStore:
         )
         return _row_to_pipeline(row) if row else None
 
+    async def get_pipeline_by_name(self, pipeline_name: str) -> Optional[PipelineContract]:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM pipelines WHERE pipeline_name = $1", pipeline_name
+        )
+        return _row_to_pipeline(row) if row else None
+
     async def list_pipelines(self, status: Optional[str] = None) -> list[PipelineContract]:
         sql = "SELECT * FROM pipelines WHERE TRUE"
         params: list = []

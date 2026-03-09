@@ -63,6 +63,10 @@ class Config:
         return os.path.join(self.data_dir, "logs")
 
     @property
+    def contracts_dir(self):
+        return os.path.join(self.data_dir, "contracts")
+
+    @property
     def has_api_key(self):
         return bool(self.api_key)
 

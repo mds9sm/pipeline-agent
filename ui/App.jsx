@@ -363,6 +363,10 @@ function PipelinesView({ tierFilter }) {
   const [expanded, setExpanded] = useState(null);
   const [detail, setDetail] = useState(null);
   const [runs, setRuns] = useState([]);
+  const [editForm, setEditForm] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [yamlView, setYamlView] = useState(null);
+  const [timeline, setTimeline] = useState([]);
 
   useEffect(() => {
     const tierParam = tierFilter !== "All" ? `&tier=${tierFilter[1]}` : "";
@@ -372,15 +376,128 @@ function PipelinesView({ tierFilter }) {
   async function expand(p) {
     if (expanded === p.pipeline_id) {
       setExpanded(null);
+      setEditForm(null);
+      setYamlView(null);
+      setTimeline([]);
       return;
     }
     setExpanded(p.pipeline_id);
+    setEditForm(null);
+    setYamlView(null);
+    setTimeline([]);
     const [d, r] = await Promise.all([
       api("GET", `/api/pipelines/${p.pipeline_id}`),
       api("GET", `/api/pipelines/${p.pipeline_id}/runs?limit=5`),
     ]);
     setDetail(d);
     setRuns(r);
+  }
+
+  function startEditing() {
+    if (!detail) return;
+    const qc = detail.quality_config || {};
+    setEditForm({
+      schedule_cron: detail.schedule_cron || "",
+      retry_max_attempts: detail.retry_max_attempts ?? 3,
+      retry_backoff_seconds: detail.retry_backoff_seconds ?? 60,
+      timeout_seconds: detail.timeout_seconds ?? 3600,
+      refresh_type: detail.refresh_type || "full",
+      replication_method: detail.replication_method || "watermark",
+      incremental_column: detail.incremental_column || "",
+      load_type: detail.load_type || "append",
+      merge_keys: (detail.merge_keys || []).join(", "),
+      last_watermark: detail.last_watermark || "",
+      reset_watermark: false,
+      count_tolerance: qc.count_tolerance ?? 0.001,
+      volume_z_score_warn: qc.volume_z_score_warn ?? 2.0,
+      volume_z_score_fail: qc.volume_z_score_fail ?? 3.0,
+      null_rate_stddev_threshold: qc.null_rate_stddev_threshold ?? 2.0,
+      freshness_warn_multiplier: qc.freshness_warn_multiplier ?? 2.0,
+      freshness_fail_multiplier: qc.freshness_fail_multiplier ?? 5.0,
+      promote_on_warn: qc.promote_on_warn ?? true,
+      halt_on_first_fail: qc.halt_on_first_fail ?? true,
+      tier: detail.tier || 2,
+      owner: detail.owner || "",
+      freshness_column: detail.freshness_column || "",
+      tags_json: JSON.stringify(detail.tags || {}, null, 2),
+      auto_approve_additive_schema: detail.auto_approve_additive_schema || false,
+      reason: "",
+    });
+  }
+
+  async function saveSettings() {
+    if (!editForm || !detail) return;
+    setSaving(true);
+    try {
+      const body = {};
+      // Schedule
+      if (editForm.schedule_cron !== (detail.schedule_cron || "")) body.schedule_cron = editForm.schedule_cron;
+      if (editForm.retry_max_attempts !== (detail.retry_max_attempts ?? 3)) body.retry_max_attempts = parseInt(editForm.retry_max_attempts);
+      if (editForm.retry_backoff_seconds !== (detail.retry_backoff_seconds ?? 60)) body.retry_backoff_seconds = parseInt(editForm.retry_backoff_seconds);
+      if (editForm.timeout_seconds !== (detail.timeout_seconds ?? 3600)) body.timeout_seconds = parseInt(editForm.timeout_seconds);
+      // Strategy
+      if (editForm.refresh_type !== (detail.refresh_type || "full")) body.refresh_type = editForm.refresh_type;
+      if (editForm.replication_method !== (detail.replication_method || "watermark")) body.replication_method = editForm.replication_method;
+      if (editForm.incremental_column !== (detail.incremental_column || "")) body.incremental_column = editForm.incremental_column;
+      if (editForm.load_type !== (detail.load_type || "append")) body.load_type = editForm.load_type;
+      const newMergeKeys = editForm.merge_keys.split(",").map((s) => s.trim()).filter(Boolean);
+      if (JSON.stringify(newMergeKeys) !== JSON.stringify(detail.merge_keys || [])) body.merge_keys = newMergeKeys;
+      if (editForm.reset_watermark) body.reset_watermark = true;
+      // Quality
+      const qc = detail.quality_config || {};
+      const qualityUpdates = {};
+      if (parseFloat(editForm.count_tolerance) !== (qc.count_tolerance ?? 0.001)) qualityUpdates.count_tolerance = parseFloat(editForm.count_tolerance);
+      if (parseFloat(editForm.volume_z_score_warn) !== (qc.volume_z_score_warn ?? 2.0)) qualityUpdates.volume_z_score_warn = parseFloat(editForm.volume_z_score_warn);
+      if (parseFloat(editForm.volume_z_score_fail) !== (qc.volume_z_score_fail ?? 3.0)) qualityUpdates.volume_z_score_fail = parseFloat(editForm.volume_z_score_fail);
+      if (parseFloat(editForm.null_rate_stddev_threshold) !== (qc.null_rate_stddev_threshold ?? 2.0)) qualityUpdates.null_rate_stddev_threshold = parseFloat(editForm.null_rate_stddev_threshold);
+      if (parseFloat(editForm.freshness_warn_multiplier) !== (qc.freshness_warn_multiplier ?? 2.0)) qualityUpdates.freshness_warn_multiplier = parseFloat(editForm.freshness_warn_multiplier);
+      if (parseFloat(editForm.freshness_fail_multiplier) !== (qc.freshness_fail_multiplier ?? 5.0)) qualityUpdates.freshness_fail_multiplier = parseFloat(editForm.freshness_fail_multiplier);
+      if (editForm.promote_on_warn !== (qc.promote_on_warn ?? true)) qualityUpdates.promote_on_warn = editForm.promote_on_warn;
+      if (editForm.halt_on_first_fail !== (qc.halt_on_first_fail ?? true)) qualityUpdates.halt_on_first_fail = editForm.halt_on_first_fail;
+      if (Object.keys(qualityUpdates).length > 0) body.quality_config = qualityUpdates;
+      // Observability
+      if (parseInt(editForm.tier) !== (detail.tier || 2)) body.tier = parseInt(editForm.tier);
+      if (editForm.owner !== (detail.owner || "")) body.owner = editForm.owner;
+      if (editForm.freshness_column !== (detail.freshness_column || "")) body.freshness_column = editForm.freshness_column;
+      try { const newTags = JSON.parse(editForm.tags_json); if (JSON.stringify(newTags) !== JSON.stringify(detail.tags || {})) body.tags = newTags; } catch {}
+      if (editForm.auto_approve_additive_schema !== (detail.auto_approve_additive_schema || false)) body.auto_approve_additive_schema = editForm.auto_approve_additive_schema;
+      if (editForm.reason) body.reason = editForm.reason;
+
+      if (Object.keys(body).length === 0 || (Object.keys(body).length === 1 && body.reason)) {
+        window.alert("No changes detected.");
+        setSaving(false);
+        return;
+      }
+
+      const updated = await api("PATCH", `/api/pipelines/${detail.pipeline_id}`, body);
+      setDetail(updated);
+      setEditForm(null);
+      setPipelines((ps) => ps.map((pp) => pp.pipeline_id === updated.pipeline_id ? { ...pp, ...updated } : pp));
+    } catch (e) {
+      window.alert("Save failed: " + (e.message || e));
+    }
+    setSaving(false);
+  }
+
+  async function loadYaml() {
+    if (yamlView) { setYamlView(null); return; }
+    if (!detail) return;
+    try {
+      const resp = await fetch(`/api/pipelines/${detail.pipeline_id}/export`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
+      });
+      const text = await resp.text();
+      setYamlView(text);
+    } catch (e) { console.error(e); }
+  }
+
+  async function loadTimeline() {
+    if (timeline.length > 0) { setTimeline([]); return; }
+    if (!detail) return;
+    try {
+      const data = await api("GET", `/api/pipelines/${detail.pipeline_id}/timeline?limit=20`);
+      setTimeline(Array.isArray(data) ? data : (data.events || []));
+    } catch (e) { console.error(e); }
   }
 
   async function trigger(id) {
@@ -549,12 +666,206 @@ function PipelinesView({ tierFilter }) {
                   </div>
                 </div>
 
+                {/* ---- Edit Settings Panel ---- */}
+                {editForm && (
+                  <div className="border-2 border-blue-300 rounded-xl p-4 bg-blue-50/30 space-y-4">
+                    <div className="text-xs font-semibold text-blue-600 mb-2">Edit Settings</div>
+
+                    {/* Schedule */}
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1.5">Schedule</div>
+                      <div className="grid grid-cols-4 gap-2">
+                        <label className="text-xs text-stone-500">
+                          Cron
+                          <input className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs font-mono bg-white" value={editForm.schedule_cron} onChange={(e) => setEditForm({...editForm, schedule_cron: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Retry attempts
+                          <input type="number" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.retry_max_attempts} onChange={(e) => setEditForm({...editForm, retry_max_attempts: parseInt(e.target.value) || 0})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Backoff (s)
+                          <input type="number" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.retry_backoff_seconds} onChange={(e) => setEditForm({...editForm, retry_backoff_seconds: parseInt(e.target.value) || 0})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Timeout (s)
+                          <input type="number" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.timeout_seconds} onChange={(e) => setEditForm({...editForm, timeout_seconds: parseInt(e.target.value) || 0})} />
+                        </label>
+                      </div>
+                    </div>
+
+                    {/* Strategy */}
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1.5">Strategy</div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <label className="text-xs text-stone-500">
+                          Refresh type
+                          <select className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.refresh_type} onChange={(e) => setEditForm({...editForm, refresh_type: e.target.value})}>
+                            <option value="full">full</option>
+                            <option value="incremental">incremental</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Load type
+                          <select className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.load_type} onChange={(e) => setEditForm({...editForm, load_type: e.target.value})}>
+                            <option value="append">append</option>
+                            <option value="merge">merge</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Replication
+                          <select className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.replication_method} onChange={(e) => setEditForm({...editForm, replication_method: e.target.value})}>
+                            <option value="watermark">watermark</option>
+                            <option value="cdc">cdc</option>
+                            <option value="snapshot">snapshot</option>
+                          </select>
+                        </label>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 mt-2">
+                        <label className="text-xs text-stone-500">
+                          Incremental column
+                          <input className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs font-mono bg-white" value={editForm.incremental_column} onChange={(e) => setEditForm({...editForm, incremental_column: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Merge keys (comma-sep)
+                          <input className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs font-mono bg-white" value={editForm.merge_keys} onChange={(e) => setEditForm({...editForm, merge_keys: e.target.value})} />
+                        </label>
+                        <div className="flex items-end gap-2">
+                          <label className="text-xs text-stone-500 flex-1">
+                            Watermark
+                            <input className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs font-mono bg-white" value={editForm.last_watermark} disabled={editForm.reset_watermark} onChange={(e) => setEditForm({...editForm, last_watermark: e.target.value})} />
+                          </label>
+                          <button
+                            onClick={() => setEditForm({...editForm, reset_watermark: !editForm.reset_watermark})}
+                            className={`text-xs px-2 py-1 rounded border mb-0.5 ${editForm.reset_watermark ? "bg-red-100 border-red-300 text-red-600" : "border-stone-300 text-stone-500 hover:bg-stone-100"}`}
+                          >
+                            {editForm.reset_watermark ? "Will Reset" : "Reset"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Quality */}
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1.5">Quality Thresholds</div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <label className="text-xs text-stone-500">
+                          Count tolerance
+                          <input type="number" step="0.001" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.count_tolerance} onChange={(e) => setEditForm({...editForm, count_tolerance: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Volume Z warn
+                          <input type="number" step="0.1" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.volume_z_score_warn} onChange={(e) => setEditForm({...editForm, volume_z_score_warn: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Volume Z fail
+                          <input type="number" step="0.1" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.volume_z_score_fail} onChange={(e) => setEditForm({...editForm, volume_z_score_fail: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Null rate stddev
+                          <input type="number" step="0.1" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.null_rate_stddev_threshold} onChange={(e) => setEditForm({...editForm, null_rate_stddev_threshold: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Freshness warn ×
+                          <input type="number" step="0.1" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.freshness_warn_multiplier} onChange={(e) => setEditForm({...editForm, freshness_warn_multiplier: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Freshness fail ×
+                          <input type="number" step="0.1" className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.freshness_fail_multiplier} onChange={(e) => setEditForm({...editForm, freshness_fail_multiplier: e.target.value})} />
+                        </label>
+                      </div>
+                      <div className="flex gap-4 mt-2">
+                        <label className="text-xs text-stone-500 flex items-center gap-1.5">
+                          <input type="checkbox" checked={editForm.promote_on_warn} onChange={(e) => setEditForm({...editForm, promote_on_warn: e.target.checked})} />
+                          Promote on warn
+                        </label>
+                        <label className="text-xs text-stone-500 flex items-center gap-1.5">
+                          <input type="checkbox" checked={editForm.halt_on_first_fail} onChange={(e) => setEditForm({...editForm, halt_on_first_fail: e.target.checked})} />
+                          Halt on first fail
+                        </label>
+                      </div>
+                    </div>
+
+                    {/* Observability */}
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1.5">Observability</div>
+                      <div className="grid grid-cols-4 gap-2">
+                        <label className="text-xs text-stone-500">
+                          Tier
+                          <select className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.tier} onChange={(e) => setEditForm({...editForm, tier: parseInt(e.target.value)})}>
+                            <option value={1}>T1 - Critical</option>
+                            <option value={2}>T2 - Standard</option>
+                            <option value={3}>T3 - Best-effort</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Owner
+                          <input className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.owner} onChange={(e) => setEditForm({...editForm, owner: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Freshness column
+                          <input className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs font-mono bg-white" value={editForm.freshness_column} onChange={(e) => setEditForm({...editForm, freshness_column: e.target.value})} />
+                        </label>
+                        <label className="text-xs text-stone-500 flex items-end gap-1.5 pb-0.5">
+                          <input type="checkbox" checked={editForm.auto_approve_additive_schema} onChange={(e) => setEditForm({...editForm, auto_approve_additive_schema: e.target.checked})} />
+                          Auto-approve additive
+                        </label>
+                      </div>
+                      <label className="text-xs text-stone-500 block mt-2">
+                        Tags (JSON)
+                        <textarea className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs font-mono bg-white" rows={2} value={editForm.tags_json} onChange={(e) => setEditForm({...editForm, tags_json: e.target.value})} />
+                      </label>
+                    </div>
+
+                    {/* Footer: reason + save */}
+                    <div className="flex items-end gap-2 pt-2 border-t border-blue-200">
+                      <label className="text-xs text-stone-500 flex-1">
+                        Change reason
+                        <input className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" placeholder="Why are you making this change?" value={editForm.reason} onChange={(e) => setEditForm({...editForm, reason: e.target.value})} />
+                      </label>
+                      <button
+                        onClick={saveSettings}
+                        disabled={saving}
+                        className="text-xs px-4 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        {saving ? "Saving..." : "Save Changes"}
+                      </button>
+                      <button
+                        onClick={() => setEditForm(null)}
+                        className="text-xs px-3 py-1.5 border border-stone-300 text-stone-500 rounded-lg hover:bg-stone-100"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="flex gap-2">
                   <button
                     onClick={() => trigger(p.pipeline_id)}
                     className="text-xs px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
                   >
                     Trigger Run
+                  </button>
+                  {!editForm && (
+                    <button
+                      onClick={startEditing}
+                      className="text-xs px-3 py-1.5 border border-blue-300 text-blue-600 rounded-lg hover:bg-blue-50"
+                    >
+                      Edit Settings
+                    </button>
+                  )}
+                  <button
+                    onClick={loadYaml}
+                    className={`text-xs px-3 py-1.5 border rounded-lg ${yamlView ? "border-amber-300 text-amber-600 bg-amber-50" : "border-stone-300 text-stone-500 hover:bg-stone-100"}`}
+                  >
+                    {yamlView ? "Hide YAML" : "View YAML"}
+                  </button>
+                  <button
+                    onClick={loadTimeline}
+                    className={`text-xs px-3 py-1.5 border rounded-lg ${timeline.length > 0 ? "border-purple-300 text-purple-600 bg-purple-50" : "border-stone-300 text-stone-500 hover:bg-stone-100"}`}
+                  >
+                    {timeline.length > 0 ? "Hide Timeline" : "Timeline"}
                   </button>
                   {p.status === "active" ? (
                     <button
@@ -572,6 +883,39 @@ function PipelinesView({ tierFilter }) {
                     </button>
                   )}
                 </div>
+
+                {/* YAML View */}
+                {yamlView && (
+                  <div className="bg-stone-900 rounded-xl p-4 overflow-auto max-h-96">
+                    <pre className="text-xs text-green-400 font-mono whitespace-pre">{yamlView}</pre>
+                  </div>
+                )}
+
+                {/* Timeline */}
+                {timeline.length > 0 && (
+                  <div>
+                    <div className="text-xs font-semibold text-stone-500 mb-2">Change Timeline</div>
+                    <div className="space-y-1.5">
+                      {timeline.filter((e) => e.type === "decision").map((e, i) => (
+                        <div key={i} className="border border-stone-200 rounded-lg px-3 py-2 bg-white">
+                          <div className="flex items-center gap-2 text-xs">
+                            <span className="px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded text-[10px] font-medium">{e.decision_type || "decision"}</span>
+                            <span className="text-stone-400 font-mono">{e.timestamp?.slice(0, 16)}</span>
+                          </div>
+                          {e.detail && (
+                            <div className="text-xs text-stone-500 mt-1 font-mono truncate">{typeof e.detail === "string" ? e.detail : JSON.stringify(e.detail)}</div>
+                          )}
+                          {e.reasoning && (
+                            <div className="text-xs text-stone-400 mt-0.5 italic">{e.reasoning}</div>
+                          )}
+                        </div>
+                      ))}
+                      {timeline.filter((e) => e.type === "decision").length === 0 && (
+                        <div className="text-xs text-stone-300">No change events recorded yet</div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>

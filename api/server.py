@@ -25,6 +25,7 @@ from contracts.models import (
     PipelineDependency, NotificationPolicy, AgentPreference,
     ContractChangeProposal, SchemaVersion, ColumnMapping,
     User, TriggerType, ChangeType,
+    DecisionLog, RefreshType, ReplicationMethod, LoadType, QualityConfig,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -35,9 +36,14 @@ from agent.autonomous import PipelineRunner
 from scheduler.manager import Scheduler
 from monitor.engine import MonitorEngine
 from auth import AuthDependency, create_token
-from crypto import encrypt_dict, decrypt_dict, CREDENTIAL_FIELDS
+from crypto import encrypt_dict, decrypt_dict, encrypt, decrypt, CREDENTIAL_FIELDS
 from config import Config
 from logging_config import set_request_id, request_id_var
+from contracts.yaml_codec import (
+    pipeline_to_yaml, pipelines_to_yaml, yaml_to_pipelines,
+    pipeline_to_dict, diff_contracts, snapshot_state,
+)
+import yaml
 
 log = logging.getLogger(__name__)
 
@@ -131,10 +137,31 @@ class BatchCreateRequest(BaseModel):
 
 
 class UpdatePipelineRequest(BaseModel):
+    # Schedule
     schedule_cron: Optional[str] = None
+    retry_max_attempts: Optional[int] = None
+    retry_backoff_seconds: Optional[int] = None
+    timeout_seconds: Optional[int] = None
+    # Strategy
+    refresh_type: Optional[str] = None
+    replication_method: Optional[str] = None
+    incremental_column: Optional[str] = None
+    load_type: Optional[str] = None
+    merge_keys: Optional[list[str]] = None
+    last_watermark: Optional[str] = None
+    reset_watermark: Optional[bool] = None
+    # Quality
+    quality_config: Optional[dict] = None
+    # Observability
     tier: Optional[int] = None
     owner: Optional[str] = None
     tags: Optional[dict] = None
+    tier_config: Optional[dict] = None
+    freshness_column: Optional[str] = None
+    # Approval
+    auto_approve_additive_schema: Optional[bool] = None
+    # Audit
+    reason: Optional[str] = None
 
 
 class BackfillRequest(BaseModel):
@@ -919,6 +946,41 @@ def create_app(
             pipelines = [p for p in pipelines if getattr(p, "tier", None) == tier]
         return [_pipeline_summary(p) for p in pipelines]
 
+    @app.get("/api/pipelines/export")
+    @limiter.limit("30/minute")
+    async def export_all_pipelines(
+        request: Request,
+        status: Optional[str] = Query(None),
+        include_credentials: bool = Query(False),
+        caller: dict = Depends(auth_dep),
+    ):
+        if include_credentials:
+            require_role(caller, "admin")
+
+        pipelines = await store.list_pipelines(status=status)
+        if not pipelines:
+            return PlainTextResponse(
+                "# No pipelines found\n", media_type="application/x-yaml",
+            )
+
+        mask = not include_credentials
+        if include_credentials and config.has_encryption_key:
+            for p in pipelines:
+                for fld in ("source_password", "target_password"):
+                    val = getattr(p, fld, "")
+                    if val:
+                        try:
+                            setattr(p, fld, decrypt(val, config.encryption_key))
+                        except Exception:
+                            pass
+
+        yaml_str = pipelines_to_yaml(pipelines, mask_credentials=mask)
+        return PlainTextResponse(
+            yaml_str,
+            media_type="application/x-yaml",
+            headers={"Content-Disposition": 'attachment; filename="pipelines.yaml"'},
+        )
+
     @app.get("/api/pipelines/{pipeline_id}")
     @limiter.limit("100/minute")
     async def get_pipeline(
@@ -1009,16 +1071,113 @@ def create_app(
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
+
+        import json as _json
+
+        changes = {}
+
+        # --- Schedule fields ---
         if req.schedule_cron is not None:
+            changes["schedule_cron"] = {"old": p.schedule_cron, "new": req.schedule_cron}
             p.schedule_cron = req.schedule_cron
+        if req.retry_max_attempts is not None:
+            changes["retry_max_attempts"] = {"old": p.retry_max_attempts, "new": req.retry_max_attempts}
+            p.retry_max_attempts = req.retry_max_attempts
+        if req.retry_backoff_seconds is not None:
+            changes["retry_backoff_seconds"] = {"old": p.retry_backoff_seconds, "new": req.retry_backoff_seconds}
+            p.retry_backoff_seconds = req.retry_backoff_seconds
+        if req.timeout_seconds is not None:
+            changes["timeout_seconds"] = {"old": p.timeout_seconds, "new": req.timeout_seconds}
+            p.timeout_seconds = req.timeout_seconds
+
+        # --- Strategy fields ---
+        if req.refresh_type is not None:
+            old_val = p.refresh_type.value if hasattr(p.refresh_type, "value") else p.refresh_type
+            new_enum = RefreshType(req.refresh_type.lower())
+            changes["refresh_type"] = {"old": old_val, "new": new_enum.value}
+            p.refresh_type = new_enum
+        if req.replication_method is not None:
+            old_val = p.replication_method.value if hasattr(p.replication_method, "value") else p.replication_method
+            new_enum = ReplicationMethod(req.replication_method.lower())
+            changes["replication_method"] = {"old": old_val, "new": new_enum.value}
+            p.replication_method = new_enum
+        if req.incremental_column is not None:
+            changes["incremental_column"] = {"old": p.incremental_column, "new": req.incremental_column}
+            p.incremental_column = req.incremental_column
+        if req.load_type is not None:
+            old_val = p.load_type.value if hasattr(p.load_type, "value") else p.load_type
+            new_enum = LoadType(req.load_type.lower())
+            changes["load_type"] = {"old": old_val, "new": new_enum.value}
+            p.load_type = new_enum
+        if req.merge_keys is not None:
+            changes["merge_keys"] = {"old": p.merge_keys, "new": req.merge_keys}
+            p.merge_keys = req.merge_keys
+
+        # Reset watermark (clears it for full repull)
+        if req.reset_watermark:
+            changes["last_watermark"] = {"old": p.last_watermark, "new": None}
+            p.last_watermark = None
+        elif req.last_watermark is not None:
+            changes["last_watermark"] = {"old": p.last_watermark, "new": req.last_watermark}
+            p.last_watermark = req.last_watermark
+
+        # --- Quality config partial merge ---
+        if req.quality_config is not None:
+            qc = p.quality_config or QualityConfig()
+            qc_changes = {}
+            for k, v in req.quality_config.items():
+                if hasattr(qc, k):
+                    old_v = getattr(qc, k)
+                    if old_v != v:
+                        qc_changes[k] = {"old": old_v, "new": v}
+                        setattr(qc, k, v)
+            if qc_changes:
+                changes["quality_config"] = qc_changes
+            p.quality_config = qc
+
+        # --- Observability fields ---
         if req.tier is not None:
+            changes["tier"] = {"old": p.tier, "new": req.tier}
             p.tier = req.tier
         if req.owner is not None:
+            changes["owner"] = {"old": p.owner, "new": req.owner}
             p.owner = req.owner
         if req.tags is not None:
+            changes["tags"] = {"old": p.tags, "new": req.tags}
             p.tags = req.tags
+        if req.tier_config is not None:
+            changes["tier_config"] = {"old": p.tier_config, "new": req.tier_config}
+            p.tier_config = req.tier_config
+        if req.freshness_column is not None:
+            changes["freshness_column"] = {"old": p.freshness_column, "new": req.freshness_column}
+            p.freshness_column = req.freshness_column
+
+        # --- Approval ---
+        if req.auto_approve_additive_schema is not None:
+            changes["auto_approve_additive_schema"] = {"old": p.auto_approve_additive_schema, "new": req.auto_approve_additive_schema}
+            p.auto_approve_additive_schema = req.auto_approve_additive_schema
+
+        if not changes:
+            return await _pipeline_detail(p, store)
+
+        # Bump version and update timestamp
+        p.version += 1
+        p.updated_at = now_iso()
         await store.save_pipeline(p)
-        return _pipeline_summary(p)
+
+        # Audit: save DecisionLog
+        await store.save_decision(DecisionLog(
+            pipeline_id=p.pipeline_id,
+            decision_type="contract_update",
+            detail=_json.dumps(changes, default=str),
+            reasoning=req.reason or "",
+            created_at=now_iso(),
+        ))
+
+        # Persist contract YAML to disk
+        _persist_contract_yaml(p, config)
+
+        return await _pipeline_detail(p, store)
 
     @app.post("/api/pipelines/{pipeline_id}/trigger")
     @limiter.limit("100/minute")
@@ -1192,6 +1351,222 @@ def create_app(
             "pipeline_name": pipeline.pipeline_name,
             "event_count": len(events),
             "events": events,
+        }
+
+    # -----------------------------------------------------------------------
+    # Contract export / import / sync
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/pipelines/{pipeline_id}/export")
+    @limiter.limit("100/minute")
+    async def export_pipeline(
+        request: Request,
+        pipeline_id: str,
+        include_state: bool = Query(False),
+        include_credentials: bool = Query(False),
+        caller: dict = Depends(auth_dep),
+    ):
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        if include_credentials:
+            require_role(caller, "admin")
+            if config.has_encryption_key:
+                for fld in ("source_password", "target_password"):
+                    val = getattr(p, fld, "")
+                    if val:
+                        try:
+                            setattr(p, fld, decrypt(val, config.encryption_key))
+                        except Exception:
+                            pass
+
+        mask = not include_credentials
+
+        if include_state:
+            error_budget = await store.get_error_budget(p.pipeline_id)
+            dependencies = await store.list_dependencies(p.pipeline_id)
+            schema_versions = await store.list_schema_versions(p.pipeline_id)
+
+            eb_dict = asdict(error_budget) if error_budget else None
+            dep_dicts = [asdict(d) for d in dependencies]
+            sv_dicts = [
+                {
+                    "version": sv.version,
+                    "change_summary": sv.change_summary,
+                    "change_type": sv.change_type,
+                    "applied_at": sv.applied_at,
+                }
+                for sv in schema_versions
+            ]
+
+            d = pipeline_to_dict(p, mask_credentials=mask)
+            d["_state"] = snapshot_state(p, eb_dict, dep_dicts, sv_dicts)
+            yaml_str = yaml.dump(
+                d, default_flow_style=False, sort_keys=False, allow_unicode=True,
+            )
+        else:
+            yaml_str = pipeline_to_yaml(p, mask_credentials=mask)
+
+        return PlainTextResponse(
+            yaml_str,
+            media_type="application/x-yaml",
+            headers={
+                "Content-Disposition": f'attachment; filename="{p.pipeline_name}.yaml"',
+            },
+        )
+
+    @app.post("/api/pipelines/import")
+    @limiter.limit("10/minute")
+    async def import_pipelines(
+        request: Request,
+        mode: str = Query("create"),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+
+        if mode not in ("create", "upsert"):
+            raise HTTPException(400, "mode must be 'create' or 'upsert'")
+
+        body = await request.body()
+        try:
+            pipelines = yaml_to_pipelines(body.decode("utf-8"), preserve_id=False)
+        except Exception as e:
+            raise HTTPException(400, f"Invalid YAML: {e}")
+
+        results = []
+        for p in pipelines:
+            existing = await store.get_pipeline_by_name(p.pipeline_name)
+
+            if existing and mode == "create":
+                raise HTTPException(
+                    409,
+                    f"Pipeline '{p.pipeline_name}' already exists. "
+                    "Use mode=upsert to update.",
+                )
+
+            if existing and mode == "upsert":
+                p.pipeline_id = existing.pipeline_id
+                p.created_at = existing.created_at
+                p.version = existing.version + 1
+                if not p.source_password:
+                    p.source_password = existing.source_password
+                if not p.target_password:
+                    p.target_password = existing.target_password
+                action = "updated"
+            else:
+                action = "created"
+
+            if config.has_encryption_key:
+                for fld in ("source_password", "target_password"):
+                    val = getattr(p, fld, "")
+                    if val and val != "***":
+                        setattr(p, fld, encrypt(val, config.encryption_key))
+
+            p.updated_at = now_iso()
+            await store.save_pipeline(p)
+            results.append({
+                "pipeline_id": p.pipeline_id,
+                "pipeline_name": p.pipeline_name,
+                "action": action,
+                "version": p.version,
+            })
+
+        return results
+
+    @app.post("/api/contracts/sync")
+    @limiter.limit("10/minute")
+    async def sync_contracts(
+        request: Request,
+        dry_run: bool = Query(True),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin")
+
+        body = await request.body()
+        try:
+            incoming_pipelines = yaml_to_pipelines(
+                body.decode("utf-8"), preserve_id=False,
+            )
+        except Exception as e:
+            raise HTTPException(400, f"Invalid YAML: {e}")
+
+        created = []
+        updated = []
+        unchanged = []
+        errors = []
+
+        for incoming in incoming_pipelines:
+            try:
+                existing = await store.get_pipeline_by_name(incoming.pipeline_name)
+
+                if not existing:
+                    if dry_run:
+                        created.append({
+                            "pipeline_name": incoming.pipeline_name,
+                            "action": "create",
+                        })
+                    else:
+                        if config.has_encryption_key:
+                            for fld in ("source_password", "target_password"):
+                                val = getattr(incoming, fld, "")
+                                if val and val != "***":
+                                    setattr(
+                                        incoming, fld,
+                                        encrypt(val, config.encryption_key),
+                                    )
+                        await store.save_pipeline(incoming)
+                        created.append({
+                            "pipeline_id": incoming.pipeline_id,
+                            "pipeline_name": incoming.pipeline_name,
+                        })
+                else:
+                    diffs = diff_contracts(existing, incoming)
+                    if not diffs:
+                        unchanged.append(existing.pipeline_name)
+                    elif dry_run:
+                        updated.append({
+                            "pipeline_name": existing.pipeline_name,
+                            "pipeline_id": existing.pipeline_id,
+                            "diffs": diffs,
+                        })
+                    else:
+                        incoming.pipeline_id = existing.pipeline_id
+                        incoming.created_at = existing.created_at
+                        incoming.version = existing.version + 1
+                        if not incoming.source_password:
+                            incoming.source_password = existing.source_password
+                        if not incoming.target_password:
+                            incoming.target_password = existing.target_password
+                        if config.has_encryption_key:
+                            for fld in ("source_password", "target_password"):
+                                val = getattr(incoming, fld, "")
+                                if val and val != "***":
+                                    setattr(
+                                        incoming, fld,
+                                        encrypt(val, config.encryption_key),
+                                    )
+                        incoming.updated_at = now_iso()
+                        await store.save_pipeline(incoming)
+                        updated.append({
+                            "pipeline_id": incoming.pipeline_id,
+                            "pipeline_name": incoming.pipeline_name,
+                            "diffs": diffs,
+                        })
+            except HTTPException:
+                raise
+            except Exception as e:
+                errors.append({
+                    "pipeline_name": incoming.pipeline_name,
+                    "error": str(e),
+                })
+
+        return {
+            "dry_run": dry_run,
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "errors": errors,
         }
 
     # -----------------------------------------------------------------------
@@ -1871,6 +2246,13 @@ async def _pipeline_detail(p, store: Store) -> dict:
             "merge_keys": p.merge_keys,
             "incremental_column": p.incremental_column,
             "last_watermark": p.last_watermark,
+            "replication_method": p.replication_method.value if hasattr(p.replication_method, "value") else p.replication_method,
+            "retry_max_attempts": p.retry_max_attempts,
+            "retry_backoff_seconds": p.retry_backoff_seconds,
+            "timeout_seconds": p.timeout_seconds,
+            "auto_approve_additive_schema": p.auto_approve_additive_schema,
+            "tier_config": p.tier_config or {},
+            "freshness_column": p.freshness_column,
             "column_mappings": [
                 {
                     "source_column": m.source_column,
@@ -1884,13 +2266,7 @@ async def _pipeline_detail(p, store: Store) -> dict:
             ],
             "target_ddl": p.target_ddl,
             "target_options": p.target_options,
-            "quality_config": {
-                "count_tolerance": p.quality_config.count_tolerance,
-                "promote_on_warn": p.quality_config.promote_on_warn,
-                "halt_on_first_fail": p.quality_config.halt_on_first_fail,
-            }
-            if p.quality_config
-            else None,
+            "quality_config": asdict(p.quality_config) if p.quality_config else {},
             "agent_reasoning": p.agent_reasoning,
             "baseline_row_count": p.baseline_row_count,
             "notification_policy_id": p.notification_policy_id,
@@ -1912,6 +2288,17 @@ async def _pipeline_detail(p, store: Store) -> dict:
     else:
         d["error_budget"] = None
     return d
+
+
+def _persist_contract_yaml(p, config):
+    """Write pipeline contract to YAML file on disk for auditability."""
+    contracts_dir = config.contracts_dir
+    os.makedirs(contracts_dir, exist_ok=True)
+    safe_name = p.pipeline_name.replace("/", "_").replace(" ", "_")
+    path = os.path.join(contracts_dir, f"{safe_name}.yaml")
+    yaml_str = pipeline_to_yaml(p, mask_credentials=True)
+    with open(path, "w") as f:
+        f.write(yaml_str)
 
 
 def _run_summary(r) -> dict:

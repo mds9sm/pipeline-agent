@@ -27,3 +27,6 @@ httpx>=0.26.0
 
 # Scheduling
 croniter>=2.0.1
+
+# Serialization
+pyyaml>=6.0

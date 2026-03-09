@@ -8,6 +8,52 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ## [Unreleased]
 
+### Build 10 - 2026-03-08 (Claude Opus 4.6)
+
+**Pipeline Settings UI + Change Logging + Auto-Persistence**
+
+#### Added
+- **Expanded PATCH `/api/pipelines/{id}`** — 18+ editable fields (was 4). Supports schedule (cron, retry, backoff, timeout), strategy (refresh_type, replication_method, incremental_column, load_type, merge_keys, watermark reset), quality config (partial merge of any QualityConfig field), observability (tier, owner, tags, tier_config, freshness_column), and approval settings (auto_approve_additive_schema). All changes tracked with old→new diffs.
+- **Change audit trail** — Every PATCH saves a `DecisionLog` with `decision_type="contract_update"`, JSON diff of all changed fields, and optional user-provided `reason`. Visible in the Timeline view.
+- **Auto-persist to YAML** — On every contract update, writes `data/contracts/{pipeline_name}.yaml` with masked credentials. Enables Git-based contract versioning.
+- **`_persist_contract_yaml()` helper** — Writes pipeline contract to disk as YAML after each update.
+- **Pipeline Settings UI** — Full edit form in the Pipelines view with 4 grouped sections: Schedule (cron, retry, backoff, timeout), Strategy (refresh type, load type, replication, incremental column, merge keys, watermark reset), Quality (6 threshold inputs + 2 checkboxes), Observability (tier, owner, freshness column, tags JSON, auto-approve). Includes change reason input and Save/Cancel buttons.
+- **YAML view button** — Toggle to display pipeline contract as formatted YAML in a dark-themed `<pre>` block.
+- **Timeline button** — Toggle to show change history (DecisionLog entries filtered to `contract_update` type) with decision type pill, timestamp, detail, and reasoning.
+- **`contracts_dir` config property** — `config.contracts_dir` → `data/contracts/`. Directory auto-created on startup.
+
+#### Changed
+- **`config.py`** — Added `contracts_dir` property.
+- **`main.py`** — Creates `contracts_dir` on startup in `setup_data_dirs()`.
+- **`api/server.py`** — Added `DecisionLog, RefreshType, ReplicationMethod, LoadType, QualityConfig` imports. Expanded `UpdatePipelineRequest` from 4 to 18+ fields. Rewrote PATCH handler with change tracking, version bumping, DecisionLog audit, and YAML persistence. Expanded `_pipeline_detail()` to include `replication_method`, `retry_max_attempts`, `retry_backoff_seconds`, `timeout_seconds`, `auto_approve_additive_schema`, `tier_config`, `freshness_column`, and full `quality_config` (was 3 fields, now all QualityConfig fields via `asdict()`).
+- **`ui/App.jsx`** — Added `editForm`, `saving`, `yamlView`, `timeline` state. Added `startEditing()`, `saveSettings()`, `loadYaml()`, `loadTimeline()` functions. Added settings editor panel, YAML view, timeline display, and 3 new buttons (Edit Settings, View YAML, Timeline).
+
+---
+
+### Build 9 - 2026-03-08 (Claude Opus 4.6)
+
+**Contract-as-Code: YAML export, import, and GitOps sync for pipeline contracts**
+
+#### Added
+- **`contracts/yaml_codec.py` (new file)** — Pure serialization module with 8 functions: `pipeline_to_dict`, `dict_to_pipeline`, `pipeline_to_yaml`, `yaml_to_pipeline`, `pipelines_to_yaml`, `yaml_to_pipelines`, `diff_contracts`, `snapshot_state`. Groups flat PipelineContract fields into human-readable, Git-diff-friendly YAML structure (source/target/strategy/schedule/quality sections).
+- **`GET /api/pipelines/export`** — Bulk export all pipelines as multi-document YAML. `?status=active` filter, `?include_credentials=true` (admin-only, decrypts Fernet-encrypted passwords in-memory).
+- **`GET /api/pipelines/{id}/export`** — Single pipeline YAML export. `?include_state=true` adds runtime state (baselines, error budget, dependencies, schema versions). `?include_credentials=true` (admin-only).
+- **`POST /api/pipelines/import`** — Import pipelines from YAML body. `?mode=create` (default, 409 if exists) or `?mode=upsert` (preserves pipeline_id, bumps version, preserves credentials if masked with `***`).
+- **`POST /api/contracts/sync`** — GitOps reconciliation. `?dry_run=true` (default) returns field-level diffs without applying. `?dry_run=false` creates new pipelines, updates existing. Returns `{created, updated, unchanged, errors}`.
+- **`get_pipeline_by_name()`** — New store method for name-based pipeline lookup (UNIQUE constraint), used by import/sync endpoints.
+
+#### Changed
+- **`requirements.txt`** — Added `pyyaml>=6.0` dependency.
+- **`api/server.py`** — Added YAML codec imports, `encrypt`/`decrypt` imports from crypto, 4 new endpoints.
+
+#### Design decisions
+- `pipeline_name` is the sync key (not `pipeline_id`) — enables same YAML across environments where IDs differ.
+- Credentials masked by default (`"***"`) on export; preserved on import when masked.
+- Runtime state (`_state:` section) exported separately, ignored on import by default.
+- Route ordering: `GET /api/pipelines/export` registered before `GET /api/pipelines/{pipeline_id}` to avoid path collision.
+
+---
+
 ### Build 8 - 2026-03-08 (Claude Opus 4.6)
 
 **Production-grade structured logging with pipeline context propagation**

@@ -57,6 +57,7 @@ def setup_data_dirs(config: Config):
     """Create required data directories."""
     os.makedirs(config.staging_dir, exist_ok=True)
     os.makedirs(os.path.join(config.data_dir, "logs"), exist_ok=True)
+    os.makedirs(config.contracts_dir, exist_ok=True)
 
 
 async def observability_loop(config: Config, store: Store, agent: AgentCore):
