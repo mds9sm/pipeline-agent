@@ -564,9 +564,14 @@ class User:
     id: str = field(default_factory=new_id)
     username: str = ""
     password_hash: str = ""
-    role: str = "viewer"  # admin / editor / viewer
+    role: str = "viewer"  # admin / operator / viewer
+    email: str = ""
     created_at: str = field(default_factory=now_iso)
     last_login: str = ""
+
+    @property
+    def user_id(self) -> str:
+        return self.id
 
 
 # ---------------------------------------------------------------------------

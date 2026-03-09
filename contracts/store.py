@@ -902,16 +902,17 @@ class ContractStore:
     async def save_user(self, u: User) -> None:
         await self.pool.execute("""
             INSERT INTO users (
-                id, username, password_hash, role, created_at, last_login
-            ) VALUES ($1,$2,$3,$4,$5,$6)
+                id, username, password_hash, role, email, created_at, last_login
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7)
             ON CONFLICT (id) DO UPDATE SET
                 username=EXCLUDED.username,
                 password_hash=EXCLUDED.password_hash,
                 role=EXCLUDED.role,
+                email=EXCLUDED.email,
                 last_login=EXCLUDED.last_login
         """,
             u.id, u.username, u.password_hash,
-            u.role, u.created_at, u.last_login,
+            u.role, u.email, u.created_at, u.last_login,
         )
 
 
@@ -1172,6 +1173,7 @@ def _row_to_user(row: asyncpg.Record) -> User:
         username=row["username"],
         password_hash=row["password_hash"],
         role=row["role"],
+        email=row["email"] or "",
         created_at=row["created_at"],
         last_login=row["last_login"] or "",
     )
@@ -1452,6 +1454,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL DEFAULT 'viewer',
+    email TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     last_login TEXT NOT NULL DEFAULT ''
 );

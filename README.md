@@ -2,7 +2,7 @@
 
 An AI-powered data pipeline platform where the agent is the product.
 
-The agent discovers schemas, proposes ingestion strategies, runs pipelines autonomously, validates every load through a 7-check quality gate, monitors for drift and freshness issues, generates its own connector code for new sources and targets on demand, and learns from every human approval and rejection. There are no pre-built integrations beyond two seed connectors -- everything else is generated through conversation.
+The agent discovers schemas, proposes ingestion strategies, runs pipelines autonomously, validates every load through a 7-check quality gate, monitors for drift and freshness issues, generates its own connector code for new sources and targets on demand, and learns from every human approval and rejection. Ships with 8 seed connectors and 4 demo pipelines that run end-to-end on first startup. Additional connectors are generated through conversation.
 
 ---
 
@@ -55,12 +55,12 @@ State lives in **PostgreSQL with pgvector** for persistence and semantic search.
 ### Setup
 
 ```bash
-# 1. Start PostgreSQL with pgvector
+# 1. Start PostgreSQL, demo MySQL, demo MongoDB, mock SaaS APIs
 docker compose up -d
 
 # 2. Configure environment
 cp .env.example .env
-# Edit .env -- at minimum set ANTHROPIC_API_KEY for AI features
+# Edit .env -- set ANTHROPIC_API_KEY for AI features (optional for demo)
 
 # 3. Install dependencies
 pip install -r requirements.txt
@@ -72,11 +72,12 @@ python main.py
 On first start:
 1. An asyncpg connection pool is created against PostgreSQL
 2. All database tables are created (with `IF NOT EXISTS`)
-3. The pgvector extension is enabled
-4. Seed connectors (MySQL source, Redshift target) are written to the DB and loaded
-5. The API server, scheduler, monitor, and observability loops start concurrently
+3. A default admin user is created (admin/admin)
+4. 8 seed connectors are loaded (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebook Insights sources + PostgreSQL, Redshift targets)
+5. 4 demo pipelines are auto-created (MySQL, MongoDB, Stripe sources → PostgreSQL)
+6. The API server, scheduler, monitor, and observability loops start concurrently
 
-Open **http://localhost:8100** to access the UI.
+Open **http://localhost:8100** and log in with **admin / admin**.
 
 ---
 
@@ -84,7 +85,15 @@ Open **http://localhost:8100** to access the UI.
 
 ### JWT Authentication
 
-Enable with `AUTH_ENABLED=true`. Three roles: **admin**, **editor**, **viewer**. Tokens are issued via `POST /api/auth/login` and carry `sub`, `role`, `iat`, `exp` claims. When auth is disabled (default for development), all requests are treated as admin.
+Authentication is **enabled by default** (`AUTH_ENABLED=true`). A default admin user (admin/admin) is auto-created on first startup. Three roles with RBAC enforcement:
+
+| Role | Capabilities |
+|------|-------------|
+| **admin** | Full access — register users, generate/deprecate connectors, manage pipelines, approve proposals |
+| **operator** | Run/manage pipelines, approve proposals, test connectors, view all data |
+| **viewer** | Read-only access to all views and chat |
+
+Tokens are issued via `POST /api/auth/login` and carry `sub`, `role`, `iat`, `exp` claims. Set `AUTH_ENABLED=false` to disable auth for development (all requests treated as admin).
 
 Authentication methods:
 - **Bearer token** in the `Authorization` header

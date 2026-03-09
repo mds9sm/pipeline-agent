@@ -163,6 +163,23 @@ async def main():
         await store.create_tables()
         log.info("  Database tables ready.")
 
+        # 5b. Bootstrap default admin user
+        existing_admin = await store.get_user_by_username("admin")
+        if not existing_admin:
+            import bcrypt as _bcrypt
+            from contracts.models import User
+            hashed = _bcrypt.hashpw(b"admin", _bcrypt.gensalt()).decode("utf-8")
+            admin_user = User(
+                username="admin",
+                password_hash=hashed,
+                role="admin",
+                email="admin@dapos.local",
+            )
+            await store.save_user(admin_user)
+            log.info("  Default admin user created (admin/admin)")
+        else:
+            log.info("  Admin user exists.")
+
         # 6. Build all components with dependency injection
         registry = ConnectorRegistry(store, config)
         agent = AgentCore(config, store)

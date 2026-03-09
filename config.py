@@ -43,10 +43,10 @@ class Config:
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
 
         # Auth
-        self.jwt_secret = os.getenv("JWT_SECRET", "")
+        self.jwt_secret = os.getenv("JWT_SECRET", "") or "dapos-dev-secret-change-in-production"
         self.jwt_algorithm = os.getenv("JWT_ALGORITHM", "HS256")
         self.jwt_expiry_hours = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
-        self.auth_enabled = os.getenv("AUTH_ENABLED", "false").lower() == "true"
+        self.auth_enabled = os.getenv("AUTH_ENABLED", "true").lower() == "true"
 
         # Encryption (Fernet key for credentials at rest)
         self.encryption_key = os.getenv("ENCRYPTION_KEY", "")

@@ -8,6 +8,39 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ## [Unreleased]
 
+### Build 5 - 2026-03-08 (Claude Opus 4.6)
+
+**Authentication enabled by default with RBAC**
+
+#### Added
+- **Default admin user** — auto-created on first startup (admin/admin, admin@dapos.local)
+- **`require_role()` RBAC helper** in `api/server.py` — enforces role-based access on all mutating endpoints
+- **"operator" role** — replaces "editor". Three roles: admin (full access), operator (run/manage pipelines), viewer (read-only)
+- **Role validation** on `RegisterRequest` — rejects invalid roles
+
+#### Fixed
+- **`User.user_id` AttributeError** — `User` model had `id` field but login/register endpoints referenced `user.user_id`. Added `@property user_id` alias.
+- **`User.email` missing** — Register endpoint set `email=req.email` but User model and users table had no email field. Added `email` field to model, DDL, and store methods.
+- **Empty JWT secret** — `JWT_SECRET` defaulted to `""`, making token signing fail. Added fallback dev secret.
+
+#### Changed
+- **`AUTH_ENABLED` default** — changed from `false` to `true`. Auth is now on by default.
+- **`config.py`** — JWT secret falls back to `"dapos-dev-secret-change-in-production"` when not set
+- **RBAC enforcement** on 12 mutating endpoints (connector generate/deprecate, pipeline CRUD/trigger/pause/resume/backfill, approvals)
+
+#### RBAC Matrix
+| Action | admin | operator | viewer |
+|--------|-------|----------|--------|
+| Register users | yes | no | no |
+| Generate/deprecate connectors | yes | no | no |
+| Test connectors | yes | yes | no |
+| Create/update/delete pipelines | yes | yes | no |
+| Trigger/pause/resume/backfill | yes | yes | no |
+| Approve/reject proposals | yes | yes | no |
+| View all data, chat | yes | yes | yes |
+
+---
+
 ### Build 4 - 2026-03-08 (Claude Opus 4.6)
 
 **Freshness monitoring fix + lineage endpoint fix**

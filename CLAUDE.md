@@ -44,7 +44,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `monitor/engine.py` | Drift detection, freshness, lineage impact, alert dispatch |
 | `scheduler/manager.py` | Cron scheduler + topological sort + backfill + retry |
 | `sandbox.py` | AST validation + restricted builtins + import whitelist |
-| `auth.py` | JWT auth with 3 roles (admin, editor, viewer) |
+| `auth.py` | JWT auth with 3 roles (admin, operator, viewer) |
 | `crypto.py` | Fernet encryption for credentials at rest |
 | `ui/App.jsx` | React 18 SPA (CDN, no build) - 9 views including Chat |
 
@@ -61,8 +61,28 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 ```bash
 docker compose up -d          # Start PostgreSQL, demo MySQL, demo MongoDB, mock SaaS APIs
 ANTHROPIC_API_KEY=sk-... python main.py   # Start the app (seeds 8 connectors + 4 demo pipelines)
-# Open http://localhost:8100
+# Open http://localhost:8100  → Login: admin / admin
 ```
+
+## Authentication & RBAC
+
+Auth is **enabled by default** (`AUTH_ENABLED=true`). A default admin user (admin/admin) is auto-created on first startup.
+
+**Roles:** `admin`, `operator`, `viewer`
+
+| Action | admin | operator | viewer |
+|--------|-------|----------|--------|
+| Register users | yes | no | no |
+| Generate/deprecate connectors | yes | no | no |
+| Test connectors | yes | yes | no |
+| Create/update/trigger pipelines | yes | yes | no |
+| Approve/reject proposals | yes | yes | no |
+| View all data, chat | yes | yes | yes |
+
+**Config:**
+- `AUTH_ENABLED` — `true` (default) or `false` to disable
+- `JWT_SECRET` — set in production; dev fallback provided
+- `JWT_EXPIRY_HOURS` — default 24
 
 ## Demo Environment
 

@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query, Depends, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -40,6 +40,14 @@ log = logging.getLogger(__name__)
 
 limiter = Limiter(key_func=get_remote_address)
 
+VALID_ROLES = ("admin", "operator", "viewer")
+
+
+def require_role(caller: dict, *roles: str):
+    """Raise 403 if the caller's role is not in the allowed roles."""
+    if caller.get("role") not in roles:
+        raise HTTPException(403, f"Requires role: {', '.join(roles)}")
+
 
 # ---------------------------------------------------------------------------
 # Pydantic request/response models
@@ -54,7 +62,14 @@ class RegisterRequest(BaseModel):
     username: str
     password: str
     role: str = "viewer"
-    email: Optional[str] = None
+    email: str = ""
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v):
+        if v not in ("admin", "operator", "viewer"):
+            raise ValueError("Role must be admin, operator, or viewer")
+        return v
 
 
 class CommandRequest(BaseModel):
@@ -240,8 +255,7 @@ def create_app(
         req: RegisterRequest = Body(...),
         caller: dict = Depends(auth_dep),
     ):
-        if caller.get("role") != "admin":
-            raise HTTPException(403, "Only admins can register new users")
+        require_role(caller, "admin")
         existing = await store.get_user_by_username(req.username)
         if existing:
             raise HTTPException(409, "Username already taken")
@@ -776,6 +790,7 @@ def create_app(
         req: GenerateConnectorRequest = Body(...),
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin")
         record = await agent.generate_connector(
             req.connector_type, req.db_type, req.params
         )
@@ -817,6 +832,7 @@ def create_app(
         caller: dict = Depends(auth_dep),
         params: Optional[dict] = None,
     ):
+        require_role(caller, "admin", "operator")
         c = await store.get_connector(connector_id)
         if not c:
             raise HTTPException(404, "Connector not found")
@@ -844,6 +860,7 @@ def create_app(
         connector_id: str,
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin")
         c = await store.get_connector(connector_id)
         if not c:
             raise HTTPException(404, "Connector not found")
@@ -895,6 +912,7 @@ def create_app(
         req: CreatePipelineRequest = Body(...),
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin", "operator")
         # Build strategy dict from request fields
         strategy = dict(req.strategy)
         strategy.setdefault("source_schema", req.source_schema)
@@ -941,6 +959,7 @@ def create_app(
         req: BatchCreateRequest = Body(...),
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin", "operator")
         created = []
         for p_req in req.pipelines:
             create_kwargs = p_req.model_dump()
@@ -960,6 +979,7 @@ def create_app(
         req: UpdatePipelineRequest = Body(...),
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin", "operator")
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
@@ -981,6 +1001,7 @@ def create_app(
         pipeline_id: str,
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin", "operator")
         run = await scheduler.trigger(pipeline_id)
         return {"run_id": run.run_id, "status": run.status.value}
 
@@ -992,6 +1013,7 @@ def create_app(
         req: BackfillRequest = Body(...),
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin", "operator")
         run = await scheduler.trigger_backfill(pipeline_id, req.start, req.end)
         return {
             "run_id": run.run_id,
@@ -1007,6 +1029,7 @@ def create_app(
         pipeline_id: str,
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin", "operator")
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
@@ -1021,6 +1044,7 @@ def create_app(
         pipeline_id: str,
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin", "operator")
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
@@ -1097,6 +1121,7 @@ def create_app(
         req: ApprovalRequest = Body(...),
         caller: dict = Depends(auth_dep),
     ):
+        require_role(caller, "admin", "operator")
         proposal = await store.get_proposal(proposal_id)
         if not proposal:
             raise HTTPException(404, "Proposal not found")

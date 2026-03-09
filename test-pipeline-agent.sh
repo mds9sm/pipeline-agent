@@ -18,12 +18,15 @@ set -o pipefail
 # Configuration
 # ============================================================================
 API_URL="${API_URL:-http://localhost:8100}"
+TEST_USER="${TEST_USER:-admin}"
+TEST_PASS="${TEST_PASS:-admin}"
 PASS_COUNT=0
 FAIL_COUNT=0
 WARN_COUNT=0
 SKIP_COUNT=0
 TOTAL_COUNT=0
 TEST_MODE="${1:-all}"
+AUTH_HEADER=""
 
 # Timing
 START_TIME=$(date +%s)
@@ -36,6 +39,23 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
+
+# ============================================================================
+# Auth -- login and get JWT token
+# ============================================================================
+login_response=$(curl -s -m 10 -X POST "$API_URL/api/auth/login" \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\": \"$TEST_USER\", \"password\": \"$TEST_PASS\"}" 2>/dev/null)
+
+AUTH_TOKEN=$(echo "$login_response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+if [ -n "$AUTH_TOKEN" ] && [ "$AUTH_TOKEN" != "" ]; then
+    AUTH_HEADER="Authorization: Bearer $AUTH_TOKEN"
+    echo -e "${GREEN}Authenticated as $TEST_USER${NC}"
+else
+    # Auth might be disabled -- continue without token
+    AUTH_HEADER=""
+    echo -e "${YELLOW}No auth token (auth may be disabled)${NC}"
+fi
 
 # ============================================================================
 # Helpers
@@ -82,6 +102,7 @@ chat() {
     local session="${2:-default_session}"
     curl -s -m 60 -X POST "$API_URL/api/command" \
         -H 'Content-Type: application/json' \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
         -d "{\"text\": \"$text\", \"session_id\": \"$session\"}" 2>/dev/null
 }
 
@@ -94,13 +115,16 @@ chat_text() {
 
 # HTTP GET and return body + code
 api_get() {
-    curl -s -m 30 -w "\n%{http_code}" "$API_URL$1" 2>/dev/null
+    curl -s -m 30 -w "\n%{http_code}" \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+        "$API_URL$1" 2>/dev/null
 }
 
 # HTTP POST with JSON
 api_post() {
     curl -s -m 60 -w "\n%{http_code}" -X POST "$API_URL$1" \
         -H 'Content-Type: application/json' \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
         -d "$2" 2>/dev/null
 }
 
@@ -814,7 +838,7 @@ if [ "$TEST_MODE" = "all" ] || [ "$TEST_MODE" = "--api" ]; then
 section "PIPELINE CRUD VIA REST API"
 
 # First get connector IDs
-CONNECTORS=$(curl -s "$API_URL/api/connectors" 2>/dev/null)
+CONNECTORS=$(curl -s ${AUTH_HEADER:+-H "$AUTH_HEADER"} "$API_URL/api/connectors" 2>/dev/null)
 SRC_ID=$(echo "$CONNECTORS" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
@@ -863,6 +887,7 @@ if [ -n "$SRC_ID" ] && [ -n "$TGT_ID" ]; then
         test_name "PATCH /api/pipelines/$PID"
         RESP=$(curl -s -m 30 -w "\n%{http_code}" -X PATCH "$API_URL/api/pipelines/$PID" \
             -H 'Content-Type: application/json' \
+            ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
             -d '{"tier": 1}' 2>/dev/null)
         CODE=$(echo "$RESP" | tail -1)
         if [ "$CODE" = "200" ]; then
