@@ -5,10 +5,11 @@ Only runs if no pipelines exist yet (first startup guard).
 Requires demo Docker services (demo-mysql, demo-mongo, demo-api) to be running.
 """
 from __future__ import annotations
+import asyncio
 import logging
 
 from contracts.models import (
-    PipelineContract, PipelineStatus, RefreshType, ReplicationMethod, LoadType,
+    PipelineContract, RunRecord, RunMode, PipelineStatus, RefreshType, ReplicationMethod, LoadType,
 )
 from contracts.store import ContractStore
 from connectors.registry import ConnectorRegistry
@@ -25,6 +26,8 @@ DEMO_PIPELINES = [
         "source_database": "demo_ecommerce",
         "source_schema": "demo_ecommerce",
         "source_table": "orders",
+        "source_user": "root",
+        "source_password": "",
         "target_table": "demo_orders",
         "refresh_type": RefreshType.FULL,
         "schedule_cron": "0 * * * *",
@@ -37,6 +40,8 @@ DEMO_PIPELINES = [
         "source_database": "demo_ecommerce",
         "source_schema": "demo_ecommerce",
         "source_table": "customers",
+        "source_user": "root",
+        "source_password": "",
         "target_table": "demo_customers",
         "refresh_type": RefreshType.INCREMENTAL,
         "incremental_column": "updated_at",
@@ -78,11 +83,12 @@ TARGET_PASSWORD = "pipeline_agent"
 TARGET_SCHEMA = "raw"
 
 
-async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegistry) -> None:
+async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegistry, runner=None) -> None:
     """Create demo pipelines if none exist yet.
 
     Profiles each source table to populate column_mappings so the target
     DDL is correct and pipeline execution works end-to-end.
+    If runner is provided, triggers all created pipelines immediately.
     """
     existing = await store.list_pipelines()
     if existing:
@@ -98,6 +104,7 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
         log.warning("Target connector '%s' not found, skipping demo bootstrap.", TARGET_CONNECTOR_NAME)
         return
 
+    created_pipelines: list[PipelineContract] = []
     created = 0
     for cfg in DEMO_PIPELINES:
         source_id = name_to_id.get(cfg["source_connector_name"])
@@ -113,6 +120,8 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
                 "host": cfg["source_host"],
                 "port": cfg["source_port"],
                 "database": cfg["source_database"],
+                "user": cfg.get("source_user", ""),
+                "password": cfg.get("source_password", ""),
             }
             source = await registry.get_source(source_id, src_params)
             profile = await source.profile_table(cfg["source_schema"], cfg["source_table"])
@@ -134,6 +143,8 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
             source_database=cfg["source_database"],
             source_schema=cfg.get("source_schema", ""),
             source_table=cfg["source_table"],
+            source_user=cfg.get("source_user", ""),
+            source_password=cfg.get("source_password", ""),
             # Target
             target_connector_id=target_id,
             target_host=TARGET_HOST,
@@ -156,7 +167,21 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
             tags={"environment": "demo"},
         )
         await store.save_pipeline(contract)
+        created_pipelines.append(contract)
         created += 1
         log.info("Created demo pipeline: %s", cfg["pipeline_name"])
 
     log.info("Demo bootstrap complete: %d pipelines created.", created)
+
+    # Trigger all created pipelines immediately (don't wait for scheduler cron)
+    if runner and created_pipelines:
+        for pipeline in created_pipelines:
+            try:
+                run = RunRecord(
+                    pipeline_id=pipeline.pipeline_id,
+                    run_mode=RunMode.MANUAL,
+                )
+                asyncio.create_task(runner.execute(pipeline, run))
+                log.info("Triggered first run for: %s", pipeline.pipeline_name)
+            except Exception as e:
+                log.warning("Could not trigger %s: %s", pipeline.pipeline_name, e)

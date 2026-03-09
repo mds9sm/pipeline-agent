@@ -8,6 +8,29 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ## [Unreleased]
 
+### Build 6 - 2026-03-08 (Claude Opus 4.6)
+
+**Four bug fixes: store mismatch, source credentials, quality gate first-run, demo triggers**
+
+#### Fixed
+- **Bug #1: `list_runs(window_days=)` store method mismatch** — `agent/autonomous.py` called `store.list_runs(pipeline_id, window_days=budget.window_days)` but the store method signature is `list_runs(pipeline_id, limit=50)`. Changed to `limit=budget.window_days * 24` (~1 run/hour cap).
+- **Bug #2: Source credentials missing from PipelineContract** — `PipelineContract` had `target_user`/`target_password` but no source equivalents. `_connector_params()` hardcoded `user=""`, `password=""` for sources. Added `source_user`/`source_password` fields to model, DDL, store save/load, demo bootstrap, conversation manager, and crypto CREDENTIAL_FIELDS.
+- **Bug #3: Quality gate always halts on first run** — On the first run with no baseline, checks like schema_consistency could FAIL on type mismatches. Added first-run leniency: if no prior COMPLETE runs exist, FAILs are auto-downgraded to WARNs with a `[First run - auto-downgraded]` prefix, ensuring the first run promotes and establishes baselines.
+- **Bug #4: Demo pipelines never trigger on first startup** — Demo pipelines had `schedule_cron = "0 * * * *"` (hourly on the hour), so they wouldn't run until the next hour boundary. Now all 4 demo pipelines are triggered immediately after creation via `asyncio.create_task(runner.execute(...))`.
+- **Bonus: `list_gates(days=1)` in `main.py`** — The observability quality summary called `store.list_gates(pipeline_id, days=1)` but `list_gates()` doesn't accept a `days` parameter. Removed the invalid kwarg.
+
+#### Changed
+- **`contracts/models.py`** — Added `source_user: str = ""` and `source_password: str = ""` to PipelineContract
+- **`contracts/store.py`** — Added `source_user`, `source_password` columns to pipelines DDL; updated save_pipeline() INSERT/UPSERT (51→53 params); updated _row_to_pipeline()
+- **`agent/autonomous.py`** — `_connector_params()` now uses `contract.source_user`/`contract.source_password` instead of hardcoded empty strings
+- **`agent/conversation.py`** — `create_pipeline()` now wires `source_user`/`source_password` from encrypted source_params into PipelineContract
+- **`quality/gate.py`** — Added first-run detection and FAIL→WARN downgrade logic before decision evaluation
+- **`demo/bootstrap.py`** — Added `source_user`/`source_password` to MySQL demo configs; accepts optional `runner` param to trigger pipelines immediately
+- **`main.py`** — Passes `runner` to `bootstrap_demo_pipelines()`; removed invalid `days=1` kwarg from `list_gates()` call
+- **`crypto.py`** — Added `"source_password"` to CREDENTIAL_FIELDS
+
+---
+
 ### Build 5 - 2026-03-08 (Claude Opus 4.6)
 
 **Authentication enabled by default with RBAC**

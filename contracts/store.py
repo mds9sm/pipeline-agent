@@ -135,7 +135,7 @@ class ContractStore:
                 pipeline_id, pipeline_name, version, created_at, updated_at,
                 status, environment,
                 source_connector_id, source_host, source_port, source_database,
-                source_schema, source_table,
+                source_schema, source_table, source_user, source_password,
                 target_connector_id, target_host, target_port, target_database,
                 target_user, target_password,
                 target_schema, target_table, target_options,
@@ -151,7 +151,7 @@ class ContractStore:
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
                 $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
-                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51
+                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53
             )
             ON CONFLICT (pipeline_id) DO UPDATE SET
                 pipeline_name=EXCLUDED.pipeline_name, version=EXCLUDED.version,
@@ -161,6 +161,7 @@ class ContractStore:
                 source_host=EXCLUDED.source_host, source_port=EXCLUDED.source_port,
                 source_database=EXCLUDED.source_database,
                 source_schema=EXCLUDED.source_schema, source_table=EXCLUDED.source_table,
+                source_user=EXCLUDED.source_user, source_password=EXCLUDED.source_password,
                 target_connector_id=EXCLUDED.target_connector_id,
                 target_host=EXCLUDED.target_host, target_port=EXCLUDED.target_port,
                 target_database=EXCLUDED.target_database,
@@ -197,7 +198,7 @@ class ContractStore:
             p.pipeline_id, p.pipeline_name, p.version, p.created_at, p.updated_at,
             p.status.value, p.environment,
             p.source_connector_id, p.source_host, p.source_port, p.source_database,
-            p.source_schema, p.source_table,
+            p.source_schema, p.source_table, p.source_user, p.source_password,
             p.target_connector_id, p.target_host, p.target_port, p.target_database,
             p.target_user, p.target_password,
             p.target_schema, p.target_table,
@@ -962,6 +963,8 @@ def _row_to_pipeline(row: asyncpg.Record) -> PipelineContract:
         source_database=row["source_database"],
         source_schema=row["source_schema"],
         source_table=row["source_table"],
+        source_user=row.get("source_user", ""),
+        source_password=row.get("source_password", ""),
         target_connector_id=row["target_connector_id"] or "",
         target_host=row.get("target_host", ""),
         target_port=row.get("target_port", 0),
@@ -1219,6 +1222,8 @@ CREATE TABLE IF NOT EXISTS pipelines (
     source_database TEXT NOT NULL DEFAULT '',
     source_schema TEXT NOT NULL DEFAULT '',
     source_table TEXT NOT NULL DEFAULT '',
+    source_user TEXT NOT NULL DEFAULT '',
+    source_password TEXT NOT NULL DEFAULT '',
     target_connector_id TEXT REFERENCES connectors(connector_id),
     target_host TEXT NOT NULL DEFAULT '',
     target_port INTEGER NOT NULL DEFAULT 0,

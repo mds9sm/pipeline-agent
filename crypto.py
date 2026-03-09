@@ -53,6 +53,6 @@ def decrypt_dict(data: dict, key: str, fields: list[str]) -> dict:
 
 
 CREDENTIAL_FIELDS = [
-    "password", "api_key", "secret", "token",
+    "password", "source_password", "api_key", "secret", "token",
     "ssl_ca", "ssl_key", "ssl_cert",
 ]

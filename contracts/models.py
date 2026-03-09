@@ -283,6 +283,8 @@ class PipelineContract:
     source_database: str = ""
     source_schema: str = ""
     source_table: str = ""
+    source_user: str = ""
+    source_password: str = ""
 
     # Target
     target_connector_id: str = ""

@@ -86,7 +86,7 @@ Auth is **enabled by default** (`AUTH_ENABLED=true`). A default admin user (admi
 
 ## Demo Environment
 
-On first startup (no pipelines in DB), 4 demo pipelines are auto-created:
+On first startup (no pipelines in DB), 4 demo pipelines are auto-created and **triggered immediately** (no waiting for cron schedule):
 
 | Pipeline | Source | Target | Data |
 |----------|--------|--------|------|
@@ -94,6 +94,8 @@ On first startup (no pipelines in DB), 4 demo pipelines are auto-created:
 | demo-ecommerce-customers | demo MySQL (port 3307) | local PostgreSQL | 20 customers (incremental) |
 | demo-analytics-events | demo MongoDB (port 27018) | local PostgreSQL | 200 web events |
 | demo-stripe-charges | mock Stripe API (port 8200) | local PostgreSQL | 50 charges |
+
+All 4 pipelines execute their first run immediately after creation. The quality gate uses first-run leniency (downgrades FAILs to WARNs) to ensure the first run promotes and establishes baselines.
 
 Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events), `demo-api` (mock Stripe/Google Ads/Facebook).
 
@@ -155,6 +157,8 @@ All tests are in `test-pipeline-agent.sh`. To add a new source/target:
 6. **Method name mismatches between store and callers** — The store (`contracts/store.py`) is the source of truth for method names. Monitor, scheduler, and API code must match exactly (e.g., `save_freshness` not `save_freshness_snapshot`).
 7. **`float("inf")` in JSON columns** — PostgreSQL rejects `Infinity` in JSON. Always cap with `min(value, 99999)` before storing in JSON/JSONB columns.
 8. **Store methods require `pipeline_id`** — Most store methods like `list_dependencies()` require a `pipeline_id` argument. Never call them without it.
+9. **Quality gate first-run leniency** — On the very first run (no prior COMPLETE runs), FAILs are auto-downgraded to WARNs so the first run establishes baselines. Don't rely on the first run's gate decision for regression testing.
+10. **`source_user`/`source_password` on PipelineContract** — Source credentials are stored on the contract just like target credentials. When creating pipelines, pass source auth via `source_user`/`source_password` fields, not hardcoded empty strings.
 
 ## Changelog
 

@@ -350,10 +350,10 @@ class PipelineRunner:
                     budget_threshold=0.9,
                 )
 
-            # Get all runs within the rolling window
+            # Get all runs within the rolling window (~1 run/hour max)
             runs = await self.store.list_runs(
                 contract.pipeline_id,
-                window_days=budget.window_days,
+                limit=budget.window_days * 24,
             )
 
             total_runs = len(runs)
@@ -466,8 +466,8 @@ class PipelineRunner:
                 "host": contract.source_host,
                 "port": contract.source_port,
                 "database": contract.source_database,
-                "user": "",
-                "password": "",
+                "user": contract.source_user,
+                "password": contract.source_password,
             }
             if self.config.has_encryption_key:
                 src_params = decrypt_dict(

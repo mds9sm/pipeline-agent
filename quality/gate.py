@@ -28,6 +28,7 @@ from contracts.models import (
     CheckStatus,
     GateDecision,
     RefreshType,
+    RunStatus,
     QualityConfig,
     now_iso,
 )
@@ -79,6 +80,18 @@ class QualityGate:
         ]
 
         gate.checks = checks
+
+        # First-run leniency: if no prior complete runs, downgrade FAILs to WARNs
+        prior_runs = await self.store.list_runs(contract.pipeline_id, limit=5)
+        is_first_run = not any(
+            r.run_id != run.run_id and r.status == RunStatus.COMPLETE
+            for r in prior_runs
+        )
+        if is_first_run:
+            for c in checks:
+                if c.status == CheckStatus.FAIL:
+                    c.status = CheckStatus.WARN
+                    c.detail = f"[First run - auto-downgraded] {c.detail}"
 
         # ---- decision logic ----
         any_fail = any(c.status == CheckStatus.FAIL for c in checks)

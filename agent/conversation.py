@@ -329,6 +329,8 @@ class ConversationManager:
             source_database=encrypted_source_params.get("database", ""),
             source_schema=schema_name,
             source_table=table_name,
+            source_user=encrypted_source_params.get("user", ""),
+            source_password=encrypted_source_params.get("password", ""),
             target_connector_id=target_connector_id,
             target_host=encrypted_target_params.get("host", ""),
             target_port=encrypted_target_params.get("port", 0),

@@ -121,7 +121,7 @@ async def _log_quality_summary(store: Store):
         return
     issues = []
     for p in pipelines:
-        gates = await store.list_gates(p.pipeline_id, days=1)
+        gates = await store.list_gates(p.pipeline_id)
         if gates:
             halted = sum(1 for g in gates if g.decision.value == "halt")
             if halted:
@@ -197,7 +197,7 @@ async def main():
 
         # 7b. Bootstrap demo pipelines (first startup only)
         from demo.bootstrap import bootstrap_demo_pipelines
-        await bootstrap_demo_pipelines(store, registry)
+        await bootstrap_demo_pipelines(store, registry, runner)
 
         pipelines = await store.list_pipelines(status="active")
         log.info("  Active pipelines: %d", len(pipelines))

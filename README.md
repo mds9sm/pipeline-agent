@@ -75,7 +75,8 @@ On first start:
 3. A default admin user is created (admin/admin)
 4. 8 seed connectors are loaded (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebook Insights sources + PostgreSQL, Redshift targets)
 5. 4 demo pipelines are auto-created (MySQL, MongoDB, Stripe sources → PostgreSQL)
-6. The API server, scheduler, monitor, and observability loops start concurrently
+6. All 4 demo pipelines are triggered immediately (first run uses quality gate leniency to establish baselines)
+7. The API server, scheduler, monitor, and observability loops start concurrently
 
 Open **http://localhost:8100** and log in with **admin / admin**.
 
@@ -101,7 +102,7 @@ Authentication methods:
 
 ### Credential Encryption
 
-Set `ENCRYPTION_KEY` to a Fernet key. All credential fields (`password`, `api_key`, `secret`, `token`, `ssl_ca`, `ssl_key`, `ssl_cert`) are encrypted at rest in PostgreSQL. Generate a key with:
+Set `ENCRYPTION_KEY` to a Fernet key. All credential fields (`password`, `source_password`, `api_key`, `secret`, `token`, `ssl_ca`, `ssl_key`, `ssl_cert`) are encrypted at rest in PostgreSQL. Generate a key with:
 
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
