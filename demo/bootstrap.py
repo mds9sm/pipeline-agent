@@ -10,6 +10,7 @@ import logging
 
 from contracts.models import (
     PipelineContract, RunRecord, RunMode, PipelineStatus, RefreshType, ReplicationMethod, LoadType,
+    NotificationPolicy,
 )
 from contracts.store import ContractStore
 from connectors.registry import ConnectorRegistry
@@ -164,7 +165,10 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
             schedule_cron=cfg["schedule_cron"],
             # Observability
             tier=3,
+            tier_config={"digest_only": False},
             tags={"environment": "demo"},
+            # Schema drift auto-remediation
+            auto_approve_additive_schema=True,
         )
         await store.save_pipeline(contract)
         created_pipelines.append(contract)
@@ -172,6 +176,28 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
         log.info("Created demo pipeline: %s", cfg["pipeline_name"])
 
     log.info("Demo bootstrap complete: %d pipelines created.", created)
+
+    # Create demo notification policy with Slack webhook
+    if created_pipelines:
+        policy = NotificationPolicy(
+            policy_name="demo-slack-alerts",
+            description="Demo notification policy routing alerts to mock Slack webhook",
+            channels=[
+                {
+                    "type": "slack",
+                    "target": "http://localhost:8200/webhook/slack",
+                    "severity_filter": ["info", "warning", "critical"],
+                },
+            ],
+        )
+        await store.save_policy(policy)
+        log.info("Created demo notification policy: %s", policy.policy_name)
+
+        # Wire all demo pipelines to the notification policy
+        for pipeline in created_pipelines:
+            pipeline.notification_policy_id = policy.policy_id
+            await store.save_pipeline(pipeline)
+        log.info("Wired %d demo pipelines to notification policy.", len(created_pipelines))
 
     # Trigger all created pipelines immediately (don't wait for scheduler cron)
     if runner and created_pipelines:

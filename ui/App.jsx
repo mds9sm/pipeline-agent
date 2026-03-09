@@ -482,18 +482,69 @@ function PipelinesView({ tierFilter }) {
 
                 <div>
                   <div className="text-xs font-semibold text-stone-500 mb-2">Recent Runs</div>
-                  <div className="space-y-1">
-                    {runs.map((r) => (
-                      <div key={r.run_id} className="flex items-center gap-2 text-xs">
-                        <StatusDot status={r.status} />
-                        <span className="font-mono text-stone-400">{r.started_at?.slice(0, 16)}</span>
-                        <span className="text-stone-500">{r.rows_extracted?.toLocaleString()} rows</span>
-                        <Pill
-                          label={r.gate_decision || r.status}
-                          color={r.gate_decision === "halt" ? "red" : "green"}
-                        />
-                      </div>
-                    ))}
+                  <div className="space-y-1.5">
+                    {runs.map((r) => {
+                      const duration = r.started_at && r.completed_at
+                        ? Math.round((new Date(r.completed_at) - new Date(r.started_at)) / 1000)
+                        : null;
+                      const fmtDuration = duration != null
+                        ? duration >= 60 ? `${Math.floor(duration / 60)}m ${duration % 60}s` : `${duration}s`
+                        : null;
+                      const fmtBytes = (b) => {
+                        if (!b) return null;
+                        if (b > 1048576) return `${(b / 1048576).toFixed(1)} MB`;
+                        if (b > 1024) return `${(b / 1024).toFixed(1)} KB`;
+                        return `${b} B`;
+                      };
+                      const [showQuality, setShowQuality] = React.useState(false);
+                      return (
+                        <div key={r.run_id} className="border border-stone-200 rounded-lg px-3 py-2">
+                          <div className="flex items-center gap-2 text-xs flex-wrap">
+                            <StatusDot status={r.status} />
+                            <span className="font-mono text-stone-400">{r.started_at?.slice(0, 16)}</span>
+                            {fmtDuration && <span className="text-stone-400">{fmtDuration}</span>}
+                            <Pill label={r.run_mode || "scheduled"} color="blue" />
+                            <span className="text-stone-500">{r.rows_extracted?.toLocaleString()} extracted</span>
+                            {r.rows_loaded > 0 && <span className="text-stone-500">{r.rows_loaded?.toLocaleString()} loaded</span>}
+                            {fmtBytes(r.staging_size_bytes) && <span className="text-stone-400">{fmtBytes(r.staging_size_bytes)}</span>}
+                            <Pill
+                              label={r.gate_decision || r.status}
+                              color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
+                            />
+                          </div>
+                          {(r.watermark_before || r.watermark_after) && (
+                            <div className="text-xs text-stone-400 mt-1 font-mono">
+                              watermark: {r.watermark_before || "null"} → {r.watermark_after || "null"}
+                            </div>
+                          )}
+                          {r.quality_results && (
+                            <div className="mt-1">
+                              <button
+                                onClick={() => setShowQuality(!showQuality)}
+                                className="text-xs text-blue-500 hover:text-blue-700"
+                              >
+                                {showQuality ? "Hide" : "Show"} quality checks ({Object.keys(r.quality_results).length})
+                              </button>
+                              {showQuality && (
+                                <div className="mt-1 bg-stone-50 rounded p-2 space-y-0.5">
+                                  {Object.entries(r.quality_results).map(([check, result]) => (
+                                    <div key={check} className="flex items-center gap-2 text-xs">
+                                      <span className={`w-2 h-2 rounded-full ${
+                                        result.status === "pass" ? "bg-green-400" :
+                                        result.status === "warn" ? "bg-amber-400" : "bg-red-400"
+                                      }`} />
+                                      <span className="font-medium text-stone-600">{check}</span>
+                                      {result.detail && <span className="text-stone-400 truncate">{typeof result.detail === 'string' ? result.detail : JSON.stringify(result.detail)}</span>}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          {r.error && <div className="text-xs text-red-500 mt-1 truncate">{r.error}</div>}
+                        </div>
+                      );
+                    })}
                     {runs.length === 0 && <div className="text-xs text-stone-300">No runs yet</div>}
                   </div>
                 </div>
@@ -722,6 +773,10 @@ function ApprovalsView() {
   const [pending, setPending] = useState([]);
   const [resolved, setResolved] = useState([]);
   const [note, setNote] = useState({});
+  const [connectorCode, setConnectorCode] = useState({});
+  const [expandedCode, setExpandedCode] = useState({});
+  const [testResults, setTestResults] = useState({});
+  const [testing, setTesting] = useState({});
 
   useEffect(() => {
     api("GET", "/api/approvals?status=pending").then(setPending).catch(console.error);
@@ -731,6 +786,33 @@ function ApprovalsView() {
   async function resolve(id, action) {
     await api("POST", `/api/approvals/${id}`, { action, note: note[id] || "" });
     setPending((p) => p.filter((x) => x.proposal_id !== id));
+  }
+
+  async function toggleCode(proposalId, connectorId) {
+    if (expandedCode[proposalId]) {
+      setExpandedCode((s) => ({ ...s, [proposalId]: false }));
+      return;
+    }
+    if (!connectorCode[connectorId]) {
+      try {
+        const detail = await api("GET", `/api/connectors/${connectorId}`);
+        setConnectorCode((s) => ({ ...s, [connectorId]: detail.code || "# No code available" }));
+      } catch (e) {
+        setConnectorCode((s) => ({ ...s, [connectorId]: `# Error loading code: ${e.message}` }));
+      }
+    }
+    setExpandedCode((s) => ({ ...s, [proposalId]: true }));
+  }
+
+  async function testConnector(connectorId) {
+    setTesting((s) => ({ ...s, [connectorId]: true }));
+    try {
+      const result = await api("POST", `/api/connectors/${connectorId}/test`);
+      setTestResults((s) => ({ ...s, [connectorId]: result }));
+    } catch (e) {
+      setTestResults((s) => ({ ...s, [connectorId]: { success: false, error: e.message } }));
+    }
+    setTesting((s) => ({ ...s, [connectorId]: false }));
   }
 
   const changeColor = (t) =>
@@ -755,6 +837,36 @@ function ApprovalsView() {
               {p.impact_analysis?.breaking_change && (
                 <div className="text-xs text-red-600 mb-2">
                   Breaking change -- {p.impact_analysis.data_loss_risk} data loss risk
+                </div>
+              )}
+              {p.change_type === "new_connector" && p.connector_id && (
+                <div className="mt-2 mb-2">
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => toggleCode(p.proposal_id, p.connector_id)}
+                      className="text-xs text-purple-600 hover:text-purple-800 font-medium"
+                    >
+                      {expandedCode[p.proposal_id] ? "Hide Code" : "View Connector Code"}
+                    </button>
+                    <button
+                      onClick={() => testConnector(p.connector_id)}
+                      disabled={testing[p.connector_id]}
+                      className="text-xs px-2.5 py-1 bg-purple-100 text-purple-700 border border-purple-200 rounded-lg hover:bg-purple-200 disabled:opacity-50"
+                    >
+                      {testing[p.connector_id] ? "Testing..." : "Test Connector"}
+                    </button>
+                    {testResults[p.connector_id] && (
+                      <span className={`text-xs font-medium ${testResults[p.connector_id].success ? "text-green-600" : "text-red-600"}`}>
+                        {testResults[p.connector_id].success ? "PASSED" : "FAILED"}
+                        {testResults[p.connector_id].error && ` - ${testResults[p.connector_id].error}`}
+                      </span>
+                    )}
+                  </div>
+                  {expandedCode[p.proposal_id] && connectorCode[p.connector_id] && (
+                    <pre className="mt-2 bg-stone-900 text-green-300 text-xs p-3 rounded-lg overflow-x-auto max-h-80 overflow-y-auto font-mono leading-relaxed">
+                      {connectorCode[p.connector_id]}
+                    </pre>
+                  )}
                 </div>
               )}
               <div className="flex items-center gap-2 mt-3">

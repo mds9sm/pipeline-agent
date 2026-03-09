@@ -8,6 +8,32 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ## [Unreleased]
 
+### Build 7 - 2026-03-08 (Claude Opus 4.6)
+
+**Features #5-9: Incremental extraction (verified), enhanced run history UI, connector approval flow, alerting dispatch, schema drift auto-remediation**
+
+#### Added
+- **Feature #6: Enhanced pipeline run history** — `_run_summary()` now includes `run_mode`, `staging_size_bytes`, `quality_results`, `watermark_before`, `watermark_after`. UI shows duration, run mode pill, staging size, expandable quality check details, watermark progression for incremental pipelines.
+- **Feature #7: Connector approval flow** — ApprovalsView now shows connector code in a syntax-highlighted `<pre>` block for `new_connector` proposals. Added "Test Connector" button that calls `POST /api/connectors/{id}/test` and displays results inline.
+- **Feature #8: Alerting dispatch with mock webhook** — Added mock Slack webhook endpoints (`POST /webhook/slack`, `GET /webhook/slack/history`) to demo-api. Demo pipelines now get a notification policy routing alerts to the mock webhook. `_resolve_channels()` made async with policy lookup from store.
+- **Feature #9: Schema drift auto-remediation** — Demo pipelines created with `auto_approve_additive_schema=True`. Added `_is_safe_type_widening()` helper recognizing VARCHAR widening, INT→BIGINT, FLOAT→DOUBLE PRECISION. Auto-apply now handles both new columns and safe type widenings.
+
+#### Fixed
+- **`test_connector` endpoint bugs** — Added missing `await` on `registry.get_source()`/`registry.get_target()`, fixed `**params` → `params` arg passing, added DRAFT/APPROVED connector temporary loading via `register_approved_connector()`, now saves `test_status` on connector record.
+- **`_resolve_channels()` was sync** — Made async to enable notification policy lookup from the store. Previously had a `pass` placeholder for policy lookup.
+
+#### Changed
+- **`api/server.py`** — Added `TestStatus` to imports; enriched `_run_summary()`; fixed `test_connector` endpoint
+- **`ui/App.jsx`** — Enhanced PipelinesView run display with duration, quality checks, watermarks; enhanced ApprovalsView with code view and test button
+- **`monitor/engine.py`** — `_resolve_channels()` now async with policy lookup; added `_is_safe_type_widening()`; renamed `_auto_apply_new_columns` → `_auto_apply_schema_changes` with type widening support
+- **`demo/mock-api/app.py`** — Added mock Slack webhook endpoints
+- **`demo/bootstrap.py`** — Added `auto_approve_additive_schema=True`, `tier_config={"digest_only": False}`, notification policy creation and wiring to demo pipelines
+
+#### Verified
+- **Feature #5: Incremental extraction** — Already fully implemented. MySQL source builds `WHERE inc_col > last_watermark`, MongoDB does `{"$gt": wm}`. `demo-ecommerce-customers` uses INCREMENTAL with `updated_at` column.
+
+---
+
 ### Build 6 - 2026-03-08 (Claude Opus 4.6)
 
 **Four bug fixes: store mismatch, source credentials, quality gate first-run, demo triggers**

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import smtplib
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -200,14 +201,17 @@ class MonitorEngine:
             ),
         }
 
-        # Auto-apply additive nullable columns if configured and safe
+        # Auto-apply additive changes if configured and safe
+        safe_type_changes = [tc for tc in type_changes if self._is_safe_type_widening(tc["from"], tc["to"])]
+        breaking_type_changes = [tc for tc in type_changes if not self._is_safe_type_widening(tc["from"], tc["to"])]
+
         if (
             analysis["action"] == "auto_adapt"
             and pipeline.auto_approve_additive_schema
             and not dropped_columns
-            and not type_changes
+            and not breaking_type_changes
         ):
-            await self._auto_apply_new_columns(pipeline, new_columns)
+            await self._auto_apply_schema_changes(pipeline, new_columns, safe_type_changes)
             return
 
         # Create a proposal with impact analysis
@@ -267,12 +271,44 @@ class MonitorEngine:
             reasoning=analysis.get("reasoning", ""),
         ))
 
-    async def _auto_apply_new_columns(
+    @staticmethod
+    def _is_safe_type_widening(from_type: str, to_type: str) -> bool:
+        """Check if a type change is a safe widening that won't lose data."""
+        f = from_type.upper().strip()
+        t = to_type.upper().strip()
+
+        # VARCHAR(N) -> VARCHAR(M) where M > N
+        vm_from = re.match(r"VARCHAR\((\d+)\)", f)
+        vm_to = re.match(r"VARCHAR\((\d+)\)", t)
+        if vm_from and vm_to and int(vm_to.group(1)) > int(vm_from.group(1)):
+            return True
+
+        # Integer widening
+        int_widening = {
+            "SMALLINT": {"INT", "INTEGER", "BIGINT"},
+            "INT": {"BIGINT"},
+            "INTEGER": {"BIGINT"},
+        }
+        if f in int_widening and t in int_widening.get(f, set()):
+            return True
+
+        # Float widening
+        float_widening = {
+            "FLOAT": {"DOUBLE PRECISION", "DOUBLE"},
+            "REAL": {"DOUBLE PRECISION", "DOUBLE"},
+        }
+        if f in float_widening and t in float_widening.get(f, set()):
+            return True
+
+        return False
+
+    async def _auto_apply_schema_changes(
         self,
         pipeline: PipelineContract,
         new_columns: list[dict],
+        safe_type_changes: list[dict] | None = None,
     ) -> None:
-        """Append new nullable columns, increment version, write SchemaVersion."""
+        """Auto-apply new columns and safe type widenings, increment version."""
         # Re-profile to get full ColumnMapping objects
         src_params = self._source_params(pipeline)
         source = await self.registry.get_source(
@@ -283,10 +319,33 @@ class MonitorEngine:
         )
         live_cols = {m.source_column: m for m in profile.columns}
 
+        # Append new columns
         for col_info in new_columns:
             col_name = col_info["name"]
             if col_name in live_cols:
                 pipeline.column_mappings.append(live_cols[col_name])
+
+        # Update types for safe widenings
+        if safe_type_changes:
+            for tc in safe_type_changes:
+                col_name = tc["column"]
+                for mapping in pipeline.column_mappings:
+                    if mapping.source_column == col_name and col_name in live_cols:
+                        mapping.source_type = live_cols[col_name].source_type
+                        mapping.target_type = live_cols[col_name].target_type
+                        break
+
+        changes_desc = []
+        if new_columns:
+            changes_desc.append(f"{len(new_columns)} new column(s): {[c['name'] for c in new_columns]}")
+        if safe_type_changes:
+            widening_list = [
+                tc["column"] + ": " + tc["from"] + " -> " + tc["to"]
+                for tc in safe_type_changes
+            ]
+            changes_desc.append(
+                f"{len(safe_type_changes)} type widening(s): {widening_list}"
+            )
 
         pipeline.version += 1
         pipeline.updated_at = now_iso()
@@ -296,17 +355,14 @@ class MonitorEngine:
             pipeline_id=pipeline.pipeline_id,
             version=pipeline.version,
             column_mappings=pipeline.column_mappings,
-            change_summary=(
-                f"Auto-applied {len(new_columns)} new nullable column(s): "
-                f"{[c['name'] for c in new_columns]}"
-            ),
-            change_type="add_column",
+            change_summary=f"Auto-applied: {'; '.join(changes_desc)}",
+            change_type="add_column" if new_columns and not safe_type_changes else "alter_column_type" if safe_type_changes else "add_column",
             applied_by="agent",
         )
         await self.store.save_schema_version(sv)
         log.info(
-            "[%s] Auto-applied %d new columns (v%d).",
-            pipeline.pipeline_name, len(new_columns), pipeline.version,
+            "[%s] Auto-applied schema changes (v%d): %s",
+            pipeline.pipeline_name, pipeline.version, "; ".join(changes_desc),
         )
 
     # ------------------------------------------------------------------
@@ -455,7 +511,7 @@ class MonitorEngine:
 
         Supports Slack, Email, PagerDuty, and digest-only.
         """
-        channels = self._resolve_channels(pipeline, alert.severity)
+        channels = await self._resolve_channels(pipeline, alert.severity)
         for channel in channels:
             ch_type = channel.get("type", "")
             severity_filter = channel.get(
@@ -500,16 +556,22 @@ class MonitorEngine:
                 except Exception as e:
                     log.warning("PagerDuty escalation error: %s", e)
 
-    def _resolve_channels(
+    async def _resolve_channels(
         self,
         pipeline: PipelineContract,
         severity: AlertSeverity,
     ) -> list[dict]:
         """Resolve notification channels from policy or tier defaults."""
         if pipeline.notification_policy_id:
-            # Notification policy lookup is sync-compatible
-            # We rely on the store having been queried already or being cached
-            pass
+            try:
+                policy = await self.store.get_policy(pipeline.notification_policy_id)
+                if policy and policy.channels:
+                    return [ch for ch in policy.channels if isinstance(ch, dict)]
+            except Exception as e:
+                log.warning(
+                    "[%s] Failed to load notification policy %s: %s",
+                    pipeline.pipeline_name, pipeline.notification_policy_id, e,
+                )
 
         tier_cfg = pipeline.get_tier_config()
         channels_raw = tier_cfg.get("alert_channels", [])

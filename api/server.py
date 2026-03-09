@@ -19,7 +19,7 @@ from slowapi.errors import RateLimitExceeded
 from starlette.responses import JSONResponse
 
 from contracts.models import (
-    PipelineStatus, ProposalStatus, ConnectorStatus,
+    PipelineStatus, ProposalStatus, ConnectorStatus, TestStatus,
     PipelineDependency, NotificationPolicy, AgentPreference,
     ContractChangeProposal, SchemaVersion, ColumnMapping,
     User, TriggerType, ChangeType,
@@ -838,20 +838,24 @@ def create_app(
             raise HTTPException(404, "Connector not found")
         params = params or {}
         try:
-            if c.connector_type in ("source", "SOURCE"):
-                engine = registry.get_source(connector_id, **params)
+            # Temporarily load DRAFT/APPROVED connectors for testing
+            if c.status in (ConnectorStatus.DRAFT, ConnectorStatus.APPROVED):
+                registry.register_approved_connector(c)
+            ct = c.connector_type.value if hasattr(c.connector_type, 'value') else c.connector_type
+            if ct == "source":
+                engine = await registry.get_source(connector_id, params)
             else:
-                engine = registry.get_target(connector_id, **params)
+                engine = await registry.get_target(connector_id, params)
             result = await engine.test_connection()
-            c.test_results = {
-                "success": result.success,
-                "version": result.version,
-                "error": result.error,
-            }
+            c.test_status = TestStatus.PASSED if result.success else TestStatus.FAILED
+            c.test_results = {"success": result.success, "version": result.version, "error": result.error}
             await store.save_connector(c)
             return c.test_results
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            c.test_status = TestStatus.FAILED
+            c.test_results = {"success": False, "error": str(e)}
+            await store.save_connector(c)
+            return c.test_results
 
     @app.delete("/api/connectors/{connector_id}")
     @limiter.limit("100/minute")
@@ -1826,13 +1830,18 @@ def _run_summary(r) -> dict:
         "started_at": r.started_at,
         "completed_at": r.completed_at,
         "status": r.status.value if hasattr(r.status, "value") else r.status,
+        "run_mode": r.run_mode.value if hasattr(r.run_mode, "value") else r.run_mode,
         "rows_extracted": r.rows_extracted,
         "rows_loaded": r.rows_loaded,
+        "staging_size_bytes": r.staging_size_bytes,
+        "watermark_before": r.watermark_before,
+        "watermark_after": r.watermark_after,
         "gate_decision": (
             r.gate_decision.value
             if r.gate_decision and hasattr(r.gate_decision, "value")
             else r.gate_decision
         ),
+        "quality_results": r.quality_results,
         "error": r.error,
         "retry_count": r.retry_count,
     }

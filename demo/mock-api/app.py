@@ -1,9 +1,11 @@
 """
 Mock SaaS API service for Pipeline Agent demos.
-Serves realistic Stripe, Google Ads, and Facebook Insights endpoints.
+Serves realistic Stripe, Google Ads, Facebook Insights, and Slack webhook endpoints.
 """
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Header, Query, Path
+from typing import Any
+
+from fastapi import FastAPI, Header, Query, Path, Body
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Demo Mock APIs")
@@ -173,4 +175,31 @@ def facebook_insights(
             },
             "next": f"/v1/{ad_account_id}/insights?after={next_offset}&limit={limit}" if has_next else None,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mock Slack Webhook — /webhook/slack
+# ---------------------------------------------------------------------------
+
+_SLACK_MESSAGES: list[dict] = []
+
+
+@app.post("/webhook/slack")
+def slack_webhook(payload: dict = Body(...)):
+    """Receive a Slack-formatted alert and store it for verification."""
+    _SLACK_MESSAGES.append({
+        "received_at": datetime.utcnow().isoformat(),
+        "text": payload.get("text", ""),
+        "payload": payload,
+    })
+    return {"ok": True}
+
+
+@app.get("/webhook/slack/history")
+def slack_history(limit: int = Query(default=50, le=200)):
+    """Return list of received Slack webhook messages for verification."""
+    return {
+        "messages": _SLACK_MESSAGES[-limit:],
+        "total_count": len(_SLACK_MESSAGES),
     }
