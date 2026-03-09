@@ -1012,6 +1012,9 @@ function PipelinesView({ tierFilter }) {
                       <div className="text-[10px] text-stone-400 mt-1">
                         JSON array. Each hook: name, sql, metadata_key, description, enabled (true), timeout_seconds (30), fail_pipeline_on_error (false)
                       </div>
+                      <div className="text-[10px] text-stone-400 mt-0.5">
+                        Template variables: <code className="bg-stone-100 px-0.5 rounded">{"{{watermark_after}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{watermark_before}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{run_id}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{batch_id}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{target_schema}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{target_table}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{rows_extracted}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{pipeline_name}}"}</code>
+                      </div>
                     </div>
 
                     {/* Footer: reason + save */}

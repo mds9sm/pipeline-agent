@@ -10,7 +10,7 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 | Build | Feature | Status | Why |
 |-------|---------|--------|-----|
-| 14 | Hook template variables | Pending | `{{watermark_after}}`, `{{run_id}}` etc. — unblocks consume-and-merge pattern |
+| 14 | Hook template variables | **Done** | `{{watermark_after}}`, `{{run_id}}` etc. — unblocks consume-and-merge pattern |
 | 15 | Run context propagation | Pending | Upstream run context (watermarks, batch IDs) flows to downstream pipelines |
 | 16 | Data contracts between pipelines | Pending | Formalize producer/consumer relationships, cleanup policies, retention |
 | 17 | SQL-native intra-DB steps | Pending | Skip CSV extract for same-database pipelines (INSERT INTO...SELECT) |
@@ -21,6 +21,29 @@ Format: Each entry records what changed, why, and test results at the time of th
 ---
 
 ## [Unreleased]
+
+### Build 14 - 2026-03-09 (Claude Opus 4.6)
+
+**Hook Template Variables**
+
+#### Added
+- **`_render_hook_sql()`** — Static method on `PipelineRunner` that replaces `{{variable}}` placeholders with run context values before SQL execution. 15 supported variables: `{{pipeline_id}}`, `{{pipeline_name}}`, `{{run_id}}`, `{{run_mode}}`, `{{watermark_before}}`, `{{watermark_after}}`, `{{rows_extracted}}`, `{{rows_loaded}}`, `{{started_at}}`, `{{completed_at}}`, `{{source_schema}}`, `{{source_table}}`, `{{target_schema}}`, `{{target_table}}`, `{{batch_id}}` (alias for `run_id[:8]`).
+- **`rendered_sql` in hook results** — When template variables are used, the resolved SQL is stored in the hook result metadata so users can see exactly what executed.
+- **UI template hints** — Hooks editor shows available template variables as inline code tags.
+
+#### Key Use Case Unlocked
+Consume-and-merge pattern is now possible:
+```sql
+-- Pipeline 2 hook: safely delete only consumed rows from stage table
+DELETE FROM raw.stage_orders WHERE updated_at <= '{{watermark_after}}'
+```
+Rows arriving after `watermark_after` survive the DELETE for the next run.
+
+#### Changed
+- **`agent/autonomous.py`** — `_execute_post_promotion_hooks()` calls `_render_hook_sql()` before `execute_sql()`. None values render as empty string.
+- **`ui/App.jsx`** — Template variable hints added below hooks editor textarea.
+
+---
 
 ### Build 13 - 2026-03-08 (Claude Opus 4.6)
 

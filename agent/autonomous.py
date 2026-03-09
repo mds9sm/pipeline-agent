@@ -489,6 +489,46 @@ class PipelineRunner:
     # Post-promotion SQL hooks
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _render_hook_sql(
+        sql: str,
+        contract: PipelineContract,
+        run: RunRecord,
+    ) -> str:
+        """Replace {{variable}} placeholders with run context values.
+
+        Supported variables:
+          {{pipeline_id}}, {{pipeline_name}},
+          {{run_id}}, {{run_mode}},
+          {{watermark_before}}, {{watermark_after}},
+          {{rows_extracted}}, {{rows_loaded}},
+          {{started_at}}, {{completed_at}},
+          {{source_schema}}, {{source_table}},
+          {{target_schema}}, {{target_table}},
+          {{batch_id}} (alias for run_id[:8])
+        """
+        replacements = {
+            "pipeline_id": contract.pipeline_id,
+            "pipeline_name": contract.pipeline_name,
+            "run_id": run.run_id,
+            "run_mode": run.run_mode.value if hasattr(run.run_mode, "value") else str(run.run_mode),
+            "watermark_before": run.watermark_before or "",
+            "watermark_after": run.watermark_after or "",
+            "rows_extracted": str(run.rows_extracted),
+            "rows_loaded": str(run.rows_loaded),
+            "started_at": run.started_at or "",
+            "completed_at": run.completed_at or "",
+            "source_schema": contract.source_schema,
+            "source_table": contract.source_table,
+            "target_schema": contract.target_schema,
+            "target_table": contract.target_table,
+            "batch_id": run.run_id[:8],
+        }
+        rendered = sql
+        for key, value in replacements.items():
+            rendered = rendered.replace("{{" + key + "}}", str(value))
+        return rendered
+
     async def _execute_post_promotion_hooks(
         self,
         contract: PipelineContract,
@@ -502,10 +542,11 @@ class PipelineRunner:
 
         log.info("Executing %d post-promotion hook(s)", len(hooks))
         for hook in hooks:
+            rendered_sql = self._render_hook_sql(hook.sql, contract, run)
             t0 = _time.monotonic()
             try:
                 rows = await target.execute_sql(
-                    hook.sql, hook.timeout_seconds,
+                    rendered_sql, hook.timeout_seconds,
                 )
                 duration_ms = int((_time.monotonic() - t0) * 1000)
                 # Store first row for SELECT, or empty dict for non-SELECT
@@ -518,6 +559,8 @@ class PipelineRunner:
                     "rows_returned": len(rows),
                     "result": result_value,
                 }
+                if rendered_sql != hook.sql:
+                    result["rendered_sql"] = rendered_sql
                 log.info(
                     "Hook '%s' completed in %dms (%d rows)",
                     hook.name, duration_ms, len(rows),
