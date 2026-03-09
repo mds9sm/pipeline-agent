@@ -462,6 +462,9 @@ class RunRecord:
     gate_decision: Optional[GateDecision] = None
     error: Optional[str] = None
     retry_count: int = 0
+    # Build 15: upstream trigger context
+    triggered_by_run_id: Optional[str] = None
+    triggered_by_pipeline_id: Optional[str] = None
 
 
 @dataclass

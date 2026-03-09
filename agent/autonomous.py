@@ -85,6 +85,11 @@ class PipelineRunner:
                 await self._update_error_budget(contract, run)
                 return run
 
+            # Build 15: Load upstream run context for data-triggered runs
+            upstream_run = None
+            if run.triggered_by_run_id:
+                upstream_run = await self.store.get_run(run.triggered_by_run_id)
+
             # Resolve connectors
             src_params, tgt_params = self._connector_params(contract, "both")
             source = await self.registry.get_source(
@@ -183,10 +188,10 @@ class PipelineRunner:
             await self._track_column_lineage(contract)
 
             # Write pipeline metadata (XCom-style)
-            await self._write_run_metadata(contract, run, extract_result)
+            await self._write_run_metadata(contract, run, extract_result, upstream_run)
 
             # Execute post-promotion SQL hooks
-            await self._execute_post_promotion_hooks(contract, run, target)
+            await self._execute_post_promotion_hooks(contract, run, target, upstream_run)
 
             # 9. Mark COMPLETE
             run.status = RunStatus.COMPLETE
@@ -458,6 +463,7 @@ class PipelineRunner:
         contract: PipelineContract,
         run: RunRecord,
         extract_result,
+        upstream_run: RunRecord = None,
     ) -> None:
         """Persist execution metadata for downstream consumption."""
         try:
@@ -482,6 +488,28 @@ class PipelineRunner:
                 pid, "last_staging_size_bytes",
                 {"value": run.staging_size_bytes}, rid,
             )
+            # Build 15: Write upstream context for data-triggered runs
+            if upstream_run:
+                await self.store.set_metadata(
+                    pid, "upstream_run_id",
+                    {"value": upstream_run.run_id}, rid, namespace="upstream",
+                )
+                await self.store.set_metadata(
+                    pid, "upstream_pipeline_id",
+                    {"value": upstream_run.pipeline_id}, rid, namespace="upstream",
+                )
+                await self.store.set_metadata(
+                    pid, "upstream_watermark_after",
+                    {"value": upstream_run.watermark_after}, rid, namespace="upstream",
+                )
+                await self.store.set_metadata(
+                    pid, "upstream_rows_extracted",
+                    {"value": upstream_run.rows_extracted}, rid, namespace="upstream",
+                )
+                await self.store.set_metadata(
+                    pid, "upstream_completed_at",
+                    {"value": upstream_run.completed_at}, rid, namespace="upstream",
+                )
         except Exception as e:
             log.warning("Failed to write pipeline metadata: %s", e)
 
@@ -494,10 +522,11 @@ class PipelineRunner:
         sql: str,
         contract: PipelineContract,
         run: RunRecord,
+        upstream_run: RunRecord = None,
     ) -> str:
         """Replace {{variable}} placeholders with run context values.
 
-        Supported variables:
+        Supported variables (15 current + 9 upstream):
           {{pipeline_id}}, {{pipeline_name}},
           {{run_id}}, {{run_mode}},
           {{watermark_before}}, {{watermark_after}},
@@ -506,6 +535,11 @@ class PipelineRunner:
           {{source_schema}}, {{source_table}},
           {{target_schema}}, {{target_table}},
           {{batch_id}} (alias for run_id[:8])
+          {{upstream_run_id}}, {{upstream_pipeline_id}},
+          {{upstream_watermark_before}}, {{upstream_watermark_after}},
+          {{upstream_rows_extracted}}, {{upstream_rows_loaded}},
+          {{upstream_started_at}}, {{upstream_completed_at}},
+          {{upstream_batch_id}}
         """
         replacements = {
             "pipeline_id": contract.pipeline_id,
@@ -523,6 +557,16 @@ class PipelineRunner:
             "target_schema": contract.target_schema,
             "target_table": contract.target_table,
             "batch_id": run.run_id[:8],
+            # Build 15: upstream context variables
+            "upstream_run_id": upstream_run.run_id if upstream_run else "",
+            "upstream_pipeline_id": upstream_run.pipeline_id if upstream_run else "",
+            "upstream_watermark_before": (upstream_run.watermark_before or "") if upstream_run else "",
+            "upstream_watermark_after": (upstream_run.watermark_after or "") if upstream_run else "",
+            "upstream_rows_extracted": str(upstream_run.rows_extracted) if upstream_run else "0",
+            "upstream_rows_loaded": str(upstream_run.rows_loaded) if upstream_run else "0",
+            "upstream_started_at": (upstream_run.started_at or "") if upstream_run else "",
+            "upstream_completed_at": (upstream_run.completed_at or "") if upstream_run else "",
+            "upstream_batch_id": upstream_run.run_id[:8] if upstream_run else "",
         }
         rendered = sql
         for key, value in replacements.items():
@@ -534,6 +578,7 @@ class PipelineRunner:
         contract: PipelineContract,
         run: RunRecord,
         target,
+        upstream_run: RunRecord = None,
     ) -> None:
         """Execute SQL hooks against the target and store results as metadata."""
         hooks = [h for h in contract.post_promotion_hooks if h.enabled]
@@ -542,7 +587,7 @@ class PipelineRunner:
 
         log.info("Executing %d post-promotion hook(s)", len(hooks))
         for hook in hooks:
-            rendered_sql = self._render_hook_sql(hook.sql, contract, run)
+            rendered_sql = self._render_hook_sql(hook.sql, contract, run, upstream_run)
             t0 = _time.monotonic()
             try:
                 rows = await target.execute_sql(

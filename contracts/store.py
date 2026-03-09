@@ -263,8 +263,9 @@ class ContractStore:
                 rows_extracted, rows_loaded, watermark_before, watermark_after,
                 staging_path, staging_size_bytes,
                 drift_detected, quality_results, gate_decision,
-                error, retry_count
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                error, retry_count,
+                triggered_by_run_id, triggered_by_pipeline_id
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
             ON CONFLICT (run_id) DO UPDATE SET
                 completed_at=EXCLUDED.completed_at, status=EXCLUDED.status,
                 rows_extracted=EXCLUDED.rows_extracted, rows_loaded=EXCLUDED.rows_loaded,
@@ -275,7 +276,9 @@ class ContractStore:
                 drift_detected=EXCLUDED.drift_detected,
                 quality_results=EXCLUDED.quality_results,
                 gate_decision=EXCLUDED.gate_decision,
-                error=EXCLUDED.error, retry_count=EXCLUDED.retry_count
+                error=EXCLUDED.error, retry_count=EXCLUDED.retry_count,
+                triggered_by_run_id=EXCLUDED.triggered_by_run_id,
+                triggered_by_pipeline_id=EXCLUDED.triggered_by_pipeline_id
         """,
             r.run_id, r.pipeline_id, r.started_at, r.completed_at,
             r.status.value, r.run_mode.value,
@@ -287,6 +290,7 @@ class ContractStore:
             json.dumps(r.quality_results) if r.quality_results else None,
             r.gate_decision.value if r.gate_decision else None,
             r.error, r.retry_count,
+            r.triggered_by_run_id, r.triggered_by_pipeline_id,
         )
 
     async def get_run(self, run_id: str) -> Optional[RunRecord]:
@@ -309,6 +313,20 @@ class ContractStore:
             ORDER BY started_at DESC LIMIT 1
         """, pipeline_id)
         return _row_to_run(row) if row else None
+
+    async def get_trigger_chain(self, run_id: str, max_depth: int = 10) -> list[RunRecord]:
+        """Walk the trigger chain backwards: run → its trigger → root."""
+        chain = []
+        current_id = run_id
+        for _ in range(max_depth):
+            run = await self.get_run(current_id)
+            if not run:
+                break
+            chain.append(run)
+            if not run.triggered_by_run_id:
+                break
+            current_id = run.triggered_by_run_id
+        return chain
 
     async def get_volume_baseline(self, pipeline_id: str, window: int = 30) -> list[int]:
         rows = await self.pool.fetch("""
@@ -1111,6 +1129,8 @@ def _row_to_run(row: asyncpg.Record) -> RunRecord:
         gate_decision=GateDecision(row["gate_decision"]) if row["gate_decision"] else None,
         error=row["error"],
         retry_count=row["retry_count"],
+        triggered_by_run_id=row.get("triggered_by_run_id"),
+        triggered_by_pipeline_id=row.get("triggered_by_pipeline_id"),
     )
 
 
@@ -1626,6 +1646,9 @@ _ALTER_TABLES_SQL = """
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS schema_change_policy JSONB NOT NULL DEFAULT '{}';
 -- Build 13: Add post_promotion_hooks column to existing pipelines table
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS post_promotion_hooks JSONB NOT NULL DEFAULT '[]';
+-- Build 15: Run context propagation
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS triggered_by_run_id TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS triggered_by_pipeline_id TEXT;
 """
 
 # Alias used by several modules (agent, scheduler, monitor, api).

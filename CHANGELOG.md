@@ -11,7 +11,7 @@ Format: Each entry records what changed, why, and test results at the time of th
 | Build | Feature | Status | Why |
 |-------|---------|--------|-----|
 | 14 | Hook template variables | **Done** | `{{watermark_after}}`, `{{run_id}}` etc. — unblocks consume-and-merge pattern |
-| 15 | Run context propagation | Pending | Upstream run context (watermarks, batch IDs) flows to downstream pipelines |
+| 15 | Run context propagation | **Done** | Upstream run context (watermarks, batch IDs) flows to downstream pipelines |
 | 16 | Data contracts between pipelines | Pending | Formalize producer/consumer relationships, cleanup policies, retention |
 | 17 | SQL-native intra-DB steps | Pending | Skip CSV extract for same-database pipelines (INSERT INTO...SELECT) |
 | 18 | Composable step DAG | Pending | Replace fixed extract→load→promote flow with configurable step graph |
@@ -21,6 +21,32 @@ Format: Each entry records what changed, why, and test results at the time of th
 ---
 
 ## [Unreleased]
+
+### Build 15 - 2026-03-09 (Claude Opus 4.6)
+
+**Run Context Propagation**
+
+#### Added
+- **`triggered_by_run_id` / `triggered_by_pipeline_id`** on `RunRecord` — When a pipeline is data-triggered, the downstream run records which upstream run and pipeline caused the trigger.
+- **9 upstream template variables** — `{{upstream_run_id}}`, `{{upstream_pipeline_id}}`, `{{upstream_watermark_before}}`, `{{upstream_watermark_after}}`, `{{upstream_rows_extracted}}`, `{{upstream_rows_loaded}}`, `{{upstream_started_at}}`, `{{upstream_completed_at}}`, `{{upstream_batch_id}}`. Available in post-promotion hook SQL alongside existing 15 variables (total: 24).
+- **Upstream metadata namespace** — After data-triggered runs, upstream context (run_id, pipeline_id, watermark, row count, completion time) is auto-written as metadata under `namespace="upstream"`, queryable via the existing metadata API.
+- **`GET /api/runs/{run_id}/trigger-chain`** — Walks the trigger chain backwards to the root run, returning full run summaries at each hop. Supports multi-hop chains (A → B → C).
+- **UI trigger indicators** — Data-triggered runs show the upstream pipeline ID snippet in the run list.
+
+#### Changed
+- **`scheduler/manager.py`** — `_trigger_downstream()` now receives the completed `RunRecord` and sets `triggered_by_run_id` / `triggered_by_pipeline_id` on downstream runs.
+- **`agent/autonomous.py`** — `_execute_inner()` loads upstream run for data-triggered runs. `_render_hook_sql()` extended from 15 to 24 template variables. `_write_run_metadata()` writes upstream context under `namespace="upstream"`.
+- **`api/server.py`** — `_run_summary()` includes `triggered_by_run_id` and `triggered_by_pipeline_id`.
+- **DB migration** — `ALTER TABLE runs ADD COLUMN IF NOT EXISTS triggered_by_run_id TEXT` and `triggered_by_pipeline_id TEXT`.
+
+#### Key Use Case Unlocked
+Consume-and-merge with upstream watermark boundaries:
+```sql
+-- Downstream hook: delete only rows consumed by the upstream run
+DELETE FROM raw.stage_orders WHERE updated_at <= '{{upstream_watermark_after}}'
+```
+
+---
 
 ### Build 14 - 2026-03-09 (Claude Opus 4.6)
 

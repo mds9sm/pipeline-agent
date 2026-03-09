@@ -1291,6 +1291,23 @@ def create_app(
         runs = await store.list_runs(pipeline_id, limit=limit)
         return [_run_summary(r) for r in runs]
 
+    @app.get("/api/runs/{run_id}/trigger-chain")
+    @limiter.limit("100/minute")
+    async def get_trigger_chain(
+        request: Request,
+        run_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Walk the trigger chain backwards from a run to its root trigger."""
+        chain = await store.get_trigger_chain(run_id)
+        if not chain:
+            raise HTTPException(404, "Run not found")
+        return {
+            "run_id": run_id,
+            "chain_length": len(chain),
+            "chain": [_run_summary(r) for r in chain],
+        }
+
     @app.get("/api/pipelines/{pipeline_id}/schema-history")
     @limiter.limit("100/minute")
     async def schema_history(
@@ -2651,6 +2668,8 @@ def _run_summary(r) -> dict:
         "quality_results": r.quality_results,
         "error": r.error,
         "retry_count": r.retry_count,
+        "triggered_by_run_id": r.triggered_by_run_id,
+        "triggered_by_pipeline_id": r.triggered_by_pipeline_id,
     }
 
 

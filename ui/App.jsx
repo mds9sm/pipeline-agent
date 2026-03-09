@@ -669,6 +669,9 @@ function PipelinesView({ tierFilter }) {
                             <span className="font-mono text-stone-400">{r.started_at?.slice(0, 16)}</span>
                             {fmtDuration && <span className="text-stone-400">{fmtDuration}</span>}
                             <Pill label={r.run_mode || "scheduled"} color="blue" />
+                            {r.triggered_by_pipeline_id && (
+                              <span className="text-[10px] text-stone-400 italic">from {r.triggered_by_pipeline_id?.slice(0, 8)}</span>
+                            )}
                             <span className="text-stone-500">{r.rows_extracted?.toLocaleString()} extracted</span>
                             {r.rows_loaded > 0 && <span className="text-stone-500">{r.rows_loaded?.toLocaleString()} loaded</span>}
                             {fmtBytes(r.staging_size_bytes) && <span className="text-stone-400">{fmtBytes(r.staging_size_bytes)}</span>}
@@ -1013,7 +1016,7 @@ function PipelinesView({ tierFilter }) {
                         JSON array. Each hook: name, sql, metadata_key, description, enabled (true), timeout_seconds (30), fail_pipeline_on_error (false)
                       </div>
                       <div className="text-[10px] text-stone-400 mt-0.5">
-                        Template variables: <code className="bg-stone-100 px-0.5 rounded">{"{{watermark_after}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{watermark_before}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{run_id}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{batch_id}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{target_schema}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{target_table}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{rows_extracted}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{pipeline_name}}"}</code>
+                        Template variables: <code className="bg-stone-100 px-0.5 rounded">{"{{watermark_after}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{watermark_before}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{run_id}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{batch_id}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{target_schema}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{target_table}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{rows_extracted}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{pipeline_name}}"}</code> | Upstream: <code className="bg-stone-100 px-0.5 rounded">{"{{upstream_watermark_after}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{upstream_run_id}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{upstream_rows_extracted}}"}</code> <code className="bg-stone-100 px-0.5 rounded">{"{{upstream_pipeline_id}}"}</code>
                       </div>
                     </div>
 

@@ -238,14 +238,14 @@ class Scheduler:
                     if run.status == RunStatus.FAILED:
                         await self._maybe_retry(pipeline, run)
                     elif run.status == RunStatus.COMPLETE:
-                        await self._trigger_downstream(pid)
+                        await self._trigger_downstream(pid, run)
 
             except Exception as e:
                 log.exception("Unhandled error: %s", e)
             finally:
                 self._running.discard(pid)
 
-    async def _trigger_downstream(self, completed_pipeline_id: str) -> None:
+    async def _trigger_downstream(self, completed_pipeline_id: str, completed_run: RunRecord = None) -> None:
         """After a pipeline completes, check and trigger any downstream
         dependents whose dependencies are all satisfied."""
         try:
@@ -293,6 +293,8 @@ class Scheduler:
                         pipeline_id=downstream_id,
                         run_mode=RunMode.DATA_TRIGGERED,
                         status=RunStatus.PENDING,
+                        triggered_by_run_id=completed_run.run_id if completed_run else None,
+                        triggered_by_pipeline_id=completed_pipeline_id,
                     )
                     await self.store.save_run(run)
 
