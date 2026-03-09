@@ -27,8 +27,8 @@ Thumbs.db
 *.db
 !demo/demo_source.db
 
-# Staging data (generated at runtime)
-data/staging/
+# Runtime data (staging, contracts, metadata)
+data/
 
 # Alembic
 alembic/versions/__pycache__/
