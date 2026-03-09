@@ -109,6 +109,28 @@ class QualityGate:
             gate.decision = GateDecision.PROMOTE
 
         gate.evaluated_at = now_iso()
+
+        # Log gate decision and check summary
+        check_summary = ", ".join(
+            f"{c.check_name}={c.status.value}" for c in checks
+        )
+        if gate.decision == GateDecision.HALT:
+            log.warning(
+                "Quality gate HALT (%s)", check_summary,
+            )
+        elif gate.decision == GateDecision.PROMOTE_WITH_WARNING:
+            log.info(
+                "Quality gate PROMOTE_WITH_WARNING (%s)", check_summary,
+            )
+        else:
+            log.info("Quality gate PROMOTE (%s)", check_summary)
+
+        for c in checks:
+            log.debug(
+                "  check %s: %s (%dms) -- %s",
+                c.check_name, c.status.value, c.duration_ms or 0, c.detail,
+            )
+
         return gate
 
     # ------------------------------------------------------------------

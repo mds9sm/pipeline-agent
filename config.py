@@ -41,6 +41,9 @@ class Config:
         self.api_host = os.getenv("API_HOST", "0.0.0.0")
         self.api_port = int(os.getenv("API_PORT", "8100"))
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
+        self.log_format = os.getenv("LOG_FORMAT", "json")
+        self.log_max_bytes = int(os.getenv("LOG_MAX_BYTES", str(50 * 1024 * 1024)))
+        self.log_backup_count = int(os.getenv("LOG_BACKUP_COUNT", "5"))
 
         # Auth
         self.jwt_secret = os.getenv("JWT_SECRET", "") or "dapos-dev-secret-change-in-production"

@@ -20,6 +20,7 @@ from connectors.registry import ConnectorRegistry
 from staging.local import LocalStagingManager
 from quality.gate import QualityGate
 from crypto import decrypt_dict, CREDENTIAL_FIELDS
+from logging_config import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -47,10 +48,19 @@ class PipelineRunner:
         run: RunRecord,
     ) -> RunRecord:
         """Run the full state machine for one pipeline execution."""
-        log.info(
-            "[%s] Starting run %s (mode=%s)",
-            contract.pipeline_name, run.run_id[:8], run.run_mode.value,
-        )
+        async with PipelineContext(
+            contract.pipeline_id, contract.pipeline_name,
+            run_id=run.run_id, component="runner",
+        ):
+            return await self._execute_inner(contract, run)
+
+    async def _execute_inner(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+    ) -> RunRecord:
+        """Inner execution logic (runs inside PipelineContext)."""
+        log.info("Starting run (mode=%s)", run.run_mode.value)
         try:
             # 1. Preflight checks
             if not await self._preflight(contract, run):
@@ -84,20 +94,14 @@ class PipelineRunner:
             run.staging_path = str(extract_result.staging_path)
             run.staging_size_bytes = extract_result.staging_size_bytes
 
-            log.info(
-                "[%s] Extracted %d rows",
-                contract.pipeline_name, run.rows_extracted,
-            )
+            log.info("Extracted %d rows", run.rows_extracted)
 
             # 3. Skip if incremental with 0 rows
             if (
                 run.rows_extracted == 0
                 and contract.refresh_type.value == "incremental"
             ):
-                log.info(
-                    "[%s] No new rows -- marking complete.",
-                    contract.pipeline_name,
-                )
+                log.info("No new rows -- marking complete.")
                 run.status = RunStatus.COMPLETE
                 run.completed_at = now_iso()
                 await self.store.save_run(run)
@@ -108,9 +112,7 @@ class PipelineRunner:
             run.status = RunStatus.LOADING
             await self.store.save_run(run)
             await target.load_staging(contract, run)
-            log.info(
-                "[%s] Loaded to staging", contract.pipeline_name,
-            )
+            log.info("Loaded to staging")
 
             # 5. QUALITY GATE
             run.status = RunStatus.QUALITY_GATE
@@ -142,7 +144,7 @@ class PipelineRunner:
             run.status = RunStatus.PROMOTING
             await self.store.save_run(run)
             await target.promote(contract, run)
-            log.info("[%s] Promoted to target", contract.pipeline_name)
+            log.info("Promoted to target")
 
             # 8. Update watermark (skip for backfills)
             if (
@@ -166,10 +168,7 @@ class PipelineRunner:
             run.status = RunStatus.COMPLETE
             run.completed_at = now_iso()
             await self.store.save_run(run)
-            log.info(
-                "[%s] Run complete -- %d rows extracted",
-                contract.pipeline_name, run.rows_extracted,
-            )
+            log.info("Run complete -- %d rows extracted", run.rows_extracted)
 
             # 10. Update error budget
             await self._update_error_budget(contract, run)
@@ -177,7 +176,7 @@ class PipelineRunner:
             return run
 
         except Exception as e:
-            log.exception("[%s] Run failed: %s", contract.pipeline_name, e)
+            log.exception("Run failed: %s", e)
             run.error = str(e)
             run.status = RunStatus.FAILED
             run.completed_at = now_iso()
@@ -210,10 +209,7 @@ class PipelineRunner:
         """Returns False if run should be skipped."""
         # Check pending halt proposals
         if await self.store.has_pending_halt_proposal(contract.pipeline_id):
-            log.warning(
-                "[%s] Skipping -- pending halt proposal.",
-                contract.pipeline_name,
-            )
+            log.warning("Skipping -- pending halt proposal.")
             run.status = RunStatus.FAILED
             run.error = "Skipped: pending halt proposal requires approval."
             run.completed_at = now_iso()
@@ -226,8 +222,7 @@ class PipelineRunner:
         )
         if not has_space:
             log.error(
-                "[%s] Insufficient disk space: %.0f%% used.",
-                contract.pipeline_name, used_pct * 100,
+                "Insufficient disk space: %.0f%% used.", used_pct * 100,
             )
             run.status = RunStatus.FAILED
             run.error = f"Insufficient disk space: {used_pct:.0%} used."
@@ -242,10 +237,7 @@ class PipelineRunner:
             if last_run is None:
                 upstream = await self.store.get_pipeline(dep.depends_on_id)
                 name = upstream.pipeline_name if upstream else dep.depends_on_id
-                log.warning(
-                    "[%s] Upstream %s has no successful run yet.",
-                    contract.pipeline_name, name,
-                )
+                log.warning("Upstream %s has no successful run yet.", name)
                 run.status = RunStatus.FAILED
                 run.error = (
                     f"Upstream pipeline {name} has not completed successfully."
@@ -289,10 +281,7 @@ class PipelineRunner:
         target,
     ) -> RunRecord:
         """Mark run as HALTED and preserve staging for investigation."""
-        log.warning(
-            "[%s] Quality gate HALT. Preserving staging.",
-            contract.pipeline_name,
-        )
+        log.warning("Quality gate HALT. Preserving staging.")
         run.status = RunStatus.HALTED
         run.completed_at = now_iso()
         await self.store.save_run(run)
@@ -403,16 +392,12 @@ class PipelineRunner:
                 )
                 await self.store.save_alert(alert)
                 log.error(
-                    "[%s] Error budget EXHAUSTED: %.1f%% success (%d/%d runs)",
-                    contract.pipeline_name, success_rate * 100,
-                    successful_runs, total_runs,
+                    "Error budget EXHAUSTED: %.1f%% success (%d/%d runs)",
+                    success_rate * 100, successful_runs, total_runs,
                 )
 
         except Exception as e:
-            log.warning(
-                "[%s] Error budget calculation failed: %s",
-                contract.pipeline_name, e,
-            )
+            log.warning("Error budget calculation failed: %s", e)
 
     # ------------------------------------------------------------------
     # Column lineage
@@ -438,10 +423,7 @@ class PipelineRunner:
                 )
                 await self.store.save_column_lineage(lineage)
         except Exception as e:
-            log.warning(
-                "[%s] Column lineage tracking failed: %s",
-                contract.pipeline_name, e,
-            )
+            log.warning("Column lineage tracking failed: %s", e)
 
     # ------------------------------------------------------------------
     # Connector param resolution

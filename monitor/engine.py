@@ -29,6 +29,7 @@ from contracts.store import Store
 from connectors.registry import ConnectorRegistry
 from agent.core import AgentCore
 from crypto import decrypt_dict, CREDENTIAL_FIELDS
+from logging_config import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -67,20 +68,15 @@ class MonitorEngine:
         """Check drift and freshness for all active pipelines."""
         pipelines = await self.store.list_pipelines(status="active")
         for pipeline in pipelines:
-            try:
-                await self._check_drift(pipeline)
-            except Exception as e:
-                log.warning(
-                    "[%s] Drift check error: %s",
-                    pipeline.pipeline_name, e,
-                )
-            try:
-                await self._check_freshness(pipeline)
-            except Exception as e:
-                log.warning(
-                    "[%s] Freshness check error: %s",
-                    pipeline.pipeline_name, e,
-                )
+            with PipelineContext(pipeline.pipeline_id, pipeline.pipeline_name, component="monitor"):
+                try:
+                    await self._check_drift(pipeline)
+                except Exception as e:
+                    log.warning("Drift check error: %s", e)
+                try:
+                    await self._check_freshness(pipeline)
+                except Exception as e:
+                    log.warning("Freshness check error: %s", e)
 
     # ------------------------------------------------------------------
     # Schema drift detection
@@ -112,10 +108,7 @@ class MonitorEngine:
                 pipeline.source_schema, pipeline.source_table,
             )
         except Exception as e:
-            log.warning(
-                "[%s] Could not profile source table: %s",
-                pipeline.pipeline_name, e,
-            )
+            log.warning("Could not profile source table: %s", e)
             return
 
         current_cols = {m.source_column: m for m in pipeline.column_mappings}
@@ -150,7 +143,7 @@ class MonitorEngine:
             "dropped_columns": dropped_columns,
             "type_changes": type_changes,
         }
-        log.info("[%s] Drift detected: %s", pipeline.pipeline_name, drift_info)
+        log.info("Drift detected: %s", drift_info)
 
         # Load relevant preferences
         prefs = (
@@ -186,8 +179,8 @@ class MonitorEngine:
                     })
             except Exception as e:
                 log.warning(
-                    "[%s] Failed to query downstream lineage for column %s: %s",
-                    pipeline.pipeline_name, col_name, e,
+                    "Failed to query downstream lineage for column %s: %s",
+                    col_name, e,
                 )
 
         impact_analysis = {
@@ -361,8 +354,8 @@ class MonitorEngine:
         )
         await self.store.save_schema_version(sv)
         log.info(
-            "[%s] Auto-applied schema changes (v%d): %s",
-            pipeline.pipeline_name, pipeline.version, "; ".join(changes_desc),
+            "Auto-applied schema changes (v%d): %s",
+            pipeline.version, "; ".join(changes_desc),
         )
 
     # ------------------------------------------------------------------
@@ -493,10 +486,7 @@ class MonitorEngine:
                     await self._dispatch_alert(alert, pipeline)
 
         except Exception as e:
-            log.warning(
-                "[%s] Freshness check failed: %s",
-                pipeline.pipeline_name, e,
-            )
+            log.warning("Freshness check failed: %s", e)
 
     # ------------------------------------------------------------------
     # Alert dispatch
@@ -569,8 +559,8 @@ class MonitorEngine:
                     return [ch for ch in policy.channels if isinstance(ch, dict)]
             except Exception as e:
                 log.warning(
-                    "[%s] Failed to load notification policy %s: %s",
-                    pipeline.pipeline_name, pipeline.notification_policy_id, e,
+                    "Failed to load notification policy %s: %s",
+                    pipeline.notification_policy_id, e,
                 )
 
         tier_cfg = pipeline.get_tier_config()

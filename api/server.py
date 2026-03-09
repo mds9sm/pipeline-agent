@@ -3,6 +3,8 @@ FastAPI REST API server with JWT auth, rate limiting, and agent-routed commands.
 """
 import logging
 import os
+import time
+import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Optional
@@ -35,6 +37,7 @@ from monitor.engine import MonitorEngine
 from auth import AuthDependency, create_token
 from crypto import encrypt_dict, decrypt_dict, CREDENTIAL_FIELDS
 from config import Config
+from logging_config import set_request_id, request_id_var
 
 log = logging.getLogger(__name__)
 
@@ -216,6 +219,25 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def request_correlation(request: Request, call_next):
+        req_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        token = set_request_id(req_id)
+        t0 = time.monotonic()
+        try:
+            response = await call_next(request)
+            if request.url.path not in ("/api/health", "/health"):
+                elapsed = int((time.monotonic() - t0) * 1000)
+                log.info(
+                    "%s %s %d (%dms)",
+                    request.method, request.url.path,
+                    response.status_code, elapsed,
+                )
+            response.headers["X-Request-ID"] = req_id
+            return response
+        finally:
+            request_id_var.reset(token)
 
     auth_dep = AuthDependency(config)
 
@@ -1102,6 +1124,75 @@ def create_app(
             }
             for sv in versions
         ]
+
+    @app.get("/api/pipelines/{pipeline_id}/timeline")
+    @limiter.limit("100/minute")
+    async def pipeline_timeline(
+        request: Request,
+        pipeline_id: str,
+        limit: int = Query(50, ge=1, le=200),
+        caller: dict = Depends(auth_dep),
+    ):
+        pipeline = await store.get_pipeline(pipeline_id)
+        if not pipeline:
+            raise HTTPException(404, "Pipeline not found")
+
+        events = []
+
+        runs = await store.list_runs(pipeline_id, limit=limit)
+        for r in runs:
+            events.append({
+                "type": "run",
+                "timestamp": r.completed_at or r.started_at,
+                "run_id": r.run_id,
+                "status": r.status.value if hasattr(r.status, "value") else r.status,
+                "run_mode": r.run_mode.value if hasattr(r.run_mode, "value") else r.run_mode,
+                "rows_extracted": r.rows_extracted,
+                "error": r.error,
+            })
+
+        gates = await store.list_gates(pipeline_id)
+        for g in gates[:limit]:
+            events.append({
+                "type": "gate",
+                "timestamp": g.evaluated_at,
+                "run_id": g.run_id,
+                "decision": g.decision.value if hasattr(g.decision, "value") else g.decision,
+                "checks": [
+                    {"name": c.check_name, "status": c.status.value if hasattr(c.status, "value") else c.status}
+                    for c in (g.checks or [])
+                ],
+            })
+
+        alerts = await store.list_alerts_for_pipeline(pipeline_id, limit=limit)
+        for a in alerts:
+            events.append({
+                "type": "alert",
+                "timestamp": a.created_at,
+                "alert_id": a.alert_id,
+                "severity": a.severity.value if hasattr(a.severity, "value") else a.severity,
+                "summary": a.summary,
+            })
+
+        decisions = await store.list_decisions(pipeline_id)
+        for d in decisions[:limit]:
+            events.append({
+                "type": "decision",
+                "timestamp": d.created_at,
+                "decision_type": d.decision_type,
+                "detail": d.detail,
+                "reasoning": d.reasoning,
+            })
+
+        events.sort(key=lambda e: e.get("timestamp") or "", reverse=True)
+        events = events[:limit]
+
+        return {
+            "pipeline_id": pipeline_id,
+            "pipeline_name": pipeline.pipeline_name,
+            "event_count": len(events),
+            "events": events,
+        }
 
     # -----------------------------------------------------------------------
     # Approvals

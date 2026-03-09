@@ -8,6 +8,34 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ## [Unreleased]
 
+### Build 8 - 2026-03-08 (Claude Opus 4.6)
+
+**Production-grade structured logging with pipeline context propagation**
+
+#### Added
+- **`logging_config.py` (new file)** — ContextVars (`pipeline_id`, `pipeline_name`, `run_id`, `request_id`, `component`), `PipelineContext` context manager (sync + async, reset-based), `ContextFilter` for automatic injection, `JSONFormatter` (one JSON object per line, Datadog/Loki/CloudWatch compatible), `ConsoleFormatter` (human-readable with inline context tags), `setup_logging()` with `RotatingFileHandler`.
+- **Request correlation middleware** — `@app.middleware("http")` reads `X-Request-ID` header or generates UUID, sets contextvar, logs `METHOD /path STATUS (duration_ms)` for non-health requests, returns `X-Request-ID` in response header.
+- **Quality gate logging** — Gate decisions logged as WARNING (HALT) or INFO (PROMOTE/PROMOTE_WITH_WARNING) with check summary. Individual check details logged at DEBUG level.
+- **Per-pipeline timeline API** — `GET /api/pipelines/{pipeline_id}/timeline` returns merged runs, gates, alerts, and decisions sorted by timestamp. New `list_alerts_for_pipeline()` store method.
+
+#### Changed
+- **`config.py`** — Added `LOG_FORMAT` (default: json), `LOG_MAX_BYTES` (default: 50MB), `LOG_BACKUP_COUNT` (default: 5) env vars.
+- **`main.py`** — `setup_logging()` delegates to `logging_config.setup_logging()` with config values. Creates `data/logs/` directory.
+- **`agent/autonomous.py`** — Split `execute()` into PipelineContext wrapper + `_execute_inner()`. Removed all 14 `[%s]` manual prefixes.
+- **`scheduler/manager.py`** — `_tick()` loop and `_run_pipeline()` wrapped in PipelineContext. Removed ~8 `[%s]` prefixes.
+- **`monitor/engine.py`** — `_tick()` loop wrapped in PipelineContext. Removed ~6 `[%s]` prefixes.
+- **`quality/gate.py`** — Added gate decision + check summary logging after evaluation.
+- **`api/server.py`** — Added request correlation middleware, timeline endpoint, imported `time`, `uuid`, `logging_config`.
+- **`contracts/store.py`** — Added `list_alerts_for_pipeline(pipeline_id, limit)` method.
+
+#### Log output examples
+
+Console: `2026-03-08 14:32:15 INFO  agent.autonomous -- [demo-orders | run:abc12345] Extracted 30 rows`
+
+JSON: `{"timestamp":"2026-03-08T14:32:28+00:00","level":"INFO","logger":"agent.autonomous","message":"Extracted 30 rows","pipeline_id":"abc-123","pipeline_name":"demo-orders","run_id":"abc12345-full-uuid","component":"runner"}`
+
+---
+
 ### Build 7 - 2026-03-08 (Claude Opus 4.6)
 
 **Features #5-9: Incremental extraction (verified), enhanced run history UI, connector approval flow, alerting dispatch, schema drift auto-remediation**

@@ -19,6 +19,7 @@ from contracts.models import (
 )
 from contracts.store import Store
 from agent.autonomous import PipelineRunner
+from logging_config import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -69,57 +70,55 @@ class Scheduler:
         sorted_pipelines = self.topological_sort(pipelines, deps)
 
         for pipeline in sorted_pipelines:
-            if pipeline.pipeline_id in self._running:
-                continue
+            with PipelineContext(pipeline.pipeline_id, pipeline.pipeline_name, component="scheduler"):
+                if pipeline.pipeline_id in self._running:
+                    continue
 
-            if not self._is_due(pipeline, now):
-                continue
+                if not self._is_due(pipeline, now):
+                    continue
 
-            # Check error budget before scheduling
-            budget = await self.store.get_error_budget(pipeline.pipeline_id)
-            if budget and budget.escalated:
-                log.warning(
-                    "[%s] Skipping -- error budget exhausted "
-                    "(success_rate=%.1f%%, threshold=%.0f%%).",
-                    pipeline.pipeline_name,
-                    budget.success_rate * 100,
-                    budget.budget_threshold * 100,
-                )
-                continue
-
-            # SLA tracking: log when pipeline misses its scheduled window
-            last_run = await self.store.get_last_successful_run(
-                pipeline.pipeline_id,
-            )
-            if last_run and last_run.completed_at:
-                try:
-                    last_time = datetime.fromisoformat(
-                        last_run.completed_at,
-                    ).replace(tzinfo=timezone.utc)
-                    ci = croniter(pipeline.schedule_cron, last_time)
-                    expected_next = ci.get_next(datetime).replace(
-                        tzinfo=timezone.utc,
+                # Check error budget before scheduling
+                budget = await self.store.get_error_budget(pipeline.pipeline_id)
+                if budget and budget.escalated:
+                    log.warning(
+                        "Skipping -- error budget exhausted "
+                        "(success_rate=%.1f%%, threshold=%.0f%%).",
+                        budget.success_rate * 100,
+                        budget.budget_threshold * 100,
                     )
-                    # If we are more than 2x the schedule interval late
-                    schedule_interval = (
-                        expected_next - last_time
-                    ).total_seconds()
-                    delay = (now - expected_next).total_seconds()
-                    if delay > schedule_interval:
-                        log.warning(
-                            "[%s] SLA miss: pipeline is %.0f minutes late "
-                            "(expected at %s, now %s).",
-                            pipeline.pipeline_name,
-                            delay / 60,
-                            expected_next.isoformat(),
-                            now.isoformat(),
-                        )
-                except Exception:
-                    pass
+                    continue
 
-            asyncio.create_task(
-                self._run_pipeline(pipeline, RunMode.SCHEDULED),
-            )
+                # SLA tracking: log when pipeline misses its scheduled window
+                last_run = await self.store.get_last_successful_run(
+                    pipeline.pipeline_id,
+                )
+                if last_run and last_run.completed_at:
+                    try:
+                        last_time = datetime.fromisoformat(
+                            last_run.completed_at,
+                        ).replace(tzinfo=timezone.utc)
+                        ci = croniter(pipeline.schedule_cron, last_time)
+                        expected_next = ci.get_next(datetime).replace(
+                            tzinfo=timezone.utc,
+                        )
+                        schedule_interval = (
+                            expected_next - last_time
+                        ).total_seconds()
+                        delay = (now - expected_next).total_seconds()
+                        if delay > schedule_interval:
+                            log.warning(
+                                "SLA miss: pipeline is %.0f minutes late "
+                                "(expected at %s, now %s).",
+                                delay / 60,
+                                expected_next.isoformat(),
+                                now.isoformat(),
+                            )
+                    except Exception:
+                        pass
+
+                asyncio.create_task(
+                    self._run_pipeline(pipeline, RunMode.SCHEDULED),
+                )
 
     def _is_due(self, pipeline: PipelineContract, now: datetime) -> bool:
         """Evaluate cron schedule from last successful run."""
@@ -215,10 +214,7 @@ class Scheduler:
         """Acquire semaphore, execute pipeline, handle retries on failure."""
         pid = pipeline.pipeline_id
         if pid in self._running:
-            log.debug(
-                "Pipeline %s already running, skipping.",
-                pipeline.pipeline_name,
-            )
+            log.debug("Pipeline already running, skipping.")
             return
 
         async with self.semaphore:
@@ -232,17 +228,18 @@ class Scheduler:
                 if not existing_run:
                     await self.store.save_run(run)
 
-                run = await self.runner.execute(pipeline, run)
+                async with PipelineContext(
+                    pipeline.pipeline_id, pipeline.pipeline_name,
+                    run_id=run.run_id, component="scheduler",
+                ):
+                    run = await self.runner.execute(pipeline, run)
 
-                # Handle retries on failure
-                if run.status == RunStatus.FAILED:
-                    await self._maybe_retry(pipeline, run)
+                    # Handle retries on failure
+                    if run.status == RunStatus.FAILED:
+                        await self._maybe_retry(pipeline, run)
 
             except Exception as e:
-                log.exception(
-                    "Unhandled error in pipeline %s: %s",
-                    pipeline.pipeline_name, e,
-                )
+                log.exception("Unhandled error: %s", e)
             finally:
                 self._running.discard(pid)
 
@@ -256,17 +253,13 @@ class Scheduler:
         Respects retry_max_attempts.
         """
         if run.retry_count >= pipeline.retry_max_attempts:
-            log.info(
-                "[%s] Max retries reached (%d).",
-                pipeline.pipeline_name, pipeline.retry_max_attempts,
-            )
+            log.info("Max retries reached (%d).", pipeline.retry_max_attempts)
             return
 
         backoff = pipeline.retry_backoff_seconds * (2 ** run.retry_count)
         log.info(
-            "[%s] Retrying in %ds (attempt %d/%d)...",
-            pipeline.pipeline_name, backoff,
-            run.retry_count + 1, pipeline.retry_max_attempts,
+            "Retrying in %ds (attempt %d/%d)...",
+            backoff, run.retry_count + 1, pipeline.retry_max_attempts,
         )
         await asyncio.sleep(backoff)
 

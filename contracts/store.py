@@ -595,6 +595,16 @@ class ContractStore:
         )
         return [_row_to_alert(r) for r in rows]
 
+    async def list_alerts_for_pipeline(
+        self, pipeline_id: str, limit: int = 100,
+    ) -> list[AlertRecord]:
+        rows = await self.pool.fetch(
+            "SELECT * FROM alerts WHERE pipeline_id = $1 "
+            "ORDER BY created_at DESC LIMIT $2",
+            pipeline_id, limit,
+        )
+        return [_row_to_alert(r) for r in rows]
+
     # ==================================================================
     # Decision log
     # ==================================================================

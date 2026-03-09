@@ -42,19 +42,14 @@ log = logging.getLogger("pipeline-agent")
 
 
 def setup_logging(config: Config):
-    """Configure logging to both console and file."""
-    level = getattr(logging, config.log_level.upper(), logging.INFO)
-    log_dir = os.path.join(config.data_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.join(log_dir, "pipeline-agent.log")),
-    ]
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s -- %(message)s",
-        handlers=handlers,
+    """Configure structured logging with context propagation and rotation."""
+    from logging_config import setup_logging as _setup
+    _setup(
+        log_level=config.log_level,
+        log_dir=os.path.join(config.data_dir, "logs"),
+        max_bytes=config.log_max_bytes,
+        backup_count=config.log_backup_count,
+        json_logging=(config.log_format == "json"),
     )
 
 
