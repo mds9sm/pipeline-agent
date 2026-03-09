@@ -22,7 +22,7 @@ from contracts.models import (
     PipelineContract, ContractChangeProposal, SchemaVersion,
     FreshnessSnapshot, AlertRecord, ColumnMapping, DecisionLog,
     FreshnessStatus, AlertSeverity, TriggerType, ChangeType,
-    ProposalStatus, ConnectorStatus, TIER_DEFAULTS,
+    ProposalStatus, ConnectorStatus, PipelineStatus, TIER_DEFAULTS,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -194,67 +194,75 @@ class MonitorEngine:
             ),
         }
 
-        # Auto-apply additive changes if configured and safe
+        # Policy-driven drift handling (Build 12)
+        policy = pipeline.get_schema_policy()
         safe_type_changes = [tc for tc in type_changes if self._is_safe_type_widening(tc["from"], tc["to"])]
         breaking_type_changes = [tc for tc in type_changes if not self._is_safe_type_widening(tc["from"], tc["to"])]
 
-        if (
-            analysis["action"] == "auto_adapt"
-            and pipeline.auto_approve_additive_schema
-            and not dropped_columns
-            and not breaking_type_changes
-        ):
-            await self._auto_apply_schema_changes(pipeline, new_columns, safe_type_changes)
+        # Detect nullable changes
+        nullable_changes = self._detect_nullable_changes(pipeline, profile)
+
+        actions_to_apply = []   # (category, items)
+        proposals_to_create = []  # (change_type, detail_dict)
+        halt_reasons = []
+
+        # --- New columns ---
+        if new_columns:
+            if policy.on_new_column == "auto_add":
+                actions_to_apply.append(("new_columns", new_columns))
+            elif policy.on_new_column == "propose":
+                proposals_to_create.append((ChangeType.ADD_COLUMN, {"new_columns": new_columns}))
+            # "ignore": do nothing
+
+        # --- Dropped columns ---
+        if dropped_columns:
+            if policy.on_dropped_column == "halt":
+                halt_reasons.append(f"Column(s) dropped: {dropped_columns}")
+            elif policy.on_dropped_column == "propose":
+                proposals_to_create.append((ChangeType.DROP_COLUMN, {"dropped_columns": dropped_columns}))
+            # "ignore": do nothing
+
+        # --- Type changes ---
+        if safe_type_changes:
+            if policy.on_type_change == "auto_widen":
+                actions_to_apply.append(("safe_type_changes", safe_type_changes))
+            elif policy.on_type_change == "propose":
+                proposals_to_create.append((ChangeType.ALTER_COLUMN_TYPE, {"type_changes": safe_type_changes}))
+            elif policy.on_type_change == "halt":
+                halt_reasons.append(f"Type change(s): {[tc['column'] for tc in safe_type_changes]}")
+
+        if breaking_type_changes:
+            if policy.on_type_change == "halt":
+                halt_reasons.append(f"Breaking type change(s): {[tc['column'] for tc in breaking_type_changes]}")
+            else:
+                proposals_to_create.append((ChangeType.ALTER_COLUMN_TYPE, {"type_changes": breaking_type_changes}))
+
+        # --- Nullable changes ---
+        if nullable_changes:
+            if policy.on_nullable_change == "auto_accept":
+                actions_to_apply.append(("nullable_changes", nullable_changes))
+            elif policy.on_nullable_change == "propose":
+                proposals_to_create.append((ChangeType.ALTER_COLUMN_TYPE, {"nullable_changes": nullable_changes}))
+            elif policy.on_nullable_change == "halt":
+                halt_reasons.append(f"Nullable change(s): {[nc['column'] for nc in nullable_changes]}")
+
+        # --- Execute decisions ---
+        if halt_reasons:
+            await self._create_halt_proposal(pipeline, drift_info, impact_analysis, analysis, halt_reasons)
             return
 
-        # Create a proposal with impact analysis
-        proposal = ContractChangeProposal(
-            pipeline_id=pipeline.pipeline_id,
-            trigger_type=TriggerType.SCHEMA_DRIFT,
-            trigger_detail=drift_info,
-            change_type=(
-                ChangeType.DROP_COLUMN if dropped_columns
-                else ChangeType.ALTER_COLUMN_TYPE if type_changes
-                else ChangeType.ADD_COLUMN
-            ),
-            current_state={
-                "column_mappings": [
-                    asdict(m) for m in pipeline.column_mappings
-                ],
-            },
-            proposed_state={
-                "column_mappings": [asdict(m) for m in profile.columns],
-            },
-            reasoning=analysis.get("reasoning", ""),
-            confidence=analysis.get("confidence", 0.5),
-            impact_analysis=impact_analysis,
-            rollback_plan=analysis.get("rollback_plan", ""),
-            contract_version_before=pipeline.version,
-        )
-        await self.store.save_proposal(proposal)
+        if actions_to_apply:
+            auto_new = [item for cat, items in actions_to_apply if cat == "new_columns" for item in items]
+            auto_type = [item for cat, items in actions_to_apply if cat == "safe_type_changes" for item in items]
+            auto_nullable = [item for cat, items in actions_to_apply if cat == "nullable_changes" for item in items]
+            await self._auto_apply_schema_changes(pipeline, auto_new, auto_type, auto_nullable)
 
-        # Create alert
-        severity = (
-            AlertSeverity.CRITICAL if dropped_columns or type_changes
-            else AlertSeverity.WARNING
-        )
-        alert = AlertRecord(
-            severity=severity,
-            tier=pipeline.tier,
-            pipeline_id=pipeline.pipeline_id,
-            pipeline_name=pipeline.pipeline_name,
-            summary=(
-                f"Schema drift detected: {len(new_columns)} new, "
-                f"{len(dropped_columns)} dropped, "
-                f"{len(type_changes)} type changes."
-            ),
-            detail={
-                **drift_info,
-                "downstream_impact_count": len(downstream_impact),
-            },
-        )
-        await self.store.save_alert(alert)
-        await self._dispatch_alert(alert, pipeline)
+            # Downstream propagation
+            if policy.propagate_to_downstream and actions_to_apply:
+                await self._propagate_schema_downstream(pipeline, actions_to_apply)
+
+        if proposals_to_create:
+            await self._create_drift_proposals(pipeline, proposals_to_create, drift_info, impact_analysis, analysis)
 
         # Log decision
         await self.store.save_decision(DecisionLog(
@@ -263,6 +271,22 @@ class MonitorEngine:
             detail=json.dumps(drift_info),
             reasoning=analysis.get("reasoning", ""),
         ))
+
+    @staticmethod
+    def _detect_nullable_changes(pipeline: PipelineContract, profile) -> list[dict]:
+        """Detect columns where nullable status changed."""
+        current_cols = {m.source_column: m for m in pipeline.column_mappings}
+        live_cols = {m.source_column: m for m in profile.columns}
+        changes = []
+        for col_name in live_cols:
+            if col_name in current_cols:
+                if live_cols[col_name].is_nullable != current_cols[col_name].is_nullable:
+                    changes.append({
+                        "column": col_name,
+                        "from_nullable": current_cols[col_name].is_nullable,
+                        "to_nullable": live_cols[col_name].is_nullable,
+                    })
+        return changes
 
     @staticmethod
     def _is_safe_type_widening(from_type: str, to_type: str) -> bool:
@@ -300,8 +324,9 @@ class MonitorEngine:
         pipeline: PipelineContract,
         new_columns: list[dict],
         safe_type_changes: list[dict] | None = None,
+        nullable_changes: list[dict] | None = None,
     ) -> None:
-        """Auto-apply new columns and safe type widenings, increment version."""
+        """Auto-apply new columns, safe type widenings, and nullable changes."""
         # Re-profile to get full ColumnMapping objects
         src_params = self._source_params(pipeline)
         source = await self.registry.get_source(
@@ -328,6 +353,15 @@ class MonitorEngine:
                         mapping.target_type = live_cols[col_name].target_type
                         break
 
+        # Apply nullable changes
+        if nullable_changes:
+            for nc in nullable_changes:
+                col_name = nc["column"]
+                for mapping in pipeline.column_mappings:
+                    if mapping.source_column == col_name:
+                        mapping.is_nullable = nc["to_nullable"]
+                        break
+
         changes_desc = []
         if new_columns:
             changes_desc.append(f"{len(new_columns)} new column(s): {[c['name'] for c in new_columns]}")
@@ -338,6 +372,10 @@ class MonitorEngine:
             ]
             changes_desc.append(
                 f"{len(safe_type_changes)} type widening(s): {widening_list}"
+            )
+        if nullable_changes:
+            changes_desc.append(
+                f"{len(nullable_changes)} nullable change(s): {[nc['column'] for nc in nullable_changes]}"
             )
 
         pipeline.version += 1
@@ -357,6 +395,108 @@ class MonitorEngine:
             "Auto-applied schema changes (v%d): %s",
             pipeline.version, "; ".join(changes_desc),
         )
+
+    async def _create_halt_proposal(
+        self, pipeline, drift_info, impact_analysis, analysis, halt_reasons,
+    ):
+        """Create a proposal and critical alert for halted schema changes."""
+        proposal = ContractChangeProposal(
+            pipeline_id=pipeline.pipeline_id,
+            trigger_type=TriggerType.SCHEMA_DRIFT,
+            trigger_detail={**drift_info, "halt_reasons": halt_reasons},
+            change_type=ChangeType.DROP_COLUMN if "dropped" in str(halt_reasons) else ChangeType.ALTER_COLUMN_TYPE,
+            current_state={"column_mappings": [asdict(m) for m in pipeline.column_mappings]},
+            proposed_state={},
+            reasoning=f"Policy halt: {'; '.join(halt_reasons)}. {analysis.get('reasoning', '')}",
+            confidence=analysis.get("confidence", 0.5),
+            impact_analysis=impact_analysis,
+            rollback_plan=analysis.get("rollback_plan", ""),
+            contract_version_before=pipeline.version,
+        )
+        await self.store.save_proposal(proposal)
+
+        alert = AlertRecord(
+            severity=AlertSeverity.CRITICAL,
+            tier=pipeline.tier,
+            pipeline_id=pipeline.pipeline_id,
+            pipeline_name=pipeline.pipeline_name,
+            summary=f"Schema change HALTED by policy: {'; '.join(halt_reasons)}",
+            detail=drift_info,
+        )
+        await self.store.save_alert(alert)
+        await self._dispatch_alert(alert, pipeline)
+        log.warning("Schema change HALTED by policy for %s: %s", pipeline.pipeline_name, halt_reasons)
+
+    async def _create_drift_proposals(
+        self, pipeline, proposals_to_create, drift_info, impact_analysis, analysis,
+    ):
+        """Create proposals for schema changes that require human approval."""
+        for change_type, detail in proposals_to_create:
+            proposal = ContractChangeProposal(
+                pipeline_id=pipeline.pipeline_id,
+                trigger_type=TriggerType.SCHEMA_DRIFT,
+                trigger_detail={**drift_info, "policy_action": "propose", "specific_changes": detail},
+                change_type=change_type,
+                current_state={"column_mappings": [asdict(m) for m in pipeline.column_mappings]},
+                proposed_state=detail,
+                reasoning=analysis.get("reasoning", ""),
+                confidence=analysis.get("confidence", 0.5),
+                impact_analysis=impact_analysis,
+                rollback_plan=analysis.get("rollback_plan", ""),
+                contract_version_before=pipeline.version,
+            )
+            await self.store.save_proposal(proposal)
+
+        alert = AlertRecord(
+            severity=AlertSeverity.WARNING,
+            tier=pipeline.tier,
+            pipeline_id=pipeline.pipeline_id,
+            pipeline_name=pipeline.pipeline_name,
+            summary=f"Schema changes require approval: {len(proposals_to_create)} proposal(s) created.",
+            detail=drift_info,
+        )
+        await self.store.save_alert(alert)
+        await self._dispatch_alert(alert, pipeline)
+
+    async def _propagate_schema_downstream(
+        self, pipeline: PipelineContract, applied_changes: list,
+    ) -> None:
+        """When schema changes are auto-applied, create proposals for
+        downstream pipelines to update their schemas."""
+        try:
+            dependents = await self.store.list_dependents(pipeline.pipeline_id)
+            if not dependents:
+                return
+
+            for dep in dependents:
+                downstream = await self.store.get_pipeline(dep.pipeline_id)
+                if not downstream or downstream.status != PipelineStatus.ACTIVE:
+                    continue
+
+                proposal = ContractChangeProposal(
+                    pipeline_id=downstream.pipeline_id,
+                    trigger_type=TriggerType.SCHEMA_DRIFT,
+                    trigger_detail={
+                        "propagated_from": pipeline.pipeline_id,
+                        "propagated_from_name": pipeline.pipeline_name,
+                        "upstream_changes": str(applied_changes),
+                    },
+                    change_type=ChangeType.ADD_COLUMN,
+                    reasoning=(
+                        f"Upstream pipeline '{pipeline.pipeline_name}' had schema changes "
+                        f"auto-applied. Review if this downstream pipeline needs corresponding updates."
+                    ),
+                    confidence=0.6,
+                    contract_version_before=downstream.version,
+                )
+                await self.store.save_proposal(proposal)
+                log.info(
+                    "Propagated schema change proposal to downstream pipeline %s.",
+                    downstream.pipeline_name,
+                )
+
+        except Exception as e:
+            log.warning("Downstream schema propagation failed: %s", e)
 
     # ------------------------------------------------------------------
     # Freshness monitoring

@@ -99,7 +99,7 @@ class ConnectorRegistry:
                 )
                 await self.store.save_connector(record)
                 log.info("Seeded connector: %s", name)
-            elif not existing.code:
+            elif existing.code != code:
                 existing.code = code
                 await self.store.save_connector(existing)
                 log.info("Updated seed code for: %s", name)

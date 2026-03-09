@@ -13,7 +13,7 @@ from croniter import croniter
 
 from config import Config
 from contracts.models import (
-    PipelineContract, RunRecord, PipelineDependency,
+    PipelineContract, RunRecord, PipelineDependency, DecisionLog,
     PipelineStatus, RunMode, RunStatus,
     now_iso, new_id,
 )
@@ -237,11 +237,81 @@ class Scheduler:
                     # Handle retries on failure
                     if run.status == RunStatus.FAILED:
                         await self._maybe_retry(pipeline, run)
+                    elif run.status == RunStatus.COMPLETE:
+                        await self._trigger_downstream(pid)
 
             except Exception as e:
                 log.exception("Unhandled error: %s", e)
             finally:
                 self._running.discard(pid)
+
+    async def _trigger_downstream(self, completed_pipeline_id: str) -> None:
+        """After a pipeline completes, check and trigger any downstream
+        dependents whose dependencies are all satisfied."""
+        try:
+            dependents = await self.store.list_dependents(completed_pipeline_id)
+            if not dependents:
+                return
+
+            for dep in dependents:
+                downstream_id = dep.pipeline_id
+                if downstream_id in self._running:
+                    log.debug(
+                        "Downstream %s already running, skipping data trigger.",
+                        downstream_id,
+                    )
+                    continue
+
+                downstream = await self.store.get_pipeline(downstream_id)
+                if not downstream or downstream.status != PipelineStatus.ACTIVE:
+                    continue
+
+                # Check error budget
+                budget = await self.store.get_error_budget(downstream_id)
+                if budget and budget.escalated:
+                    log.debug(
+                        "Downstream %s has exhausted error budget, skipping.",
+                        downstream.pipeline_name,
+                    )
+                    continue
+
+                # Check ALL upstream dependencies are satisfied
+                all_deps = await self.store.list_dependencies(downstream_id)
+                all_satisfied = True
+                for d in all_deps:
+                    last_run = await self.store.get_last_successful_run(d.depends_on_id)
+                    if last_run is None:
+                        all_satisfied = False
+                        break
+
+                if all_satisfied:
+                    log.info(
+                        "Data-triggered: upstream %s completed, triggering downstream %s.",
+                        completed_pipeline_id, downstream.pipeline_name,
+                    )
+                    run = RunRecord(
+                        pipeline_id=downstream_id,
+                        run_mode=RunMode.DATA_TRIGGERED,
+                        status=RunStatus.PENDING,
+                    )
+                    await self.store.save_run(run)
+
+                    await self.store.save_decision(DecisionLog(
+                        pipeline_id=downstream_id,
+                        decision_type="data_triggered",
+                        detail=f"Triggered by upstream completion: {completed_pipeline_id}",
+                        reasoning="All upstream dependencies satisfied after upstream pipeline completed.",
+                    ))
+
+                    asyncio.create_task(
+                        self._run_pipeline(downstream, RunMode.DATA_TRIGGERED, run),
+                    )
+
+        except Exception as e:
+            log.warning(
+                "Error checking downstream triggers for %s: %s",
+                completed_pipeline_id, e,
+            )
 
     async def _maybe_retry(
         self,

@@ -1,6 +1,7 @@
 """
 FastAPI REST API server with JWT auth, rate limiting, and agent-routed commands.
 """
+import decimal
 import logging
 import os
 import time
@@ -24,8 +25,9 @@ from contracts.models import (
     PipelineStatus, ProposalStatus, ConnectorStatus, TestStatus,
     PipelineDependency, NotificationPolicy, AgentPreference,
     ContractChangeProposal, SchemaVersion, ColumnMapping,
-    User, TriggerType, ChangeType,
+    User, TriggerType, ChangeType, DependencyType,
     DecisionLog, RefreshType, ReplicationMethod, LoadType, QualityConfig,
+    SchemaChangePolicy, SCHEMA_POLICY_TIER_DEFAULTS, PostPromotionHook,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -160,6 +162,10 @@ class UpdatePipelineRequest(BaseModel):
     freshness_column: Optional[str] = None
     # Approval
     auto_approve_additive_schema: Optional[bool] = None
+    # Schema change policy (Build 12)
+    schema_change_policy: Optional[dict] = None
+    # Post-promotion hooks (Build 13)
+    post_promotion_hooks: Optional[list[dict]] = None
     # Audit
     reason: Optional[str] = None
 
@@ -1157,6 +1163,28 @@ def create_app(
             changes["auto_approve_additive_schema"] = {"old": p.auto_approve_additive_schema, "new": req.auto_approve_additive_schema}
             p.auto_approve_additive_schema = req.auto_approve_additive_schema
 
+        # --- Schema change policy ---
+        if req.schema_change_policy is not None:
+            from dataclasses import asdict as _asdict
+            old_policy = _asdict(p.get_schema_policy())
+            new_policy = SchemaChangePolicy(**req.schema_change_policy)
+            changes["schema_change_policy"] = {"old": old_policy, "new": _asdict(new_policy)}
+            p.schema_change_policy = new_policy
+
+        if req.post_promotion_hooks is not None:
+            from dataclasses import asdict as _asdict
+            old_hooks = [_asdict(h) for h in p.post_promotion_hooks]
+            new_hooks = []
+            for h in req.post_promotion_hooks:
+                if "hook_id" not in h or not h["hook_id"]:
+                    h["hook_id"] = new_id()
+                new_hooks.append(PostPromotionHook(**h))
+            changes["post_promotion_hooks"] = {
+                "old": old_hooks,
+                "new": [_asdict(nh) for nh in new_hooks],
+            }
+            p.post_promotion_hooks = new_hooks
+
         if not changes:
             return await _pipeline_detail(p, store)
 
@@ -1866,6 +1894,270 @@ def create_app(
         return {"status": "deleted"}
 
     # -----------------------------------------------------------------------
+    # Pipeline dependencies (Build 11)
+    # -----------------------------------------------------------------------
+
+    class AddDependencyRequest(BaseModel):
+        depends_on_id: str
+        dependency_type: Optional[str] = "user_defined"
+        notes: Optional[str] = None
+
+    @app.post("/api/pipelines/{pipeline_id}/dependencies")
+    @limiter.limit("100/minute")
+    async def add_pipeline_dependency(
+        request: Request,
+        pipeline_id: str,
+        req: AddDependencyRequest = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        upstream = await store.get_pipeline(req.depends_on_id)
+        if not upstream:
+            raise HTTPException(404, f"Upstream pipeline not found: {req.depends_on_id}")
+        if pipeline_id == req.depends_on_id:
+            raise HTTPException(400, "Pipeline cannot depend on itself")
+        # Simple cycle check: if upstream depends on this pipeline
+        upstream_deps = await store.list_dependencies(req.depends_on_id)
+        for d in upstream_deps:
+            if d.depends_on_id == pipeline_id:
+                raise HTTPException(400, "Adding this dependency would create a cycle")
+
+        dep = PipelineDependency(
+            pipeline_id=pipeline_id,
+            depends_on_id=req.depends_on_id,
+            dependency_type=DependencyType(req.dependency_type.lower()),
+            notes=req.notes,
+        )
+        await store.save_dependency(dep)
+
+        await store.save_decision(DecisionLog(
+            pipeline_id=pipeline_id,
+            decision_type="dependency_added",
+            detail=f"Added dependency on {upstream.pipeline_name}",
+            reasoning=req.notes or "",
+        ))
+        return {"dependency_id": dep.dependency_id}
+
+    @app.get("/api/pipelines/{pipeline_id}/dependencies")
+    @limiter.limit("100/minute")
+    async def list_pipeline_dependencies(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        deps = await store.list_dependencies(pipeline_id)
+        dependents = await store.list_dependents(pipeline_id)
+        result = []
+        for dep in deps:
+            up = await store.get_pipeline(dep.depends_on_id)
+            result.append({
+                "dependency_id": dep.dependency_id,
+                "depends_on_id": dep.depends_on_id,
+                "depends_on_name": up.pipeline_name if up else dep.depends_on_id,
+                "dependency_type": dep.dependency_type.value if hasattr(dep.dependency_type, "value") else dep.dependency_type,
+                "notes": dep.notes,
+            })
+        return {
+            "upstream": result,
+            "downstream_count": len(dependents),
+        }
+
+    @app.delete("/api/pipelines/{pipeline_id}/dependencies/{dependency_id}")
+    @limiter.limit("100/minute")
+    async def remove_pipeline_dependency(
+        request: Request,
+        pipeline_id: str,
+        dependency_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        await store.delete_dependency(dependency_id)
+        await store.save_decision(DecisionLog(
+            pipeline_id=pipeline_id,
+            decision_type="dependency_removed",
+            detail=f"Removed dependency {dependency_id}",
+            reasoning="",
+        ))
+        return {"status": "deleted"}
+
+    # -----------------------------------------------------------------------
+    # Pipeline metadata (Build 11 - XCom-style)
+    # -----------------------------------------------------------------------
+
+    class SetMetadataRequest(BaseModel):
+        value: dict
+        namespace: Optional[str] = "default"
+
+    @app.get("/api/pipelines/{pipeline_id}/metadata")
+    @limiter.limit("100/minute")
+    async def list_pipeline_metadata(
+        request: Request,
+        pipeline_id: str,
+        namespace: Optional[str] = Query(None),
+        caller: dict = Depends(auth_dep),
+    ):
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        items = await store.list_metadata(pipeline_id, namespace)
+        return [
+            {
+                "id": m.id,
+                "pipeline_id": m.pipeline_id,
+                "namespace": m.namespace,
+                "key": m.key,
+                "value": m.value_json,
+                "updated_at": m.updated_at,
+                "created_by_run_id": m.created_by_run_id,
+            }
+            for m in items
+        ]
+
+    @app.get("/api/pipelines/{pipeline_id}/metadata/{key}")
+    @limiter.limit("100/minute")
+    async def get_pipeline_metadata(
+        request: Request,
+        pipeline_id: str,
+        key: str,
+        namespace: str = Query("default"),
+        caller: dict = Depends(auth_dep),
+    ):
+        m = await store.get_metadata(pipeline_id, key, namespace)
+        if not m:
+            raise HTTPException(404, "Metadata key not found")
+        return {
+            "id": m.id,
+            "pipeline_id": m.pipeline_id,
+            "namespace": m.namespace,
+            "key": m.key,
+            "value": m.value_json,
+            "updated_at": m.updated_at,
+            "created_by_run_id": m.created_by_run_id,
+        }
+
+    @app.put("/api/pipelines/{pipeline_id}/metadata/{key}")
+    @limiter.limit("100/minute")
+    async def set_pipeline_metadata(
+        request: Request,
+        pipeline_id: str,
+        key: str,
+        req: SetMetadataRequest = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        await store.set_metadata(pipeline_id, key, req.value, namespace=req.namespace)
+        return {"status": "ok", "key": key}
+
+    @app.delete("/api/pipelines/{pipeline_id}/metadata/{key}")
+    @limiter.limit("100/minute")
+    async def delete_pipeline_metadata(
+        request: Request,
+        pipeline_id: str,
+        key: str,
+        namespace: str = Query("default"),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        await store.delete_metadata(pipeline_id, key, namespace)
+        return {"status": "deleted"}
+
+    # -----------------------------------------------------------------------
+    # Schema policy defaults (Build 12)
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/schema-policy-defaults")
+    @limiter.limit("100/minute")
+    async def get_schema_policy_defaults(
+        request: Request,
+        caller: dict = Depends(auth_dep),
+    ):
+        from dataclasses import asdict as _asdict
+        return {
+            str(tier): _asdict(policy)
+            for tier, policy in SCHEMA_POLICY_TIER_DEFAULTS.items()
+        }
+
+    # -----------------------------------------------------------------------
+    # Post-Promotion Hook Testing (Build 13)
+    # -----------------------------------------------------------------------
+
+    class TestHookRequest(BaseModel):
+        sql: str
+        timeout_seconds: int = 30
+
+    @app.post("/api/pipelines/{pipeline_id}/hooks/test")
+    @limiter.limit("30/minute")
+    async def test_hook(
+        request: Request,
+        pipeline_id: str,
+        req: TestHookRequest = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        # Resolve target connector
+        import json as _json
+        tgt_params = {
+            "host": p.target_host,
+            "port": p.target_port,
+            "database": p.target_database,
+            "user": p.target_user,
+            "password": p.target_password,
+            "default_schema": p.target_schema,
+        }
+        if config.has_encryption_key:
+            from crypto import decrypt_dict, CREDENTIAL_FIELDS
+            tgt_params = decrypt_dict(
+                tgt_params, config.encryption_key, CREDENTIAL_FIELDS,
+            )
+        target = await registry.get_target(
+            p.target_connector_id, tgt_params,
+        )
+
+        t0 = time.monotonic()
+        try:
+            rows = await target.execute_sql(req.sql, req.timeout_seconds)
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            # Convert to JSON-safe format
+            safe_rows = []
+            for r in rows[:100]:  # Cap at 100 rows for safety
+                safe_row = {}
+                for k, v in r.items():
+                    if hasattr(v, "isoformat"):
+                        safe_row[k] = v.isoformat()
+                    elif isinstance(v, decimal.Decimal):
+                        safe_row[k] = float(v)
+                    elif isinstance(v, bytes):
+                        safe_row[k] = v.decode("utf-8", errors="replace")
+                    else:
+                        safe_row[k] = v
+                safe_rows.append(safe_row)
+            return {
+                "status": "success",
+                "duration_ms": duration_ms,
+                "rows_returned": len(rows),
+                "rows": safe_rows,
+            }
+        except NotImplementedError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            return {
+                "status": "error",
+                "duration_ms": duration_ms,
+                "error": str(e),
+            }
+
+    # -----------------------------------------------------------------------
     # Error Budgets
     # -----------------------------------------------------------------------
 
@@ -1885,23 +2177,20 @@ def create_app(
             }
         return {
             "pipeline_id": pipeline_id,
-            "budget_id": budget.budget_id,
-            "total_budget_minutes": budget.total_budget_minutes,
-            "consumed_minutes": budget.consumed_minutes,
-            "remaining_minutes": budget.remaining_minutes,
-            "budget_period": budget.budget_period,
-            "period_start": budget.period_start,
-            "period_end": budget.period_end,
-            "utilization_pct": round(
-                (budget.consumed_minutes / budget.total_budget_minutes) * 100, 2
-            )
-            if budget.total_budget_minutes > 0
-            else 0,
+            "window_days": budget.window_days,
+            "total_runs": budget.total_runs,
+            "successful_runs": budget.successful_runs,
+            "failed_runs": budget.failed_runs,
+            "success_rate": budget.success_rate,
+            "budget_threshold": budget.budget_threshold,
+            "budget_remaining": budget.budget_remaining,
+            "escalated": budget.escalated,
+            "last_calculated": budget.last_calculated,
             "status": (
                 "ok"
-                if budget.consumed_minutes < budget.total_budget_minutes * 0.8
+                if not budget.escalated and budget.budget_remaining > 0.05
                 else "warning"
-                if budget.consumed_minutes < budget.total_budget_minutes
+                if not budget.escalated
                 else "exhausted"
             ),
         }
@@ -2276,17 +2565,57 @@ async def _pipeline_detail(p, store: Store) -> dict:
     budget = await store.get_error_budget(p.pipeline_id)
     if budget:
         d["error_budget"] = {
-            "total_budget_minutes": budget.total_budget_minutes,
-            "consumed_minutes": budget.consumed_minutes,
-            "remaining_minutes": budget.remaining_minutes,
-            "utilization_pct": round(
-                (budget.consumed_minutes / budget.total_budget_minutes) * 100, 2
-            )
-            if budget.total_budget_minutes > 0
-            else 0,
+            "window_days": budget.window_days,
+            "total_runs": budget.total_runs,
+            "successful_runs": budget.successful_runs,
+            "failed_runs": budget.failed_runs,
+            "success_rate": budget.success_rate,
+            "budget_threshold": budget.budget_threshold,
+            "budget_remaining": budget.budget_remaining,
+            "escalated": budget.escalated,
+            "last_calculated": budget.last_calculated,
         }
     else:
         d["error_budget"] = None
+
+    # Dependencies (Build 11)
+    deps = await store.list_dependencies(p.pipeline_id)
+    dependents = await store.list_dependents(p.pipeline_id)
+    upstream_list = []
+    for dep in deps:
+        up = await store.get_pipeline(dep.depends_on_id)
+        upstream_list.append({
+            "dependency_id": dep.dependency_id,
+            "depends_on_id": dep.depends_on_id,
+            "depends_on_name": up.pipeline_name if up else dep.depends_on_id,
+            "dependency_type": dep.dependency_type.value if hasattr(dep.dependency_type, "value") else dep.dependency_type,
+            "notes": dep.notes,
+        })
+    d["dependencies"] = {
+        "upstream": upstream_list,
+        "downstream_count": len(dependents),
+    }
+
+    # Metadata (Build 11)
+    metadata = await store.list_metadata(p.pipeline_id)
+    d["metadata"] = [
+        {"key": m.key, "namespace": m.namespace, "value": m.value_json, "updated_at": m.updated_at}
+        for m in metadata
+    ]
+
+    # Schema change policy (Build 12)
+    d["schema_change_policy"] = asdict(p.get_schema_policy())
+    d["schema_change_policy_is_custom"] = p.schema_change_policy is not None
+
+    # Post-promotion hooks (Build 13)
+    d["post_promotion_hooks"] = [asdict(h) for h in p.post_promotion_hooks]
+
+    # Hook results from metadata (namespace="hooks")
+    hook_metadata = await store.list_metadata(p.pipeline_id, namespace="hooks")
+    d["hook_results"] = {
+        m.key: m.value_json for m in hook_metadata
+    }
+
     return d
 
 

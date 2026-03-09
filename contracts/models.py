@@ -42,6 +42,7 @@ class RunMode(str, Enum):
     SCHEDULED = "scheduled"
     MANUAL = "manual"
     BACKFILL = "backfill"
+    DATA_TRIGGERED = "data_triggered"
 
 
 class RefreshType(str, Enum):
@@ -152,6 +153,30 @@ class PreferenceSource(str, Enum):
     APPROVAL_PATTERN = "approval_pattern"
 
 
+class SchemaColumnAction(str, Enum):
+    AUTO_ADD = "auto_add"
+    PROPOSE = "propose"
+    IGNORE = "ignore"
+
+
+class SchemaDropAction(str, Enum):
+    HALT = "halt"
+    PROPOSE = "propose"
+    IGNORE = "ignore"
+
+
+class SchemaTypeAction(str, Enum):
+    AUTO_WIDEN = "auto_widen"
+    PROPOSE = "propose"
+    HALT = "halt"
+
+
+class SchemaNullableAction(str, Enum):
+    AUTO_ACCEPT = "auto_accept"
+    PROPOSE = "propose"
+    HALT = "halt"
+
+
 # ---------------------------------------------------------------------------
 # Tier defaults
 # ---------------------------------------------------------------------------
@@ -194,6 +219,57 @@ TIER_DEFAULTS = {
         "retry_urgency": "lazy",
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Schema change policy (per-pipeline, with tier-based defaults)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SchemaChangePolicy:
+    on_new_column: str = "auto_add"        # auto_add | propose | ignore
+    on_dropped_column: str = "propose"     # halt | propose | ignore
+    on_type_change: str = "propose"        # auto_widen | propose | halt
+    on_nullable_change: str = "auto_accept"  # auto_accept | propose | halt
+    propagate_to_downstream: bool = False
+
+
+SCHEMA_POLICY_TIER_DEFAULTS = {
+    1: SchemaChangePolicy(
+        on_new_column="auto_add",
+        on_dropped_column="halt",
+        on_type_change="propose",
+        on_nullable_change="propose",
+        propagate_to_downstream=True,
+    ),
+    2: SchemaChangePolicy(
+        on_new_column="auto_add",
+        on_dropped_column="propose",
+        on_type_change="auto_widen",
+        on_nullable_change="auto_accept",
+        propagate_to_downstream=True,
+    ),
+    3: SchemaChangePolicy(
+        on_new_column="auto_add",
+        on_dropped_column="ignore",
+        on_type_change="auto_widen",
+        on_nullable_change="auto_accept",
+        propagate_to_downstream=False,
+    ),
+}
+
+
+@dataclass
+class PostPromotionHook:
+    """SQL hook executed against the target after promotion completes."""
+    hook_id: str = field(default_factory=new_id)
+    name: str = ""
+    sql: str = ""
+    metadata_key: str = ""
+    description: str = ""
+    enabled: bool = True
+    timeout_seconds: int = 30
+    fail_pipeline_on_error: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +419,18 @@ class PipelineContract:
     # Approval settings
     auto_approve_additive_schema: bool = False
     approval_notification_channel: str = ""
+
+    # Schema change policy (Build 12)
+    schema_change_policy: Optional[SchemaChangePolicy] = None
+
+    # Post-promotion SQL hooks (Build 13)
+    post_promotion_hooks: list[PostPromotionHook] = field(default_factory=list)
+
+    def get_schema_policy(self) -> SchemaChangePolicy:
+        """Return the effective schema change policy (explicit > tier default)."""
+        if self.schema_change_policy:
+            return self.schema_change_policy
+        return SCHEMA_POLICY_TIER_DEFAULTS.get(self.tier, SCHEMA_POLICY_TIER_DEFAULTS[2])
 
     def get_tier_config(self) -> dict:
         defaults = TIER_DEFAULTS.get(self.tier, TIER_DEFAULTS[2]).copy()
@@ -505,6 +593,17 @@ class AgentPreference:
 # ---------------------------------------------------------------------------
 # New entities (PostgreSQL migration)
 # ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineMetadata:
+    id: str = field(default_factory=new_id)
+    pipeline_id: str = ""
+    namespace: str = "default"
+    key: str = ""
+    value_json: dict = field(default_factory=dict)
+    updated_at: str = field(default_factory=now_iso)
+    created_by_run_id: Optional[str] = None
+
 
 @dataclass
 class ErrorBudget:

@@ -7,7 +7,46 @@ It provides the product context, conventions, and test strategy needed to work o
 
 ## Product Identity
 
-**DAPOS (Data Agent Platform Operating System)** - An AI-powered data pipeline platform where the agent IS the product. Ships with 8 seed connectors (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebook Insights sources + PostgreSQL, Redshift targets) and 4 demo pipelines that auto-create on first startup. Additional connectors are generated through conversation with the Claude-powered agent.
+**DAPOS (Data Agent Platform Operating System)** — An AI-powered **full-scope data platform** where the agent IS the product. Covers **ingestion, transformation, orchestration, and observability** — not just EL, but ELT with native transform capabilities replacing external tools like dbt/Airflow.
+
+Ships with 8 seed connectors (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebook Insights sources + PostgreSQL, Redshift targets) and 4 demo pipelines that auto-create on first startup. Additional connectors are generated through conversation with the Claude-powered agent.
+
+## Product Vision & Scope
+
+**Origin:** Started as an ingestion platform (extract + load). Now expanding to **full data platform** scope.
+
+**What DAPOS replaces:** Fivetran (ingestion) + dbt (transforms) + Airflow (orchestration) + Monte Carlo (observability) — unified under one agentic system.
+
+**Core capabilities (current + planned):**
+- **Ingestion** — Extract from any source, load to any target. Connectors generated via AI. *(Implemented)*
+- **Orchestration** — Pipeline DAGs with dependency-triggered execution, error budgets, cron + event-driven scheduling. *(Implemented)*
+- **Quality & Observability** — 7-check quality gate, schema drift detection, freshness monitoring, alerting. *(Implemented)*
+- **Post-promotion hooks** — SQL-based computed metadata after each pipeline run (XCom-style). *(Implemented)*
+- **Transforms** — Native SQL transforms within pipelines, replacing dbt macros. *(Planned)*
+- **Composable pipeline steps** — Pipeline as a DAG of steps (extract, transform, gate, promote, cleanup) instead of fixed flow. *(Planned)*
+- **Data contracts** — Formalized producer/consumer relationships between pipelines with cleanup policies and retention. *(Planned)*
+- **DAG visualization** — UI-visible pipeline dependency graph with execution status. *(Planned)*
+- **Agent topology reasoning** — User describes a business problem, agent designs multi-pipeline architecture with the right patterns (consume-and-merge, fan-in, SCD, etc.). *(Planned)*
+
+**Key patterns the platform must support:**
+| Pattern | Example |
+|---------|---------|
+| Consume & merge | Stage → upsert → cleanup consumed rows |
+| Fan-in | Multiple sources → unified table |
+| Fan-out | One source → multiple targets |
+| SCD Type 2 | Historical change tracking |
+| Quarantine | Bad rows → error table, good rows → production |
+| Cascading aggregation | Raw → daily → monthly → dashboard |
+| Conditional routing | Branch on quality/volume thresholds |
+| Replay/reprocess | Re-run a time window idempotently |
+
+**Architectural principles for expansion:**
+1. **Run context flows downstream** — Watermarks, batch IDs, row counts propagate from producer to consumer pipelines as first-class data.
+2. **Cleanup ownership is explicit** — Every intermediate table has a defined cleanup owner (producer TTL or consumer-after-processing).
+3. **Intra-database optimization** — Same-database pipelines use SQL-native paths, not extract-to-file.
+4. **Hooks reference run context** — Template variables (`{{watermark_after}}`, `{{run_id}}`) enable dynamic post-promotion logic.
+5. **Agent proposes, human approves topology** — Two-tier autonomy extends to pipeline design: agent designs multi-pipeline solutions, human approves before creation.
+6. **Idempotent by default** — Merge over append, watermark-bounded over full scan. Safe to re-run.
 
 ## Architecture (single process, 4 async loops)
 
@@ -50,11 +89,14 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 
 ## Critical Design Constraints
 
-1. **No static connector imports** - All connector code lives in PostgreSQL, loaded via `exec()`. Seeds and generated connectors are architecturally identical.
-2. **Two-tier autonomy is a HARD constraint** - Runtime decisions (extract/load/promote) are always autonomous. Structural changes (connectors, schema, strategy) always require human approval.
-3. **Quality gate is connector-agnostic** - `quality/gate.py` types against `TargetEngine` interface, not specific databases.
-4. **No LangChain, no external vector DB, no memory cache** - All state is PostgreSQL. Direct Claude API via httpx.
-5. **AST-validated sandbox** - All generated connector code is statically analyzed before execution.
+1. **No static connector imports** — All connector code lives in PostgreSQL, loaded via `exec()`. Seeds and generated connectors are architecturally identical.
+2. **Two-tier autonomy is a HARD constraint** — Runtime decisions (extract/load/promote) are always autonomous. Structural changes (connectors, schema, strategy, pipeline topology) always require human approval.
+3. **Quality gate is connector-agnostic** — `quality/gate.py` types against `TargetEngine` interface, not specific databases.
+4. **No LangChain, no external vector DB, no memory cache** — All state is PostgreSQL. Direct Claude API via httpx.
+5. **AST-validated sandbox** — All generated connector code is statically analyzed before execution.
+6. **No dbt, no Airflow** — DAPOS is the transform and orchestration layer. Native SQL transforms, not external tool delegation.
+7. **Never delete unconsumed data** — Any cleanup hook must prove its boundary (watermark, batch_id, transaction scope). Static `DELETE FROM table` without bounds is rejected by the agent.
+8. **Pipelines are composable** — Moving toward step DAGs (extract → transform → gate → promote → cleanup) instead of a fixed linear flow. New features should be built as composable steps.
 
 ## How to Start
 

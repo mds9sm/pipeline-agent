@@ -421,6 +421,12 @@ function PipelinesView({ tierFilter }) {
       freshness_column: detail.freshness_column || "",
       tags_json: JSON.stringify(detail.tags || {}, null, 2),
       auto_approve_additive_schema: detail.auto_approve_additive_schema || false,
+      on_new_column: (detail.schema_change_policy || {}).on_new_column || "auto_add",
+      on_dropped_column: (detail.schema_change_policy || {}).on_dropped_column || "propose",
+      on_type_change: (detail.schema_change_policy || {}).on_type_change || "propose",
+      on_nullable_change: (detail.schema_change_policy || {}).on_nullable_change || "auto_accept",
+      propagate_to_downstream: (detail.schema_change_policy || {}).propagate_to_downstream ?? false,
+      hooks_json: JSON.stringify(detail.post_promotion_hooks || [], null, 2),
       reason: "",
     });
   }
@@ -461,6 +467,29 @@ function PipelinesView({ tierFilter }) {
       if (editForm.freshness_column !== (detail.freshness_column || "")) body.freshness_column = editForm.freshness_column;
       try { const newTags = JSON.parse(editForm.tags_json); if (JSON.stringify(newTags) !== JSON.stringify(detail.tags || {})) body.tags = newTags; } catch {}
       if (editForm.auto_approve_additive_schema !== (detail.auto_approve_additive_schema || false)) body.auto_approve_additive_schema = editForm.auto_approve_additive_schema;
+      // Schema change policy
+      const scp = detail.schema_change_policy || {};
+      const scpChanged = editForm.on_new_column !== (scp.on_new_column || "auto_add")
+        || editForm.on_dropped_column !== (scp.on_dropped_column || "propose")
+        || editForm.on_type_change !== (scp.on_type_change || "propose")
+        || editForm.on_nullable_change !== (scp.on_nullable_change || "auto_accept")
+        || editForm.propagate_to_downstream !== (scp.propagate_to_downstream ?? false);
+      if (scpChanged) {
+        body.schema_change_policy = {
+          on_new_column: editForm.on_new_column,
+          on_dropped_column: editForm.on_dropped_column,
+          on_type_change: editForm.on_type_change,
+          on_nullable_change: editForm.on_nullable_change,
+          propagate_to_downstream: editForm.propagate_to_downstream,
+        };
+      }
+      // Post-promotion hooks
+      try {
+        const newHooks = JSON.parse(editForm.hooks_json);
+        if (JSON.stringify(newHooks) !== JSON.stringify(detail.post_promotion_hooks || [])) {
+          body.post_promotion_hooks = newHooks;
+        }
+      } catch {}
       if (editForm.reason) body.reason = editForm.reason;
 
       if (Object.keys(body).length === 0 || (Object.keys(body).length === 1 && body.reason)) {
@@ -513,6 +542,25 @@ function PipelinesView({ tierFilter }) {
   async function resume(id) {
     await api("POST", `/api/pipelines/${id}/resume`);
     setPipelines((ps) => ps.map((p) => (p.pipeline_id === id ? { ...p, status: "active" } : p)));
+  }
+
+  async function addDep(pipelineId) {
+    const depId = window.prompt("Enter upstream pipeline ID to depend on:");
+    if (!depId) return;
+    try {
+      await api("POST", `/api/pipelines/${pipelineId}/dependencies`, { depends_on_id: depId });
+      const d = await api("GET", `/api/pipelines/${pipelineId}`);
+      setDetail(d);
+    } catch (e) { window.alert("Failed: " + (e.message || e)); }
+  }
+
+  async function removeDep(pipelineId, depId) {
+    if (!window.confirm("Remove this dependency?")) return;
+    try {
+      await api("DELETE", `/api/pipelines/${pipelineId}/dependencies/${depId}`);
+      const d = await api("GET", `/api/pipelines/${pipelineId}`);
+      setDetail(d);
+    } catch (e) { window.alert("Failed: " + (e.message || e)); }
   }
 
   function budgetColor(eb) {
@@ -666,6 +714,96 @@ function PipelinesView({ tierFilter }) {
                   </div>
                 </div>
 
+                {/* ---- Dependencies (Build 11) ---- */}
+                {detail.dependencies && (
+                  <div className="bg-stone-50 border border-stone-200 rounded-lg px-4 py-3 space-y-2">
+                    <div className="text-xs font-semibold text-stone-500 mb-1">Dependencies</div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <div className="text-[10px] text-stone-400 mb-1 uppercase tracking-wider">Upstream (depends on)</div>
+                        {detail.dependencies.upstream?.length > 0 ? detail.dependencies.upstream.map((d) => (
+                          <div key={d.dependency_id} className="flex items-center gap-2 text-xs border border-stone-200 rounded px-2 py-1 mb-1 bg-white">
+                            <span className="font-mono text-stone-600">{d.depends_on_name || d.depends_on_id}</span>
+                            <Pill label={d.dependency_type} color="blue" />
+                            {d.notes && <span className="text-stone-400 italic text-[10px]">{d.notes}</span>}
+                            <button onClick={() => removeDep(detail.pipeline_id, d.dependency_id)} className="text-red-400 hover:text-red-600 ml-auto text-[10px]">Remove</button>
+                          </div>
+                        )) : <div className="text-xs text-stone-300">No upstream dependencies</div>}
+                        <button onClick={() => addDep(detail.pipeline_id)} className="text-[10px] text-blue-500 hover:text-blue-700 mt-1">+ Add dependency</button>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-stone-400 mb-1 uppercase tracking-wider">Downstream</div>
+                        <div className="text-xs text-stone-500">{detail.dependencies.downstream_count || 0} pipeline(s) depend on this</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* ---- Metadata (Build 11) ---- */}
+                {detail.metadata?.length > 0 && (
+                  <div className="bg-stone-50 border border-stone-200 rounded-lg px-4 py-3">
+                    <div className="text-xs font-semibold text-stone-500 mb-2">Pipeline Metadata</div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {detail.metadata.map((m) => (
+                        <div key={m.namespace + "/" + m.key} className="border border-stone-200 rounded px-2 py-1 bg-white">
+                          <div className="text-[10px] text-stone-400">{m.namespace}/{m.key}</div>
+                          <div className="text-xs font-mono text-stone-600 truncate">{JSON.stringify(m.value?.value ?? m.value)}</div>
+                          <div className="text-[10px] text-stone-300">{(m.updated_at || "").slice(0, 16)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ---- Post-Promotion Hooks (Build 13) ---- */}
+                {!editForm && (detail.post_promotion_hooks || []).length > 0 && (
+                  <div className="bg-stone-50 border border-stone-200 rounded-lg px-4 py-3">
+                    <div className="text-xs font-semibold text-stone-500 mb-2">Post-Promotion Hooks</div>
+                    <div className="space-y-2">
+                      {detail.post_promotion_hooks.map((h) => {
+                        const result = (detail.hook_results || {})[h.metadata_key || h.name];
+                        return (
+                          <div key={h.hook_id} className="flex items-start gap-2 text-xs">
+                            <Pill label={h.enabled ? "on" : "off"} color={h.enabled ? "green" : "stone"} />
+                            <div className="flex-1 min-w-0">
+                              <div className="font-semibold text-stone-700">{h.name || "unnamed"}</div>
+                              <div className="font-mono text-[10px] text-stone-400 truncate" title={h.sql}>{h.sql}</div>
+                              {h.description && <div className="text-[10px] text-stone-400">{h.description}</div>}
+                              {result && (
+                                <div className={`text-[10px] mt-0.5 ${result.status === "success" ? "text-green-600" : "text-red-500"}`}>
+                                  Last: {result.status} ({result.duration_ms}ms)
+                                  {result.result && Object.keys(result.result).length > 0 && (
+                                    <span className="ml-1 font-mono">{JSON.stringify(result.result)}</span>
+                                  )}
+                                  {result.error && <span className="ml-1">{result.error}</span>}
+                                </div>
+                              )}
+                            </div>
+                            {h.fail_pipeline_on_error && <Pill label="fail on err" color="red" />}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* ---- Schema Policy Summary (Build 12) ---- */}
+                {detail.schema_change_policy && !editForm && (
+                  <div className="bg-stone-50 border border-stone-200 rounded-lg px-4 py-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold text-stone-500">Schema Policy</span>
+                      {detail.schema_change_policy_is_custom && <Pill label="custom" color="purple" />}
+                    </div>
+                    <div className="text-xs text-stone-500 mt-1">
+                      new: <span className="font-mono">{detail.schema_change_policy.on_new_column}</span>,{" "}
+                      drop: <span className="font-mono">{detail.schema_change_policy.on_dropped_column}</span>,{" "}
+                      type: <span className="font-mono">{detail.schema_change_policy.on_type_change}</span>,{" "}
+                      nullable: <span className="font-mono">{detail.schema_change_policy.on_nullable_change}</span>
+                      {detail.schema_change_policy.propagate_to_downstream && <span className="ml-2 text-[10px] text-green-600">(propagates)</span>}
+                    </div>
+                  </div>
+                )}
+
                 {/* ---- Edit Settings Panel ---- */}
                 {editForm && (
                   <div className="border-2 border-blue-300 rounded-xl p-4 bg-blue-50/30 space-y-4">
@@ -815,6 +953,65 @@ function PipelinesView({ tierFilter }) {
                         Tags (JSON)
                         <textarea className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs font-mono bg-white" rows={2} value={editForm.tags_json} onChange={(e) => setEditForm({...editForm, tags_json: e.target.value})} />
                       </label>
+                    </div>
+
+                    {/* Schema Change Policy (Build 12) */}
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1.5">Schema Change Policy</div>
+                      <div className="grid grid-cols-4 gap-2">
+                        <label className="text-xs text-stone-500">
+                          New columns
+                          <select className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.on_new_column} onChange={(e) => setEditForm({...editForm, on_new_column: e.target.value})}>
+                            <option value="auto_add">Auto-add</option>
+                            <option value="propose">Propose</option>
+                            <option value="ignore">Ignore</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Dropped columns
+                          <select className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.on_dropped_column} onChange={(e) => setEditForm({...editForm, on_dropped_column: e.target.value})}>
+                            <option value="halt">Halt</option>
+                            <option value="propose">Propose</option>
+                            <option value="ignore">Ignore</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Type changes
+                          <select className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.on_type_change} onChange={(e) => setEditForm({...editForm, on_type_change: e.target.value})}>
+                            <option value="auto_widen">Auto-widen (safe)</option>
+                            <option value="propose">Propose</option>
+                            <option value="halt">Halt</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-stone-500">
+                          Nullable changes
+                          <select className="block w-full mt-0.5 px-2 py-1 border border-stone-300 rounded text-xs bg-white" value={editForm.on_nullable_change} onChange={(e) => setEditForm({...editForm, on_nullable_change: e.target.value})}>
+                            <option value="auto_accept">Auto-accept</option>
+                            <option value="propose">Propose</option>
+                            <option value="halt">Halt</option>
+                          </select>
+                        </label>
+                      </div>
+                      <label className="text-xs text-stone-500 flex items-center gap-1.5 mt-2">
+                        <input type="checkbox" checked={editForm.propagate_to_downstream} onChange={(e) => setEditForm({...editForm, propagate_to_downstream: e.target.checked})} />
+                        Propagate changes to downstream pipelines
+                      </label>
+                      <div className="text-[10px] text-stone-400 mt-1">Defaults based on tier. Override per-pipeline here.</div>
+                    </div>
+
+                    {/* Post-Promotion Hooks (Build 13) */}
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1.5">Post-Promotion SQL Hooks</div>
+                      <textarea
+                        className="block w-full px-2 py-1.5 border border-stone-300 rounded text-xs font-mono bg-white"
+                        rows={6}
+                        value={editForm.hooks_json}
+                        onChange={(e) => setEditForm({...editForm, hooks_json: e.target.value})}
+                        placeholder={'[\n  {"name": "row_count", "sql": "SELECT COUNT(*) as cnt FROM ...", "metadata_key": "total_rows"}\n]'}
+                      />
+                      <div className="text-[10px] text-stone-400 mt-1">
+                        JSON array. Each hook: name, sql, metadata_key, description, enabled (true), timeout_seconds (30), fail_pipeline_on_error (false)
+                      </div>
                     </div>
 
                     {/* Footer: reason + save */}

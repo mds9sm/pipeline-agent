@@ -6,7 +6,90 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ---
 
+## Roadmap — Next Builds
+
+| Build | Feature | Status | Why |
+|-------|---------|--------|-----|
+| 14 | Hook template variables | Pending | `{{watermark_after}}`, `{{run_id}}` etc. — unblocks consume-and-merge pattern |
+| 15 | Run context propagation | Pending | Upstream run context (watermarks, batch IDs) flows to downstream pipelines |
+| 16 | Data contracts between pipelines | Pending | Formalize producer/consumer relationships, cleanup policies, retention |
+| 17 | SQL-native intra-DB steps | Pending | Skip CSV extract for same-database pipelines (INSERT INTO...SELECT) |
+| 18 | Composable step DAG | Pending | Replace fixed extract→load→promote flow with configurable step graph |
+| 19 | DAG visualization UI | Pending | Visual pipeline dependency graph with execution status |
+| 20 | Agent topology reasoning | Pending | Agent designs multi-pipeline architectures from natural language |
+
+---
+
 ## [Unreleased]
+
+### Build 13 - 2026-03-08 (Claude Opus 4.6)
+
+**SQL-based Post-Promotion Hooks**
+
+#### Added
+- **`PostPromotionHook` dataclass** — Defines a SQL hook with: `hook_id`, `name`, `sql`, `metadata_key`, `description`, `enabled`, `timeout_seconds`, `fail_pipeline_on_error`. Stored as JSONB array on `PipelineContract`.
+- **`TargetEngine.execute_sql()`** — Non-abstract default method on the target interface. Raises `NotImplementedError` for connectors that don't support it. PostgreSQL seed connector implements it with statement timeout and `RealDictCursor`.
+- **Hook execution in runner** — `_execute_post_promotion_hooks()` runs after promotion, before marking COMPLETE. Results stored as metadata under `namespace="hooks"`. Supports fail-fast (`fail_pipeline_on_error=true`) or best-effort (default). JSON-safe serialization handles `Decimal`, `datetime`, `bytes`.
+- **`POST /api/pipelines/{id}/hooks/test`** — Test endpoint executes SQL against the pipeline's target connector without saving. Returns rows (capped at 100) with timing. Admin/operator only.
+- **PATCH support** — `post_promotion_hooks` field on `UpdatePipelineRequest`. Auto-generates `hook_id` for new hooks.
+- **Detail enrichment** — Pipeline detail response includes `post_promotion_hooks` array and `hook_results` dict (latest results from hooks namespace metadata).
+- **UI hooks display** — Read-only section shows each hook with name, SQL preview, enabled status, last execution result (status, duration, output).
+- **UI hooks editor** — JSON textarea in Edit Settings panel for defining/editing hooks.
+- **DB migration** — `ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS post_promotion_hooks JSONB NOT NULL DEFAULT '[]'`.
+
+#### Design Decisions
+- Hooks execute against the same target connector instance used for promotion (no re-instantiation needed).
+- Hook results are persisted as XCom-style metadata with `namespace="hooks"`, making them consumable by downstream pipelines via the metadata API.
+- `execute_sql()` is opt-in per connector — targets that don't support it gracefully skip hooks with a warning.
+- No SQL validation/sandboxing — hooks are set by admin/operator roles, not arbitrary users.
+
+### Build 12 - 2026-03-08 (Claude Opus 4.6)
+
+**Per-pipeline Schema Change Policies**
+
+#### Added
+- **`SchemaChangePolicy` dataclass** — 5 fields: `on_new_column` (auto_add/propose/ignore), `on_dropped_column` (halt/propose/ignore), `on_type_change` (auto_widen/propose/halt), `on_nullable_change` (auto_accept/propose/halt), `propagate_to_downstream` (bool).
+- **`SCHEMA_POLICY_TIER_DEFAULTS`** — T1: halt drops + propose types; T2: propose drops + auto-widen; T3: ignore drops + auto-widen. Tier defaults ensure zero-config safety scaling.
+- **`PipelineContract.get_schema_policy()`** — Returns explicit policy if set, otherwise tier default. Backward compatible with `auto_approve_additive_schema`.
+- **Nullable change detection** — `_detect_nullable_changes()` in monitor compares `is_nullable` between contract and live profile.
+- **Policy-driven drift decisions** — Each change category (new column, dropped column, type change, nullable change) resolved independently per policy. Halt reasons collected and applied as a batch.
+- **Downstream schema propagation** — When pipeline A auto-applies schema changes and `propagate_to_downstream=True`, creates proposals for dependent pipelines (never auto-applies — respects two-tier autonomy).
+- **`GET /api/schema-policy-defaults`** — Returns tier-based default policies.
+- **Schema change policy editor** — 4 dropdown selects + propagation checkbox in the Edit Settings panel.
+- **Schema policy enums** — `SchemaColumnAction`, `SchemaDropAction`, `SchemaTypeAction`, `SchemaNullableAction`.
+
+#### Changed
+- **`monitor/engine.py`** — `_check_drift()` rewritten to use policy-driven decisions. Split into `_create_halt_proposal()`, `_create_drift_proposals()`, `_propagate_schema_downstream()`. `_auto_apply_schema_changes()` extended with nullable changes.
+- **`contracts/store.py`** — Added `schema_change_policy JSONB` column to pipelines table. Updated `save_pipeline()` and `_row_to_pipeline()`.
+- **`api/server.py`** — `UpdatePipelineRequest` extended with `schema_change_policy`. PATCH handler applies policy. `_pipeline_detail()` includes `schema_change_policy` and `schema_change_policy_is_custom`.
+- **`ui/App.jsx`** — Schema change policy section in Edit Settings (4 selects + checkbox). Read-only policy summary in detail view.
+
+---
+
+### Build 11 - 2026-03-08 (Claude Opus 4.6)
+
+**Data-aware Scheduling + Pipeline Metadata**
+
+#### Added
+- **Event-driven pipeline triggering** — When pipeline A completes, scheduler checks all downstream dependents. If ALL upstream dependencies are satisfied, triggers immediately with `RunMode.DATA_TRIGGERED`. Cron scheduling remains as fallback. No external queue — async callbacks within the scheduler.
+- **`list_dependents(depends_on_id)` store method** — Reverse dependency lookup via `dependencies.depends_on_id` index.
+- **XCom-style pipeline metadata** — New `pipeline_metadata` PostgreSQL table with `(pipeline_id, namespace, key)` unique constraint. Runner writes 5 standard keys after each successful run: `last_run_id`, `last_row_count`, `last_max_watermark`, `last_completed_at`, `last_staging_size_bytes`.
+- **Metadata API endpoints** — `GET/PUT/DELETE /api/pipelines/{id}/metadata[/{key}]`.
+- **Dependency management API** — `POST /api/pipelines/{id}/dependencies` with cycle detection, `GET` list, `DELETE` remove. All with DecisionLog audit.
+- **Dependencies display in pipeline detail** — Upstream list with type pills + remove button. Downstream count. Inline "Add dependency" button.
+- **Metadata display in pipeline detail** — Grid of key-value cards showing namespace/key, value, updated_at.
+- **`RunMode.DATA_TRIGGERED`** — New run mode enum value for auditability.
+- **`PipelineMetadata` dataclass** — `id`, `pipeline_id`, `namespace`, `key`, `value_json`, `updated_at`, `created_by_run_id`.
+
+#### Changed
+- **`scheduler/manager.py`** — `_run_pipeline()` calls `_trigger_downstream()` after COMPLETE status.
+- **`agent/autonomous.py`** — Calls `_write_run_metadata()` after promotion.
+- **`api/server.py`** — `_pipeline_detail()` includes `dependencies` and `metadata` sections. New dependency and metadata CRUD endpoints.
+- **`contracts/store.py`** — `pipeline_metadata` table DDL, 4 CRUD methods, `list_dependents()`, `_row_to_metadata()`.
+- **`contracts/models.py`** — Added `RunMode.DATA_TRIGGERED`, `PipelineMetadata` dataclass.
+- **`ui/App.jsx`** — Dependency management section and metadata display in PipelinesView detail panel.
+
+---
 
 ### Build 10 - 2026-03-08 (Claude Opus 4.6)
 

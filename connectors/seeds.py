@@ -1083,6 +1083,19 @@ class PostgresTargetEngine(TargetEngine):
                 return {c: (row[i] or 0) for i, c in enumerate(columns)}
         finally:
             conn.close()
+
+    async def execute_sql(self, sql: str, timeout_seconds: int = 30) -> list[dict]:
+        conn = self._connect()
+        try:
+            conn.autocommit = True
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(f"SET statement_timeout = {timeout_seconds * 1000}")
+                cur.execute(sql)
+                if cur.description:
+                    return [dict(r) for r in cur.fetchall()]
+                return []
+        finally:
+            conn.close()
 '''
 
 

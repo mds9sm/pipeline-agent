@@ -122,6 +122,18 @@ class TargetEngine(ABC):
     def get_target_type(self) -> str:
         """Return identifier: 'redshift', 'snowflake', 'bigquery', etc."""
 
+    # -- SQL execution (post-promotion hooks) ----------------------------
+
+    async def execute_sql(self, sql: str, timeout_seconds: int = 30) -> list[dict]:
+        """Execute SQL and return result rows as list of dicts.
+
+        Override in connectors that support arbitrary SQL execution.
+        Used by post-promotion hooks to compute derived metadata.
+        """
+        raise NotImplementedError(
+            f"{self.get_target_type()} does not support execute_sql"
+        )
+
     # -- lifecycle -----------------------------------------------------
 
     async def close(self) -> None:

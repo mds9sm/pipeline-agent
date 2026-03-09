@@ -16,12 +16,13 @@ from contracts.models import (
     SchemaVersion, PipelineDependency, NotificationPolicy, FreshnessSnapshot,
     AlertRecord, DecisionLog, AgentPreference, ConnectorRecord,
     ErrorBudget, ColumnLineage, AgentCostLog, ConnectorMigration, User,
+    PipelineMetadata, SchemaChangePolicy, PostPromotionHook,
     ColumnMapping, QualityConfig, CheckResult,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
     ChangeType, ConnectorStatus, ConnectorType, TestStatus, AlertSeverity,
     FreshnessStatus, DependencyType, PreferenceScope, PreferenceSource,
-    now_iso,
+    now_iso, new_id,
 )
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,8 @@ class ContractStore:
         async with self.pool.acquire() as conn:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await conn.execute(_CREATE_TABLES_SQL)
+            # Migrations for existing databases
+            await conn.execute(_ALTER_TABLES_SQL)
 
     # ==================================================================
     # Connectors
@@ -130,6 +133,8 @@ class ContractStore:
         p.updated_at = now_iso()
         mappings_json = json.dumps([asdict(m) for m in p.column_mappings])
         qc_json = json.dumps(asdict(p.quality_config))
+        scp_json = json.dumps(asdict(p.schema_change_policy)) if p.schema_change_policy else json.dumps({})
+        hooks_json = json.dumps([asdict(h) for h in p.post_promotion_hooks])
         await self.pool.execute("""
             INSERT INTO pipelines (
                 pipeline_id, pipeline_name, version, created_at, updated_at,
@@ -147,11 +152,12 @@ class ContractStore:
                 freshness_column, agent_reasoning,
                 baseline_row_count, baseline_null_rates, baseline_null_stddevs,
                 baseline_cardinality, baseline_volume_avg, baseline_volume_stddev,
-                auto_approve_additive_schema, approval_notification_channel
+                auto_approve_additive_schema, approval_notification_channel,
+                schema_change_policy, post_promotion_hooks
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
                 $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
-                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53
+                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55
             )
             ON CONFLICT (pipeline_id) DO UPDATE SET
                 pipeline_name=EXCLUDED.pipeline_name, version=EXCLUDED.version,
@@ -193,7 +199,9 @@ class ContractStore:
                 baseline_volume_avg=EXCLUDED.baseline_volume_avg,
                 baseline_volume_stddev=EXCLUDED.baseline_volume_stddev,
                 auto_approve_additive_schema=EXCLUDED.auto_approve_additive_schema,
-                approval_notification_channel=EXCLUDED.approval_notification_channel
+                approval_notification_channel=EXCLUDED.approval_notification_channel,
+                schema_change_policy=EXCLUDED.schema_change_policy,
+                post_promotion_hooks=EXCLUDED.post_promotion_hooks
         """,
             p.pipeline_id, p.pipeline_name, p.version, p.created_at, p.updated_at,
             p.status.value, p.environment,
@@ -216,6 +224,7 @@ class ContractStore:
             json.dumps(p.baseline_null_stddevs), json.dumps(p.baseline_cardinality),
             p.baseline_volume_avg, p.baseline_volume_stddev,
             p.auto_approve_additive_schema, p.approval_notification_channel,
+            scp_json, hooks_json,
         )
 
     async def get_pipeline(self, pipeline_id: str) -> Optional[PipelineContract]:
@@ -461,6 +470,63 @@ class ContractStore:
         await self.pool.execute(
             "DELETE FROM dependencies WHERE dependency_id = $1", dependency_id
         )
+
+    async def list_dependents(self, depends_on_id: str) -> list[PipelineDependency]:
+        """Find all pipelines that depend on the given pipeline (reverse lookup)."""
+        rows = await self.pool.fetch(
+            "SELECT * FROM dependencies WHERE depends_on_id = $1", depends_on_id
+        )
+        return [_row_to_dependency(r) for r in rows]
+
+    # ==================================================================
+    # Pipeline metadata (XCom-style key-value store)
+    # ==================================================================
+
+    async def set_metadata(
+        self, pipeline_id: str, key: str, value: dict,
+        run_id: str = None, namespace: str = "default",
+    ) -> None:
+        """Upsert a metadata key for a pipeline."""
+        await self.pool.execute("""
+            INSERT INTO pipeline_metadata (id, pipeline_id, namespace, key, value_json, updated_at, created_by_run_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (pipeline_id, namespace, key) DO UPDATE SET
+                value_json = EXCLUDED.value_json,
+                updated_at = EXCLUDED.updated_at,
+                created_by_run_id = EXCLUDED.created_by_run_id
+        """, new_id(), pipeline_id, namespace, key, json.dumps(value), now_iso(), run_id)
+
+    async def get_metadata(
+        self, pipeline_id: str, key: str, namespace: str = "default",
+    ) -> PipelineMetadata:
+        row = await self.pool.fetchrow("""
+            SELECT * FROM pipeline_metadata
+            WHERE pipeline_id = $1 AND namespace = $2 AND key = $3
+        """, pipeline_id, namespace, key)
+        return _row_to_metadata(row) if row else None
+
+    async def list_metadata(
+        self, pipeline_id: str, namespace: str = None,
+    ) -> list[PipelineMetadata]:
+        if namespace:
+            rows = await self.pool.fetch("""
+                SELECT * FROM pipeline_metadata
+                WHERE pipeline_id = $1 AND namespace = $2 ORDER BY key
+            """, pipeline_id, namespace)
+        else:
+            rows = await self.pool.fetch("""
+                SELECT * FROM pipeline_metadata
+                WHERE pipeline_id = $1 ORDER BY namespace, key
+            """, pipeline_id)
+        return [_row_to_metadata(r) for r in rows]
+
+    async def delete_metadata(
+        self, pipeline_id: str, key: str, namespace: str = "default",
+    ) -> None:
+        await self.pool.execute("""
+            DELETE FROM pipeline_metadata
+            WHERE pipeline_id = $1 AND namespace = $2 AND key = $3
+        """, pipeline_id, namespace, key)
 
     # ==================================================================
     # Notification policies
@@ -1019,6 +1085,8 @@ def _row_to_pipeline(row: asyncpg.Record) -> PipelineContract:
         baseline_volume_stddev=row["baseline_volume_stddev"],
         auto_approve_additive_schema=row["auto_approve_additive_schema"],
         approval_notification_channel=row["approval_notification_channel"],
+        schema_change_policy=_parse_schema_change_policy(row),
+        post_promotion_hooks=_parse_post_promotion_hooks(row),
     )
 
 
@@ -1104,6 +1172,40 @@ def _row_to_schema_version(row: asyncpg.Record) -> SchemaVersion:
         applied_at=row["applied_at"],
         applied_by=row["applied_by"],
     )
+
+
+def _row_to_metadata(row: asyncpg.Record) -> PipelineMetadata:
+    return PipelineMetadata(
+        id=row["id"],
+        pipeline_id=row["pipeline_id"],
+        namespace=row["namespace"],
+        key=row["key"],
+        value_json=json.loads(row["value_json"]) if isinstance(row["value_json"], str) else row["value_json"],
+        updated_at=row["updated_at"],
+        created_by_run_id=row["created_by_run_id"],
+    )
+
+
+def _parse_schema_change_policy(row: asyncpg.Record):
+    """Deserialize schema_change_policy JSON from a pipeline row."""
+    raw = row.get("schema_change_policy")
+    if not raw:
+        return None
+    parsed = json.loads(raw) if isinstance(raw, str) else raw
+    if not parsed:
+        return None
+    return SchemaChangePolicy(**parsed)
+
+
+def _parse_post_promotion_hooks(row: asyncpg.Record) -> list[PostPromotionHook]:
+    """Deserialize post_promotion_hooks JSON from a pipeline row."""
+    raw = row.get("post_promotion_hooks")
+    if not raw:
+        return []
+    parsed = json.loads(raw) if isinstance(raw, str) else raw
+    if not parsed:
+        return []
+    return [PostPromotionHook(**h) for h in parsed]
 
 
 def _row_to_dependency(row: asyncpg.Record) -> PipelineDependency:
@@ -1277,7 +1379,9 @@ CREATE TABLE IF NOT EXISTS pipelines (
     baseline_volume_avg DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     baseline_volume_stddev DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     auto_approve_additive_schema BOOLEAN NOT NULL DEFAULT FALSE,
-    approval_notification_channel TEXT NOT NULL DEFAULT ''
+    approval_notification_channel TEXT NOT NULL DEFAULT '',
+    schema_change_policy JSONB NOT NULL DEFAULT '{}',
+    post_promotion_hooks JSONB NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -1480,6 +1584,16 @@ CREATE TABLE IF NOT EXISTS users (
     last_login TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS pipeline_metadata (
+    id TEXT PRIMARY KEY,
+    pipeline_id TEXT NOT NULL REFERENCES pipelines(pipeline_id),
+    namespace TEXT NOT NULL DEFAULT 'default',
+    key TEXT NOT NULL,
+    value_json JSONB NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    created_by_run_id TEXT
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON runs(pipeline_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
@@ -1503,6 +1617,15 @@ CREATE INDEX IF NOT EXISTS idx_cost_logs_pipeline ON agent_cost_logs(pipeline_id
 CREATE INDEX IF NOT EXISTS idx_cost_logs_timestamp ON agent_cost_logs(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_connector_migrations_connector ON connector_migrations(connector_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_pipeline_ns_key ON pipeline_metadata(pipeline_id, namespace, key);
+CREATE INDEX IF NOT EXISTS idx_metadata_pipeline ON pipeline_metadata(pipeline_id);
+"""
+
+_ALTER_TABLES_SQL = """
+-- Build 12: Add schema_change_policy column to existing pipelines table
+ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS schema_change_policy JSONB NOT NULL DEFAULT '{}';
+-- Build 13: Add post_promotion_hooks column to existing pipelines table
+ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS post_promotion_hooks JSONB NOT NULL DEFAULT '[]';
 """
 
 # Alias used by several modules (agent, scheduler, monitor, api).

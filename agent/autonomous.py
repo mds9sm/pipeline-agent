@@ -4,8 +4,11 @@ Runs extraction -> staging -> quality gate -> promotion for a single pipeline ru
 """
 from __future__ import annotations
 
+import decimal
 import logging
 import math
+import time as _time
+from datetime import date, datetime
 from typing import Optional
 
 from config import Config
@@ -23,6 +26,21 @@ from crypto import decrypt_dict, CREDENTIAL_FIELDS
 from logging_config import PipelineContext
 
 log = logging.getLogger(__name__)
+
+
+def _json_safe(obj):
+    """Convert a dict's values to JSON-serializable types."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    return obj
 
 
 class PipelineRunner:
@@ -163,6 +181,12 @@ class PipelineRunner:
 
             # Track column lineage after successful promotion
             await self._track_column_lineage(contract)
+
+            # Write pipeline metadata (XCom-style)
+            await self._write_run_metadata(contract, run, extract_result)
+
+            # Execute post-promotion SQL hooks
+            await self._execute_post_promotion_hooks(contract, run, target)
 
             # 9. Mark COMPLETE
             run.status = RunStatus.COMPLETE
@@ -424,6 +448,108 @@ class PipelineRunner:
                 await self.store.save_column_lineage(lineage)
         except Exception as e:
             log.warning("Column lineage tracking failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Pipeline metadata (XCom-style)
+    # ------------------------------------------------------------------
+
+    async def _write_run_metadata(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+        extract_result,
+    ) -> None:
+        """Persist execution metadata for downstream consumption."""
+        try:
+            pid = contract.pipeline_id
+            rid = run.run_id
+            await self.store.set_metadata(
+                pid, "last_run_id", {"value": run.run_id}, rid,
+            )
+            await self.store.set_metadata(
+                pid, "last_row_count", {"value": run.rows_extracted}, rid,
+            )
+            if extract_result.max_watermark:
+                await self.store.set_metadata(
+                    pid, "last_max_watermark",
+                    {"value": extract_result.max_watermark}, rid,
+                )
+            await self.store.set_metadata(
+                pid, "last_completed_at",
+                {"value": run.completed_at or now_iso()}, rid,
+            )
+            await self.store.set_metadata(
+                pid, "last_staging_size_bytes",
+                {"value": run.staging_size_bytes}, rid,
+            )
+        except Exception as e:
+            log.warning("Failed to write pipeline metadata: %s", e)
+
+    # ------------------------------------------------------------------
+    # Post-promotion SQL hooks
+    # ------------------------------------------------------------------
+
+    async def _execute_post_promotion_hooks(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+        target,
+    ) -> None:
+        """Execute SQL hooks against the target and store results as metadata."""
+        hooks = [h for h in contract.post_promotion_hooks if h.enabled]
+        if not hooks:
+            return
+
+        log.info("Executing %d post-promotion hook(s)", len(hooks))
+        for hook in hooks:
+            t0 = _time.monotonic()
+            try:
+                rows = await target.execute_sql(
+                    hook.sql, hook.timeout_seconds,
+                )
+                duration_ms = int((_time.monotonic() - t0) * 1000)
+                # Store first row for SELECT, or empty dict for non-SELECT
+                result_value = dict(rows[0]) if rows else {}
+                # Sanitize for JSON (handle Decimal, datetime, etc.)
+                result_value = _json_safe(result_value)
+                result = {
+                    "status": "success",
+                    "duration_ms": duration_ms,
+                    "rows_returned": len(rows),
+                    "result": result_value,
+                }
+                log.info(
+                    "Hook '%s' completed in %dms (%d rows)",
+                    hook.name, duration_ms, len(rows),
+                )
+            except NotImplementedError:
+                log.warning(
+                    "Hook '%s' skipped: target does not support execute_sql",
+                    hook.name,
+                )
+                continue
+            except Exception as e:
+                duration_ms = int((_time.monotonic() - t0) * 1000)
+                result = {
+                    "status": "error",
+                    "duration_ms": duration_ms,
+                    "error": str(e),
+                }
+                log.warning("Hook '%s' failed: %s", hook.name, e)
+                if hook.fail_pipeline_on_error:
+                    raise RuntimeError(
+                        f"Post-promotion hook '{hook.name}' failed: {e}"
+                    ) from e
+
+            # Store result as metadata
+            try:
+                key = hook.metadata_key or hook.name
+                await self.store.set_metadata(
+                    contract.pipeline_id, key, result,
+                    run.run_id, namespace="hooks",
+                )
+            except Exception as e:
+                log.warning("Failed to store hook result for '%s': %s", hook.name, e)
 
     # ------------------------------------------------------------------
     # Connector param resolution
