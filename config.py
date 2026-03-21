@@ -1,16 +1,27 @@
 """Pipeline Agent configuration — connector-agnostic, reads from environment."""
 
 import os
+from urllib.parse import urlparse
 
 
 class Config:
     def __init__(self):
         # PostgreSQL (main store + pgvector)
-        self.pg_host = os.getenv("PG_HOST", "localhost")
-        self.pg_port = int(os.getenv("PG_PORT", "5432"))
-        self.pg_database = os.getenv("PG_DATABASE", "pipeline_agent")
-        self.pg_user = os.getenv("PG_USER", "pipeline_agent")
-        self.pg_password = os.getenv("PG_PASSWORD", "pipeline_agent")
+        # DATABASE_URL takes precedence (Railway, Render, Heroku auto-inject this)
+        database_url = os.getenv("DATABASE_URL", "")
+        if database_url:
+            parsed = urlparse(database_url)
+            self.pg_host = parsed.hostname or "localhost"
+            self.pg_port = parsed.port or 5432
+            self.pg_database = (parsed.path or "/pipeline_agent").lstrip("/")
+            self.pg_user = parsed.username or "pipeline_agent"
+            self.pg_password = parsed.password or ""
+        else:
+            self.pg_host = os.getenv("PG_HOST", "localhost")
+            self.pg_port = int(os.getenv("PG_PORT", "5432"))
+            self.pg_database = os.getenv("PG_DATABASE", "pipeline_agent")
+            self.pg_user = os.getenv("PG_USER", "pipeline_agent")
+            self.pg_password = os.getenv("PG_PASSWORD", "pipeline_agent")
         self.pg_pool_min = int(os.getenv("PG_POOL_MIN", "2"))
         self.pg_pool_max = int(os.getenv("PG_POOL_MAX", "10"))
 
