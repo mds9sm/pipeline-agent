@@ -1163,8 +1163,144 @@ function PipelinesView({ tierFilter }) {
 // 3. Activity View
 // ---------------------------------------------------------------------------
 
+function ActivityRunDetail({ r }) {
+  const [expanded, setExpanded] = useState(false);
+  const duration = r.started_at && r.completed_at
+    ? Math.round((new Date(r.completed_at) - new Date(r.started_at)) / 1000)
+    : null;
+  const fmtDur = duration != null
+    ? duration >= 60 ? `${Math.floor(duration / 60)}m ${duration % 60}s` : `${duration}s`
+    : "--";
+  const fmtBytes = (b) => {
+    if (!b) return null;
+    if (b > 1048576) return `${(b / 1048576).toFixed(1)} MB`;
+    if (b > 1024) return `${(b / 1024).toFixed(1)} KB`;
+    return `${b} B`;
+  };
+  const checks = r.quality_results && Array.isArray(r.quality_results.checks) ? r.quality_results.checks : [];
+
+  return (
+    <div className="border-b border-stone-200">
+      <div
+        className="flex items-center gap-3 px-4 py-2.5 hover:bg-stone-50 text-sm cursor-pointer"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <StatusDot status={r.status} />
+        <TierBadge tier={r.tier} />
+        <span className="text-stone-400 font-mono text-xs w-32">{r.started_at?.slice(0, 16)}</span>
+        <span className="font-mono font-medium flex-1 text-stone-700">{r.pipeline_name}</span>
+        <span className="text-stone-400 text-xs">{r.rows_extracted?.toLocaleString()} rows</span>
+        {r.gate_decision && (
+          <Pill
+            label={r.gate_decision}
+            color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
+          />
+        )}
+        {r.error && <span className="text-xs text-red-600 truncate max-w-[200px]">{r.error}</span>}
+        <span className="text-stone-300 text-xs">{expanded ? "\u25B2" : "\u25BC"}</span>
+      </div>
+      {expanded && (
+        <div className="px-4 pb-4 pt-1 bg-stone-50/50 space-y-3">
+          {/* Run metadata grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+            <div>
+              <span className="text-stone-400 block">Duration</span>
+              <span className="font-mono text-stone-700">{fmtDur}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Mode</span>
+              <span className="font-mono text-stone-700">{r.run_mode || "scheduled"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Extracted</span>
+              <span className="font-mono text-stone-700">{r.rows_extracted?.toLocaleString() ?? "--"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Loaded</span>
+              <span className="font-mono text-stone-700">{r.rows_loaded?.toLocaleString() ?? "--"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Staging Size</span>
+              <span className="font-mono text-stone-700">{fmtBytes(r.staging_size_bytes) || "--"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Retries</span>
+              <span className="font-mono text-stone-700">{r.retry_count ?? 0}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Started</span>
+              <span className="font-mono text-stone-700">{r.started_at?.replace("T", " ").slice(0, 19) || "--"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Completed</span>
+              <span className="font-mono text-stone-700">{r.completed_at?.replace("T", " ").slice(0, 19) || "--"}</span>
+            </div>
+          </div>
+
+          {/* Watermarks */}
+          {(r.watermark_before || r.watermark_after) && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-1">Watermark</div>
+              <div className="flex items-center gap-2 text-xs font-mono text-stone-600">
+                <span className="bg-stone-100 rounded px-2 py-0.5">{r.watermark_before || "null"}</span>
+                <span className="text-stone-400">&rarr;</span>
+                <span className="bg-blue-50 text-blue-700 rounded px-2 py-0.5">{r.watermark_after || "null"}</span>
+              </div>
+            </div>
+          )}
+
+          {/* Triggered by */}
+          {r.triggered_by_pipeline_id && (
+            <div className="text-xs text-stone-500">
+              Triggered by pipeline <span className="font-mono text-stone-600">{r.triggered_by_pipeline_id.slice(0, 8)}</span>
+              {r.triggered_by_run_id && <span> (run <span className="font-mono text-stone-600">{r.triggered_by_run_id.slice(0, 8)}</span>)</span>}
+            </div>
+          )}
+
+          {/* Quality gate checks */}
+          {checks.length > 0 && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] uppercase text-stone-400 font-semibold">Quality Gate</span>
+                <Pill
+                  label={r.quality_results.decision || r.gate_decision || "unknown"}
+                  color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
+                />
+              </div>
+              <div className="space-y-1">
+                {checks.map((c, i) => (
+                  <div key={i} className="flex items-center gap-2 text-xs">
+                    <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                      c.status === "pass" ? "bg-green-400" :
+                      c.status === "warn" ? "bg-amber-400" : "bg-red-400"
+                    }`} />
+                    <span className="font-medium text-stone-600 w-36">{c.name}</span>
+                    <span className="text-stone-400 truncate">{c.detail}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Error detail */}
+          {r.error && (
+            <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-red-400 font-semibold mb-1">Error</div>
+              <div className="text-xs text-red-700 font-mono whitespace-pre-wrap">{r.error}</div>
+            </div>
+          )}
+
+          {/* Run ID */}
+          <div className="text-[10px] font-mono text-stone-400">Run ID: {r.run_id}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ActivityView() {
   const [runs, setRuns] = useState([]);
+  const [filter, setFilter] = useState("all");
   useEffect(() => {
     api("GET", "/api/pipelines")
       .then(async (pipelines) => {
@@ -1181,31 +1317,36 @@ function ActivityView() {
       .catch(console.error);
   }, []);
 
+  const filtered = filter === "all" ? runs
+    : filter === "failed" ? runs.filter((r) => r.status === "failed" || r.status === "halted")
+    : filter === "complete" ? runs.filter((r) => r.status === "complete")
+    : runs;
+
   return (
     <div className="px-6 py-4">
-      <h1 className="text-lg font-semibold mb-4 text-stone-800">Activity</h1>
-      <div className="bg-white border border-stone-200 rounded-xl overflow-hidden">
-        <div className="divide-y divide-stone-200">
-          {runs.map((r) => (
-            <div key={r.run_id} className="flex items-center gap-3 px-4 py-2.5 hover:bg-stone-50 text-sm">
-              <StatusDot status={r.status} />
-              <TierBadge tier={r.tier} />
-              <span className="text-stone-400 font-mono text-xs w-32">{r.started_at?.slice(0, 16)}</span>
-              <span className="font-mono font-medium flex-1 text-stone-700">{r.pipeline_name}</span>
-              <span className="text-stone-400">{r.rows_extracted?.toLocaleString()} rows</span>
-              {r.gate_decision && (
-                <Pill
-                  label={r.gate_decision}
-                  color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
-                />
-              )}
-              {r.error && <span className="text-xs text-red-600 truncate max-w-xs">{r.error}</span>}
-            </div>
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="text-lg font-semibold text-stone-800">Activity</h1>
+        <div className="flex gap-1">
+          {["all", "complete", "failed"].map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                filter === f
+                  ? "bg-stone-800 text-white"
+                  : "bg-stone-100 text-stone-500 hover:bg-stone-200"
+              }`}
+            >
+              {f === "all" ? `All (${runs.length})` : f === "complete" ? "Completed" : "Failed/Halted"}
+            </button>
           ))}
-          {runs.length === 0 && (
-            <div className="text-sm text-stone-400 py-8 text-center">No activity yet.</div>
-          )}
         </div>
+      </div>
+      <div className="bg-white border border-stone-200 rounded-xl overflow-hidden">
+        {filtered.map((r) => <ActivityRunDetail key={r.run_id} r={r} />)}
+        {filtered.length === 0 && (
+          <div className="text-sm text-stone-400 py-8 text-center">No activity yet.</div>
+        )}
       </div>
     </div>
   );
