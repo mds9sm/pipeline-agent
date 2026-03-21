@@ -148,7 +148,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 **Test script**: `./test-pipeline-agent.sh`
 
 ```bash
-./test-pipeline-agent.sh              # Full suite (~150 tests, ~20 min)
+./test-pipeline-agent.sh              # Full suite (~160 tests, ~20 min)
 ./test-pipeline-agent.sh --api        # REST API endpoints only (~36 tests, fast)
 ./test-pipeline-agent.sh --sources    # Source connector requests + generation
 ./test-pipeline-agent.sh --targets    # Target connector requests + generation
@@ -173,6 +173,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | YAML contract-as-code | 6 | single export, export with state, bulk export, status filter, import duplicate detection, GitOps sync dry-run (Build 9) |
 | Change audit | 4 | PATCH with audit reason, contract_update in timeline, YAML auto-persistence, credential masking (Build 10) |
 | Approval workflow | 2 | list pending, approve |
+| Data contracts | 11 | create, list, get, validate, update, violations, pipeline detail, auto-dep, duplicate/self rejection, delete (Build 16) |
 
 ### Adding New Tests
 

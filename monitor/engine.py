@@ -21,8 +21,10 @@ from config import Config
 from contracts.models import (
     PipelineContract, ContractChangeProposal, SchemaVersion,
     FreshnessSnapshot, AlertRecord, ColumnMapping, DecisionLog,
+    ContractViolation,
     FreshnessStatus, AlertSeverity, TriggerType, ChangeType,
     ProposalStatus, ConnectorStatus, PipelineStatus, TIER_DEFAULTS,
+    DataContractStatus, ContractViolationType, CleanupOwnership,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -65,7 +67,7 @@ class MonitorEngine:
         self._stop = True
 
     async def _tick(self) -> None:
-        """Check drift and freshness for all active pipelines."""
+        """Check drift, freshness, and data contracts for all active pipelines."""
         pipelines = await self.store.list_pipelines(status="active")
         for pipeline in pipelines:
             with PipelineContext(pipeline.pipeline_id, pipeline.pipeline_name, component="monitor"):
@@ -77,6 +79,12 @@ class MonitorEngine:
                     await self._check_freshness(pipeline)
                 except Exception as e:
                     log.warning("Freshness check error: %s", e)
+
+        # Data contract validation (Build 16)
+        try:
+            await self._check_data_contracts()
+        except Exception as e:
+            log.warning("Data contract check error: %s", e)
 
     # ------------------------------------------------------------------
     # Schema drift detection
@@ -627,6 +635,101 @@ class MonitorEngine:
 
         except Exception as e:
             log.warning("Freshness check failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Data contract validation (Build 16)
+    # ------------------------------------------------------------------
+
+    async def _check_data_contracts(self) -> None:
+        """Validate all active data contracts for freshness SLA and schema."""
+        contracts = await self.store.list_data_contracts(status="active")
+        for contract in contracts:
+            try:
+                await self._validate_contract(contract)
+            except Exception as e:
+                log.warning(
+                    "Contract validation error for %s: %s",
+                    contract.contract_id, e,
+                )
+
+    async def _validate_contract(self, contract) -> None:
+        """Check freshness SLA and required columns for one data contract."""
+        producer = await self.store.get_pipeline(contract.producer_pipeline_id)
+        if not producer:
+            return
+
+        violations = []
+        now = datetime.now(timezone.utc)
+
+        # 1. Freshness SLA check
+        last_run = await self.store.get_last_successful_run(
+            contract.producer_pipeline_id,
+        )
+        if last_run and last_run.completed_at:
+            completed = datetime.fromisoformat(
+                last_run.completed_at,
+            ).replace(tzinfo=timezone.utc)
+            staleness_minutes = (now - completed).total_seconds() / 60
+            if staleness_minutes > contract.freshness_sla_minutes:
+                violations.append(ContractViolation(
+                    contract_id=contract.contract_id,
+                    violation_type=ContractViolationType.FRESHNESS_SLA,
+                    detail=(
+                        f"Producer data is {min(staleness_minutes, 99999):.0f}m old, "
+                        f"SLA is {contract.freshness_sla_minutes}m"
+                    ),
+                    producer_pipeline_id=contract.producer_pipeline_id,
+                    consumer_pipeline_id=contract.consumer_pipeline_id,
+                ))
+
+        # 2. Required columns check
+        if contract.required_columns and producer.column_mappings:
+            target_columns = {m.target_column for m in producer.column_mappings}
+            missing = [
+                c for c in contract.required_columns
+                if c not in target_columns
+            ]
+            if missing:
+                violations.append(ContractViolation(
+                    contract_id=contract.contract_id,
+                    violation_type=ContractViolationType.SCHEMA_MISMATCH,
+                    detail=f"Missing required columns: {', '.join(missing)}",
+                    producer_pipeline_id=contract.producer_pipeline_id,
+                    consumer_pipeline_id=contract.consumer_pipeline_id,
+                ))
+
+        # 3. Record violations and update contract status
+        for v in violations:
+            await self.store.save_contract_violation(v)
+
+        contract.last_validated_at = now_iso()
+        if violations:
+            contract.status = DataContractStatus.VIOLATED
+            contract.last_violation_at = now_iso()
+            contract.violation_count += len(violations)
+            # Create alerts
+            consumer = await self.store.get_pipeline(
+                contract.consumer_pipeline_id,
+            )
+            for v in violations:
+                alert = AlertRecord(
+                    severity=AlertSeverity.WARNING,
+                    tier=producer.tier,
+                    pipeline_id=contract.producer_pipeline_id,
+                    pipeline_name=producer.pipeline_name,
+                    summary=f"Data contract violation: {v.detail}",
+                    detail={
+                        "contract_id": contract.contract_id,
+                        "consumer": consumer.pipeline_name if consumer else contract.consumer_pipeline_id,
+                        "violation_type": v.violation_type.value if hasattr(v.violation_type, "value") else v.violation_type,
+                    },
+                )
+                await self.store.save_alert(alert)
+                await self._dispatch_alert(alert, producer)
+        else:
+            contract.status = DataContractStatus.ACTIVE
+
+        await self.store.save_data_contract(contract)
 
     # ------------------------------------------------------------------
     # Alert dispatch

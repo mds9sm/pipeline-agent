@@ -16,6 +16,7 @@ from contracts.models import (
     PipelineContract, RunRecord, GateRecord, ColumnLineage,
     ErrorBudget, AlertRecord, SchemaVersion,
     RunStatus, GateDecision, RunMode, ConnectorStatus, AlertSeverity,
+    CleanupOwnership,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -588,6 +589,17 @@ class PipelineRunner:
         log.info("Executing %d post-promotion hook(s)", len(hooks))
         for hook in hooks:
             rendered_sql = self._render_hook_sql(hook.sql, contract, run, upstream_run)
+
+            # Build 16: Cleanup guard — check data contracts before DELETE/TRUNCATE
+            if any(kw in rendered_sql.upper() for kw in ("DELETE", "TRUNCATE")):
+                if not await self._check_cleanup_allowed(contract):
+                    log.warning(
+                        "Hook '%s' skipped: data contract blocks cleanup "
+                        "(consumer has not acknowledged data)",
+                        hook.name,
+                    )
+                    continue
+
             t0 = _time.monotonic()
             try:
                 rows = await target.execute_sql(
@@ -638,6 +650,28 @@ class PipelineRunner:
                 )
             except Exception as e:
                 log.warning("Failed to store hook result for '%s': %s", hook.name, e)
+
+    async def _check_cleanup_allowed(self, contract: PipelineContract) -> bool:
+        """Return False if data contracts block cleanup for this producer.
+
+        When cleanup_ownership is consumer_acknowledges, the consumer must
+        have completed at least one run before the producer can delete data.
+        """
+        try:
+            contracts = await self.store.list_data_contracts(
+                producer_id=contract.pipeline_id, status="active",
+            )
+            for dc in contracts:
+                if dc.cleanup_ownership == CleanupOwnership.CONSUMER_ACKNOWLEDGES:
+                    consumer_run = await self.store.get_last_successful_run(
+                        dc.consumer_pipeline_id,
+                    )
+                    if consumer_run is None:
+                        return False
+            return True
+        except Exception as e:
+            log.warning("Cleanup guard check failed: %s", e)
+            return True  # fail-open to avoid blocking on guard errors
 
     # ------------------------------------------------------------------
     # Connector param resolution

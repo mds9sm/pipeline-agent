@@ -139,6 +139,25 @@ class DependencyType(str, Enum):
     AGENT_RECOMMENDED = "agent_recommended"
 
 
+class CleanupOwnership(str, Enum):
+    PRODUCER_TTL = "producer_ttl"
+    CONSUMER_ACKNOWLEDGES = "consumer_acknowledges"
+    NONE = "none"
+
+
+class DataContractStatus(str, Enum):
+    ACTIVE = "active"
+    VIOLATED = "violated"
+    PAUSED = "paused"
+    ARCHIVED = "archived"
+
+
+class ContractViolationType(str, Enum):
+    FRESHNESS_SLA = "freshness_sla"
+    SCHEMA_MISMATCH = "schema_mismatch"
+    RETENTION_EXPIRED = "retention_expired"
+
+
 class PreferenceScope(str, Enum):
     GLOBAL = "global"
     PIPELINE = "pipeline"
@@ -676,6 +695,52 @@ class User:
     @property
     def user_id(self) -> str:
         return self.id
+
+
+# ---------------------------------------------------------------------------
+# Data contracts (Build 16)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DataContract:
+    """Formalizes a producer/consumer relationship between two pipelines."""
+    contract_id: str = field(default_factory=new_id)
+    producer_pipeline_id: str = ""
+    consumer_pipeline_id: str = ""
+    description: str = ""
+    status: DataContractStatus = DataContractStatus.ACTIVE
+
+    # Schema expectations (columns the consumer requires from the producer)
+    required_columns: list[str] = field(default_factory=list)
+
+    # Freshness SLA — consumer expects data no older than this
+    freshness_sla_minutes: int = 60
+
+    # Retention — producer must keep data at least this long
+    retention_hours: int = 168  # 7 days
+    cleanup_ownership: CleanupOwnership = CleanupOwnership.NONE
+
+    # State tracking
+    last_validated_at: Optional[str] = None
+    last_violation_at: Optional[str] = None
+    violation_count: int = 0
+
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class ContractViolation:
+    """Records a single data contract violation event."""
+    violation_id: str = field(default_factory=new_id)
+    contract_id: str = ""
+    violation_type: ContractViolationType = ContractViolationType.FRESHNESS_SLA
+    detail: str = ""
+    producer_pipeline_id: str = ""
+    consumer_pipeline_id: str = ""
+    resolved: bool = False
+    resolved_at: Optional[str] = None
+    created_at: str = field(default_factory=now_iso)
 
 
 # ---------------------------------------------------------------------------

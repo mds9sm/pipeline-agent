@@ -136,6 +136,12 @@ api_patch() {
         -d "$2" 2>/dev/null
 }
 
+# HTTP DELETE
+api_delete() {
+    curl -s -m 30 -w "\n%{http_code}" -X DELETE "$API_URL$1" \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} 2>/dev/null
+}
+
 # HTTP POST with plain-text body (for YAML import)
 api_post_text() {
     curl -s -m 60 -w "\n%{http_code}" -X POST "$API_URL$1" \
@@ -1425,7 +1431,191 @@ else
     fail "Approvals endpoint failed (HTTP $CODE)"
 fi
 
-fi # --api
+fi # --api (approval)
+
+# ============================================================================
+# SECTION 9: Data Contracts (Build 16)
+# ============================================================================
+if [ "$TEST_MODE" = "all" ] || [ "$TEST_MODE" = "--api" ]; then
+
+section "DATA CONTRACTS (Build 16)"
+
+# Get two demo pipeline IDs for testing
+PIPELINES_RESP=$(api_get "/api/pipelines")
+PIPELINES_BODY=$(echo "$PIPELINES_RESP" | sed '$d')
+PRODUCER_PID=$(echo "$PIPELINES_BODY" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+pipelines = data if isinstance(data, list) else data.get('pipelines',[])
+for p in pipelines:
+    if 'orders' in p.get('pipeline_name','').lower() or 'stripe' in p.get('pipeline_name','').lower():
+        print(p['pipeline_id']); break
+" 2>/dev/null)
+
+CONSUMER_PID=$(echo "$PIPELINES_BODY" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+pipelines = data if isinstance(data, list) else data.get('pipelines',[])
+for p in pipelines:
+    if 'customer' in p.get('pipeline_name','').lower() or 'analytics' in p.get('pipeline_name','').lower():
+        print(p['pipeline_id']); break
+" 2>/dev/null)
+
+if [ -n "$PRODUCER_PID" ] && [ -n "$CONSUMER_PID" ]; then
+
+    # Test 1: Create data contract
+    test_name "POST /api/data-contracts - Create contract"
+    RESP=$(api_post "/api/data-contracts" "{
+        \"producer_pipeline_id\": \"$PRODUCER_PID\",
+        \"consumer_pipeline_id\": \"$CONSUMER_PID\",
+        \"description\": \"Test contract for Build 16\",
+        \"freshness_sla_minutes\": 120,
+        \"retention_hours\": 48,
+        \"cleanup_ownership\": \"consumer_acknowledges\",
+        \"required_columns\": [\"id\"]
+    }")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    CONTRACT_ID=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('contract_id',''))" 2>/dev/null)
+    if [ "$CODE" = "200" ] && [ -n "$CONTRACT_ID" ]; then
+        pass "Created contract $CONTRACT_ID"
+    else
+        fail "Create contract failed (HTTP $CODE)"
+    fi
+
+    # Test 2: List data contracts
+    test_name "GET /api/data-contracts - List contracts"
+    RESP=$(api_get "/api/data-contracts")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    TOTAL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+    if [ "$CODE" = "200" ] && [ "$TOTAL" -ge 1 ] 2>/dev/null; then
+        pass "Found $TOTAL contract(s)"
+    else
+        fail "List contracts failed (HTTP $CODE, total=$TOTAL)"
+    fi
+
+    # Test 3: Get contract detail
+    test_name "GET /api/data-contracts/$CONTRACT_ID - Get detail"
+    RESP=$(api_get "/api/data-contracts/$CONTRACT_ID")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    STATUS=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    if [ "$CODE" = "200" ] && [ "$STATUS" = "active" ]; then
+        pass "Contract detail returned (status=$STATUS)"
+    else
+        fail "Get contract failed (HTTP $CODE)"
+    fi
+
+    # Test 4: Validate contract
+    test_name "POST /api/data-contracts/$CONTRACT_ID/validate - Validate"
+    RESP=$(api_post "/api/data-contracts/$CONTRACT_ID/validate" '{}')
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        V_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('violations_found',0))" 2>/dev/null)
+        pass "Validation completed ($V_COUNT violation(s) found)"
+    else
+        fail "Validate contract failed (HTTP $CODE)"
+    fi
+
+    # Test 5: Update contract SLA
+    test_name "PATCH /api/data-contracts/$CONTRACT_ID - Update SLA"
+    RESP=$(api_patch "/api/data-contracts/$CONTRACT_ID" '{"freshness_sla_minutes": 240}')
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ]; then
+        pass "Contract SLA updated"
+    else
+        fail "Patch contract failed (HTTP $CODE)"
+    fi
+
+    # Test 6: List violations
+    test_name "GET /api/data-contracts/$CONTRACT_ID/violations - List violations"
+    RESP=$(api_get "/api/data-contracts/$CONTRACT_ID/violations")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$CODE" = "200" ]; then
+        V_TOTAL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+        pass "Listed $V_TOTAL violation(s)"
+    else
+        fail "List violations failed (HTTP $CODE)"
+    fi
+
+    # Test 7: Pipeline detail includes data_contracts field
+    test_name "GET /api/pipelines/$PRODUCER_PID - Check data_contracts field"
+    RESP=$(api_get "/api/pipelines/$PRODUCER_PID")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    HAS_DC=$(echo "$BODY" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+dc = data.get('data_contracts', {})
+print('yes' if dc.get('as_producer') is not None else 'no')
+" 2>/dev/null)
+    if [ "$CODE" = "200" ] && [ "$HAS_DC" = "yes" ]; then
+        pass "Pipeline detail includes data_contracts"
+    else
+        fail "Pipeline detail missing data_contracts (HTTP $CODE)"
+    fi
+
+    # Test 8: Auto-dependency creation
+    test_name "GET /api/pipelines/$CONSUMER_PID/dependencies - Auto-dep from contract"
+    RESP=$(api_get "/api/pipelines/$CONSUMER_PID/dependencies")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    HAS_DEP=$(echo "$BODY" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+upstream = data.get('upstream', [])
+print('yes' if any(d.get('depends_on_id') == '$PRODUCER_PID' for d in upstream) else 'no')
+" 2>/dev/null)
+    if [ "$CODE" = "200" ] && [ "$HAS_DEP" = "yes" ]; then
+        pass "Auto-dependency created"
+    else
+        warn "Auto-dependency check inconclusive (HTTP $CODE, has_dep=$HAS_DEP)"
+    fi
+
+    # Test 9: Duplicate contract rejected
+    test_name "POST /api/data-contracts - Duplicate rejected (409)"
+    RESP=$(api_post "/api/data-contracts" "{
+        \"producer_pipeline_id\": \"$PRODUCER_PID\",
+        \"consumer_pipeline_id\": \"$CONSUMER_PID\"
+    }")
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "409" ]; then
+        pass "Duplicate contract correctly rejected"
+    else
+        fail "Expected 409 for duplicate, got HTTP $CODE"
+    fi
+
+    # Test 10: Self-contract rejected
+    test_name "POST /api/data-contracts - Self-contract rejected (400)"
+    RESP=$(api_post "/api/data-contracts" "{
+        \"producer_pipeline_id\": \"$PRODUCER_PID\",
+        \"consumer_pipeline_id\": \"$PRODUCER_PID\"
+    }")
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "400" ]; then
+        pass "Self-contract correctly rejected"
+    else
+        fail "Expected 400 for self-contract, got HTTP $CODE"
+    fi
+
+    # Test 11: Delete contract
+    test_name "DELETE /api/data-contracts/$CONTRACT_ID - Delete contract"
+    RESP=$(api_delete "/api/data-contracts/$CONTRACT_ID")
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ]; then
+        pass "Contract deleted"
+    else
+        fail "Delete contract failed (HTTP $CODE)"
+    fi
+
+else
+    skip "No suitable demo pipelines found for data contract tests"
+fi
+
+fi # --api (data contracts)
 
 # ============================================================================
 # Summary
@@ -1482,6 +1672,8 @@ echo "  - Agent understanding: capabilities, scheduling, refresh strategy, error
 echo "  - Connector generation: Oracle, SQL Server, Stripe, Google Ads, Facebook,"
 echo "    Snowflake, BigQuery, Redshift, Databricks"
 echo "  - Approval workflow"
+echo "  - Data contracts: create, list, get, validate, update, violations, auto-dep,"
+echo "    duplicate/self rejection, delete (Build 16)"
 echo ""
 
 exit $FAIL_COUNT

@@ -16,7 +16,7 @@ class Config:
 
         # Agent (Claude API)
         self.api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        self.model = os.getenv("AGENT_MODEL", "claude-sonnet-4-6")
+        self.model = os.getenv("AGENT_MODEL", "claude-opus-4-6")
 
         # Embeddings (optional — enables semantic preference search via pgvector)
         self.voyage_api_key = os.getenv("VOYAGE_API_KEY", "")

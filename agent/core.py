@@ -961,6 +961,21 @@ Respond with JSON:
                 "response_text": "Processing rejection...",
             }
 
+        # List connectors
+        if "connector" in text_lower and any(kw in text_lower for kw in (
+            "list", "show", "available", "what", "which", "all",
+        )):
+            conn_type = None
+            if "source" in text_lower:
+                conn_type = "source"
+            elif "target" in text_lower:
+                conn_type = "target"
+            return {
+                "action": "list_connectors",
+                "params": {"type": conn_type},
+                "response_text": "Listing connectors...",
+            }
+
         # Pause / resume
         if "pause" in text_lower:
             return {

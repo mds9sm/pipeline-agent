@@ -12,15 +12,49 @@ Format: Each entry records what changed, why, and test results at the time of th
 |-------|---------|--------|-----|
 | 14 | Hook template variables | **Done** | `{{watermark_after}}`, `{{run_id}}` etc. — unblocks consume-and-merge pattern |
 | 15 | Run context propagation | **Done** | Upstream run context (watermarks, batch IDs) flows to downstream pipelines |
-| 16 | Data contracts between pipelines | Pending | Formalize producer/consumer relationships, cleanup policies, retention |
+| 16 | Data contracts between pipelines | **Done** | Formalize producer/consumer relationships, cleanup policies, retention |
 | 17 | SQL-native intra-DB steps | Pending | Skip CSV extract for same-database pipelines (INSERT INTO...SELECT) |
-| 18 | Composable step DAG | Pending | Replace fixed extract→load→promote flow with configurable step graph |
+| 18 | Composable step DAG | Pending | Replace fixed extract→load→promote flow with configurable step graph (ingestion-focused, transforms deferred) |
 | 19 | DAG visualization UI | Pending | Visual pipeline dependency graph with execution status |
 | 20 | Agent topology reasoning | Pending | Agent designs multi-pipeline architectures from natural language |
 
 ---
 
 ## [Unreleased]
+
+### Build 16 - 2026-03-21 (Claude Opus 4.6)
+
+**Data Contracts Between Pipelines**
+
+#### Added
+- **`DataContract` dataclass** — Formalizes producer/consumer relationships with: `contract_id`, `producer_pipeline_id`, `consumer_pipeline_id`, `description`, `status`, `required_columns`, `freshness_sla_minutes` (default 60), `retention_hours` (default 168), `cleanup_ownership` (producer_ttl / consumer_acknowledges / none), violation tracking.
+- **`ContractViolation` dataclass** — Records individual contract violations with type (freshness_sla, schema_mismatch, retention_expired), detail, resolved state.
+- **3 new enums** — `CleanupOwnership`, `DataContractStatus` (active/violated/paused/archived), `ContractViolationType`.
+- **8 REST API endpoints**:
+  - `POST /api/data-contracts` — Create contract (validates pipelines exist, rejects self-contracts and duplicates, auto-creates dependency)
+  - `GET /api/data-contracts` — List with optional `?producer_id=`, `?consumer_id=`, `?status=` filters
+  - `GET /api/data-contracts/{id}` — Detail with recent violations and pipeline names
+  - `PATCH /api/data-contracts/{id}` — Update SLA, retention, required columns, status, cleanup ownership
+  - `DELETE /api/data-contracts/{id}` — Delete contract and its violations
+  - `POST /api/data-contracts/{id}/validate` — Manual validation (freshness SLA + required columns check)
+  - `GET /api/data-contracts/{id}/violations` — List violations with optional `?resolved=` filter
+  - `POST /api/data-contracts/{id}/violations/{vid}/resolve` — Mark violation resolved
+- **Monitor integration** — `_check_data_contracts()` runs every monitor tick (5m), validates all active contracts for freshness SLA and schema requirements, creates violations and alerts on failure.
+- **Cleanup guard** — `_check_cleanup_allowed()` in `PipelineRunner` blocks DELETE/TRUNCATE hooks when a data contract with `cleanup_ownership=consumer_acknowledges` exists and the consumer has no successful runs yet. Enforces "never delete unconsumed data" at the system level.
+- **Pipeline detail enrichment** — `GET /api/pipelines/{id}` now includes `data_contracts.as_producer` and `data_contracts.as_consumer` arrays.
+- **Auto-dependency** — Creating a data contract automatically creates a pipeline dependency (consumer depends on producer) if one doesn't already exist.
+- **DB tables** — `data_contracts` and `contract_violations` with indexes on producer, consumer, status, and unresolved violations.
+- **11 curl tests** — Create, list, get, validate, update, violations, pipeline detail enrichment, auto-dependency, duplicate/self rejection, delete.
+
+#### Scope Decision
+- dbt-like transforms and semantic layer features **deferred to later scope**. Current focus is ingestion (Fivetran) + orchestration (Airflow) + observability (Monte Carlo) only.
+
+#### Key Use Cases Unlocked
+- **Consume-and-merge safety**: Data contract with `cleanup_ownership=consumer_acknowledges` prevents the producer from deleting staged data until the consumer has processed it.
+- **Freshness SLA monitoring**: Consumer pipelines can declare how fresh they need the producer's data — the monitor automatically detects and alerts on SLA breaches.
+- **Schema expectations**: Consumer declares required columns — if the producer drops them (e.g. due to schema drift), the contract violation is caught before the consumer pipeline fails.
+
+---
 
 ### Build 15 - 2026-03-09 (Claude Opus 4.6)
 

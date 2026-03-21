@@ -28,6 +28,8 @@ from contracts.models import (
     User, TriggerType, ChangeType, DependencyType,
     DecisionLog, RefreshType, ReplicationMethod, LoadType, QualityConfig,
     SchemaChangePolicy, SCHEMA_POLICY_TIER_DEFAULTS, PostPromotionHook,
+    DataContract, ContractViolation,
+    DataContractStatus, CleanupOwnership, ContractViolationType,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -460,16 +462,28 @@ def create_app(
                 connectors = await store.list_connectors(
                     connector_type=conn_type, status="active"
                 )
+                conn_list = [
+                    {
+                        "name": c.connector_name,
+                        "type": c.connector_type.value,
+                        "database_type": c.source_target_type,
+                    }
+                    for c in connectors
+                ]
+                sources = [c for c in conn_list if c["type"] == "source"]
+                targets = [c for c in conn_list if c["type"] == "target"]
+                lines = [f"Found {len(connectors)} connector(s):\n"]
+                if sources:
+                    lines.append("**Sources:**")
+                    for c in sources:
+                        lines.append(f"  • {c['name']} ({c['database_type']})")
+                if targets:
+                    lines.append("**Targets:**")
+                    for c in targets:
+                        lines.append(f"  • {c['name']} ({c['database_type']})")
                 result_data = {
-                    "connectors": [
-                        {
-                            "name": c.connector_name,
-                            "type": c.connector_type.value,
-                            "database_type": c.source_target_type,
-                        }
-                        for c in connectors
-                    ],
-                    "fallback_text": f"Found {len(connectors)} connector(s).",
+                    "connectors": conn_list,
+                    "fallback_text": "\n".join(lines),
                 }
 
             elif action == "discover_tables":
@@ -2001,6 +2015,333 @@ def create_app(
         return {"status": "deleted"}
 
     # -----------------------------------------------------------------------
+    # Data contracts (Build 16)
+    # -----------------------------------------------------------------------
+
+    class CreateDataContractRequest(BaseModel):
+        producer_pipeline_id: str
+        consumer_pipeline_id: str
+        description: Optional[str] = ""
+        required_columns: Optional[list] = []
+        freshness_sla_minutes: Optional[int] = 60
+        retention_hours: Optional[int] = 168
+        cleanup_ownership: Optional[str] = "none"
+
+    class PatchDataContractRequest(BaseModel):
+        description: Optional[str] = None
+        required_columns: Optional[list] = None
+        freshness_sla_minutes: Optional[int] = None
+        retention_hours: Optional[int] = None
+        cleanup_ownership: Optional[str] = None
+        status: Optional[str] = None
+
+    @app.post("/api/data-contracts")
+    @limiter.limit("100/minute")
+    async def create_data_contract(
+        request: Request,
+        req: CreateDataContractRequest = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        # Validate pipelines exist
+        producer = await store.get_pipeline(req.producer_pipeline_id)
+        if not producer:
+            raise HTTPException(404, "Producer pipeline not found")
+        consumer = await store.get_pipeline(req.consumer_pipeline_id)
+        if not consumer:
+            raise HTTPException(404, "Consumer pipeline not found")
+        if req.producer_pipeline_id == req.consumer_pipeline_id:
+            raise HTTPException(400, "Producer and consumer cannot be the same pipeline")
+
+        # Check for duplicate
+        existing = await store.list_data_contracts(
+            producer_id=req.producer_pipeline_id,
+            consumer_id=req.consumer_pipeline_id,
+        )
+        if existing:
+            raise HTTPException(409, "Data contract already exists between these pipelines")
+
+        dc = DataContract(
+            producer_pipeline_id=req.producer_pipeline_id,
+            consumer_pipeline_id=req.consumer_pipeline_id,
+            description=req.description or "",
+            required_columns=req.required_columns or [],
+            freshness_sla_minutes=req.freshness_sla_minutes or 60,
+            retention_hours=req.retention_hours or 168,
+            cleanup_ownership=CleanupOwnership(req.cleanup_ownership.lower()) if req.cleanup_ownership else CleanupOwnership.NONE,
+        )
+        await store.save_data_contract(dc)
+
+        # Auto-create dependency (consumer depends on producer) if not exists
+        deps = await store.list_dependencies(req.consumer_pipeline_id)
+        has_dep = any(d.depends_on_id == req.producer_pipeline_id for d in deps)
+        if not has_dep:
+            dep = PipelineDependency(
+                pipeline_id=req.consumer_pipeline_id,
+                depends_on_id=req.producer_pipeline_id,
+                dependency_type=DependencyType.USER_DEFINED,
+                notes="auto-created by data contract",
+            )
+            await store.save_dependency(dep)
+
+        await store.save_decision(DecisionLog(
+            pipeline_id=req.producer_pipeline_id,
+            decision_type="data_contract_created",
+            detail=f"Contract with consumer {consumer.pipeline_name}",
+            reasoning=req.description or "",
+        ))
+
+        return {
+            "contract_id": dc.contract_id,
+            "producer_pipeline_id": dc.producer_pipeline_id,
+            "consumer_pipeline_id": dc.consumer_pipeline_id,
+            "status": dc.status.value,
+        }
+
+    @app.get("/api/data-contracts")
+    @limiter.limit("100/minute")
+    async def list_data_contracts(
+        request: Request,
+        producer_id: Optional[str] = None,
+        consumer_id: Optional[str] = None,
+        status: Optional[str] = None,
+        caller: dict = Depends(auth_dep),
+    ):
+        contracts = await store.list_data_contracts(
+            producer_id=producer_id,
+            consumer_id=consumer_id,
+            status=status,
+        )
+        return {
+            "contracts": [
+                {
+                    "contract_id": c.contract_id,
+                    "producer_pipeline_id": c.producer_pipeline_id,
+                    "consumer_pipeline_id": c.consumer_pipeline_id,
+                    "description": c.description,
+                    "status": c.status.value if hasattr(c.status, "value") else c.status,
+                    "freshness_sla_minutes": c.freshness_sla_minutes,
+                    "retention_hours": c.retention_hours,
+                    "cleanup_ownership": c.cleanup_ownership.value if hasattr(c.cleanup_ownership, "value") else c.cleanup_ownership,
+                    "required_columns": c.required_columns,
+                    "violation_count": c.violation_count,
+                    "last_validated_at": c.last_validated_at,
+                    "created_at": c.created_at,
+                }
+                for c in contracts
+            ],
+            "total": len(contracts),
+        }
+
+    @app.get("/api/data-contracts/{contract_id}")
+    @limiter.limit("100/minute")
+    async def get_data_contract(
+        request: Request,
+        contract_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        dc = await store.get_data_contract(contract_id)
+        if not dc:
+            raise HTTPException(404, "Data contract not found")
+        violations = await store.list_contract_violations(contract_id)
+        producer = await store.get_pipeline(dc.producer_pipeline_id)
+        consumer = await store.get_pipeline(dc.consumer_pipeline_id)
+        return {
+            "contract_id": dc.contract_id,
+            "producer_pipeline_id": dc.producer_pipeline_id,
+            "producer_pipeline_name": producer.pipeline_name if producer else None,
+            "consumer_pipeline_id": dc.consumer_pipeline_id,
+            "consumer_pipeline_name": consumer.pipeline_name if consumer else None,
+            "description": dc.description,
+            "status": dc.status.value if hasattr(dc.status, "value") else dc.status,
+            "required_columns": dc.required_columns,
+            "freshness_sla_minutes": dc.freshness_sla_minutes,
+            "retention_hours": dc.retention_hours,
+            "cleanup_ownership": dc.cleanup_ownership.value if hasattr(dc.cleanup_ownership, "value") else dc.cleanup_ownership,
+            "violation_count": dc.violation_count,
+            "last_validated_at": dc.last_validated_at,
+            "last_violation_at": dc.last_violation_at,
+            "created_at": dc.created_at,
+            "updated_at": dc.updated_at,
+            "recent_violations": [
+                {
+                    "violation_id": v.violation_id,
+                    "violation_type": v.violation_type.value if hasattr(v.violation_type, "value") else v.violation_type,
+                    "detail": v.detail,
+                    "resolved": v.resolved,
+                    "created_at": v.created_at,
+                }
+                for v in violations[:20]
+            ],
+        }
+
+    @app.patch("/api/data-contracts/{contract_id}")
+    @limiter.limit("100/minute")
+    async def patch_data_contract(
+        request: Request,
+        contract_id: str,
+        req: PatchDataContractRequest = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        dc = await store.get_data_contract(contract_id)
+        if not dc:
+            raise HTTPException(404, "Data contract not found")
+        if req.description is not None:
+            dc.description = req.description
+        if req.required_columns is not None:
+            dc.required_columns = req.required_columns
+        if req.freshness_sla_minutes is not None:
+            dc.freshness_sla_minutes = req.freshness_sla_minutes
+        if req.retention_hours is not None:
+            dc.retention_hours = req.retention_hours
+        if req.cleanup_ownership is not None:
+            dc.cleanup_ownership = CleanupOwnership(req.cleanup_ownership.lower())
+        if req.status is not None:
+            dc.status = DataContractStatus(req.status.lower())
+        await store.save_data_contract(dc)
+        return {"contract_id": dc.contract_id, "status": dc.status.value}
+
+    @app.delete("/api/data-contracts/{contract_id}")
+    @limiter.limit("100/minute")
+    async def delete_data_contract(
+        request: Request,
+        contract_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        dc = await store.get_data_contract(contract_id)
+        if not dc:
+            raise HTTPException(404, "Data contract not found")
+        await store.delete_data_contract(contract_id)
+        return {"status": "deleted"}
+
+    @app.post("/api/data-contracts/{contract_id}/validate")
+    @limiter.limit("30/minute")
+    async def validate_data_contract(
+        request: Request,
+        contract_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        dc = await store.get_data_contract(contract_id)
+        if not dc:
+            raise HTTPException(404, "Data contract not found")
+
+        violations = []
+
+        # Freshness SLA check
+        last_run = await store.get_last_successful_run(dc.producer_pipeline_id)
+        now = datetime.now(timezone.utc)
+        if last_run and last_run.completed_at:
+            completed = datetime.fromisoformat(last_run.completed_at).replace(tzinfo=timezone.utc)
+            staleness_minutes = (now - completed).total_seconds() / 60
+            if staleness_minutes > dc.freshness_sla_minutes:
+                v = ContractViolation(
+                    contract_id=dc.contract_id,
+                    violation_type=ContractViolationType.FRESHNESS_SLA,
+                    detail=f"Producer data is {staleness_minutes:.0f}m old, SLA is {dc.freshness_sla_minutes}m",
+                    producer_pipeline_id=dc.producer_pipeline_id,
+                    consumer_pipeline_id=dc.consumer_pipeline_id,
+                )
+                violations.append(v)
+        elif not last_run:
+            v = ContractViolation(
+                contract_id=dc.contract_id,
+                violation_type=ContractViolationType.FRESHNESS_SLA,
+                detail="Producer has no successful runs",
+                producer_pipeline_id=dc.producer_pipeline_id,
+                consumer_pipeline_id=dc.consumer_pipeline_id,
+            )
+            violations.append(v)
+
+        # Required columns check
+        if dc.required_columns:
+            producer = await store.get_pipeline(dc.producer_pipeline_id)
+            if producer and producer.column_mappings:
+                target_columns = {m.target_column for m in producer.column_mappings}
+                missing = [c for c in dc.required_columns if c not in target_columns]
+                if missing:
+                    v = ContractViolation(
+                        contract_id=dc.contract_id,
+                        violation_type=ContractViolationType.SCHEMA_MISMATCH,
+                        detail=f"Missing required columns: {', '.join(missing)}",
+                        producer_pipeline_id=dc.producer_pipeline_id,
+                        consumer_pipeline_id=dc.consumer_pipeline_id,
+                    )
+                    violations.append(v)
+
+        # Record violations
+        for v in violations:
+            await store.save_contract_violation(v)
+
+        dc.last_validated_at = now_iso()
+        if violations:
+            dc.status = DataContractStatus.VIOLATED
+            dc.last_violation_at = now_iso()
+            dc.violation_count += len(violations)
+        else:
+            dc.status = DataContractStatus.ACTIVE
+        await store.save_data_contract(dc)
+
+        return {
+            "contract_id": dc.contract_id,
+            "status": dc.status.value,
+            "violations_found": len(violations),
+            "violations": [
+                {
+                    "violation_type": v.violation_type.value,
+                    "detail": v.detail,
+                }
+                for v in violations
+            ],
+        }
+
+    @app.get("/api/data-contracts/{contract_id}/violations")
+    @limiter.limit("100/minute")
+    async def list_data_contract_violations(
+        request: Request,
+        contract_id: str,
+        resolved: Optional[bool] = None,
+        caller: dict = Depends(auth_dep),
+    ):
+        dc = await store.get_data_contract(contract_id)
+        if not dc:
+            raise HTTPException(404, "Data contract not found")
+        violations = await store.list_contract_violations(contract_id, resolved=resolved)
+        return {
+            "violations": [
+                {
+                    "violation_id": v.violation_id,
+                    "violation_type": v.violation_type.value if hasattr(v.violation_type, "value") else v.violation_type,
+                    "detail": v.detail,
+                    "producer_pipeline_id": v.producer_pipeline_id,
+                    "consumer_pipeline_id": v.consumer_pipeline_id,
+                    "resolved": v.resolved,
+                    "resolved_at": v.resolved_at,
+                    "created_at": v.created_at,
+                }
+                for v in violations
+            ],
+            "total": len(violations),
+        }
+
+    @app.post("/api/data-contracts/{contract_id}/violations/{violation_id}/resolve")
+    @limiter.limit("100/minute")
+    async def resolve_data_contract_violation(
+        request: Request,
+        contract_id: str,
+        violation_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        dc = await store.get_data_contract(contract_id)
+        if not dc:
+            raise HTTPException(404, "Data contract not found")
+        await store.resolve_contract_violation(violation_id)
+        return {"status": "resolved"}
+
+    # -----------------------------------------------------------------------
     # Pipeline metadata (Build 11 - XCom-style)
     # -----------------------------------------------------------------------
 
@@ -2631,6 +2972,32 @@ async def _pipeline_detail(p, store: Store) -> dict:
     hook_metadata = await store.list_metadata(p.pipeline_id, namespace="hooks")
     d["hook_results"] = {
         m.key: m.value_json for m in hook_metadata
+    }
+
+    # Data contracts (Build 16)
+    produced = await store.list_data_contracts(producer_id=p.pipeline_id)
+    consumed = await store.list_data_contracts(consumer_id=p.pipeline_id)
+    d["data_contracts"] = {
+        "as_producer": [
+            {
+                "contract_id": c.contract_id,
+                "consumer_pipeline_id": c.consumer_pipeline_id,
+                "status": c.status.value if hasattr(c.status, "value") else c.status,
+                "freshness_sla_minutes": c.freshness_sla_minutes,
+                "violation_count": c.violation_count,
+            }
+            for c in produced
+        ],
+        "as_consumer": [
+            {
+                "contract_id": c.contract_id,
+                "producer_pipeline_id": c.producer_pipeline_id,
+                "status": c.status.value if hasattr(c.status, "value") else c.status,
+                "freshness_sla_minutes": c.freshness_sla_minutes,
+                "violation_count": c.violation_count,
+            }
+            for c in consumed
+        ],
     }
 
     return d

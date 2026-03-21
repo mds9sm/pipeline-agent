@@ -17,11 +17,13 @@ from contracts.models import (
     AlertRecord, DecisionLog, AgentPreference, ConnectorRecord,
     ErrorBudget, ColumnLineage, AgentCostLog, ConnectorMigration, User,
     PipelineMetadata, SchemaChangePolicy, PostPromotionHook,
+    DataContract, ContractViolation,
     ColumnMapping, QualityConfig, CheckResult,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
     ChangeType, ConnectorStatus, ConnectorType, TestStatus, AlertSeverity,
     FreshnessStatus, DependencyType, PreferenceScope, PreferenceSource,
+    DataContractStatus, CleanupOwnership, ContractViolationType,
     now_iso, new_id,
 )
 
@@ -495,6 +497,118 @@ class ContractStore:
             "SELECT * FROM dependencies WHERE depends_on_id = $1", depends_on_id
         )
         return [_row_to_dependency(r) for r in rows]
+
+    # ==================================================================
+    # Data contracts (Build 16)
+    # ==================================================================
+
+    async def save_data_contract(self, c: DataContract) -> None:
+        c.updated_at = now_iso()
+        await self.pool.execute("""
+            INSERT INTO data_contracts (
+                contract_id, producer_pipeline_id, consumer_pipeline_id,
+                description, status, required_columns,
+                freshness_sla_minutes, retention_hours, cleanup_ownership,
+                last_validated_at, last_violation_at, violation_count,
+                created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            ON CONFLICT (contract_id) DO UPDATE SET
+                description=EXCLUDED.description,
+                status=EXCLUDED.status,
+                required_columns=EXCLUDED.required_columns,
+                freshness_sla_minutes=EXCLUDED.freshness_sla_minutes,
+                retention_hours=EXCLUDED.retention_hours,
+                cleanup_ownership=EXCLUDED.cleanup_ownership,
+                last_validated_at=EXCLUDED.last_validated_at,
+                last_violation_at=EXCLUDED.last_violation_at,
+                violation_count=EXCLUDED.violation_count,
+                updated_at=EXCLUDED.updated_at
+        """,
+            c.contract_id, c.producer_pipeline_id, c.consumer_pipeline_id,
+            c.description,
+            c.status.value if hasattr(c.status, "value") else c.status,
+            json.dumps(c.required_columns),
+            c.freshness_sla_minutes, c.retention_hours,
+            c.cleanup_ownership.value if hasattr(c.cleanup_ownership, "value") else c.cleanup_ownership,
+            c.last_validated_at, c.last_violation_at, c.violation_count,
+            c.created_at, c.updated_at,
+        )
+
+    async def get_data_contract(self, contract_id: str) -> Optional[DataContract]:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM data_contracts WHERE contract_id = $1", contract_id
+        )
+        return _row_to_data_contract(row) if row else None
+
+    async def list_data_contracts(
+        self,
+        producer_id: Optional[str] = None,
+        consumer_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[DataContract]:
+        sql = "SELECT * FROM data_contracts WHERE TRUE"
+        params: list = []
+        idx = 0
+        if producer_id:
+            idx += 1
+            sql += f" AND producer_pipeline_id = ${idx}"
+            params.append(producer_id)
+        if consumer_id:
+            idx += 1
+            sql += f" AND consumer_pipeline_id = ${idx}"
+            params.append(consumer_id)
+        if status:
+            idx += 1
+            sql += f" AND status = ${idx}"
+            params.append(status)
+        sql += " ORDER BY created_at DESC"
+        rows = await self.pool.fetch(sql, *params)
+        return [_row_to_data_contract(r) for r in rows]
+
+    async def delete_data_contract(self, contract_id: str) -> None:
+        await self.pool.execute(
+            "DELETE FROM contract_violations WHERE contract_id = $1", contract_id
+        )
+        await self.pool.execute(
+            "DELETE FROM data_contracts WHERE contract_id = $1", contract_id
+        )
+
+    async def save_contract_violation(self, v: ContractViolation) -> None:
+        await self.pool.execute("""
+            INSERT INTO contract_violations (
+                violation_id, contract_id, violation_type, detail,
+                producer_pipeline_id, consumer_pipeline_id,
+                resolved, resolved_at, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ON CONFLICT (violation_id) DO UPDATE SET
+                resolved=EXCLUDED.resolved,
+                resolved_at=EXCLUDED.resolved_at
+        """,
+            v.violation_id, v.contract_id,
+            v.violation_type.value if hasattr(v.violation_type, "value") else v.violation_type,
+            v.detail, v.producer_pipeline_id, v.consumer_pipeline_id,
+            v.resolved, v.resolved_at, v.created_at,
+        )
+
+    async def list_contract_violations(
+        self,
+        contract_id: str,
+        resolved: Optional[bool] = None,
+    ) -> list[ContractViolation]:
+        sql = "SELECT * FROM contract_violations WHERE contract_id = $1"
+        params: list = [contract_id]
+        if resolved is not None:
+            sql += " AND resolved = $2"
+            params.append(resolved)
+        sql += " ORDER BY created_at DESC"
+        rows = await self.pool.fetch(sql, *params)
+        return [_row_to_contract_violation(r) for r in rows]
+
+    async def resolve_contract_violation(self, violation_id: str) -> None:
+        await self.pool.execute("""
+            UPDATE contract_violations SET resolved = TRUE, resolved_at = $2
+            WHERE violation_id = $1
+        """, violation_id, now_iso())
 
     # ==================================================================
     # Pipeline metadata (XCom-style key-value store)
@@ -1320,6 +1434,39 @@ def _row_to_user(row: asyncpg.Record) -> User:
     )
 
 
+def _row_to_data_contract(row: asyncpg.Record) -> DataContract:
+    return DataContract(
+        contract_id=row["contract_id"],
+        producer_pipeline_id=row["producer_pipeline_id"],
+        consumer_pipeline_id=row["consumer_pipeline_id"],
+        description=row["description"],
+        status=DataContractStatus(row["status"]),
+        required_columns=json.loads(row["required_columns"]) if isinstance(row["required_columns"], str) else (row["required_columns"] or []),
+        freshness_sla_minutes=row["freshness_sla_minutes"],
+        retention_hours=row["retention_hours"],
+        cleanup_ownership=CleanupOwnership(row["cleanup_ownership"]),
+        last_validated_at=row["last_validated_at"],
+        last_violation_at=row["last_violation_at"],
+        violation_count=row["violation_count"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_contract_violation(row: asyncpg.Record) -> ContractViolation:
+    return ContractViolation(
+        violation_id=row["violation_id"],
+        contract_id=row["contract_id"],
+        violation_type=ContractViolationType(row["violation_type"]),
+        detail=row["detail"],
+        producer_pipeline_id=row["producer_pipeline_id"],
+        consumer_pipeline_id=row["consumer_pipeline_id"],
+        resolved=row["resolved"],
+        resolved_at=row["resolved_at"],
+        created_at=row["created_at"],
+    )
+
+
 # ======================================================================
 # DDL for create_tables() -- dev/test convenience
 # ======================================================================
@@ -1614,6 +1761,35 @@ CREATE TABLE IF NOT EXISTS pipeline_metadata (
     created_by_run_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS data_contracts (
+    contract_id TEXT PRIMARY KEY,
+    producer_pipeline_id TEXT NOT NULL REFERENCES pipelines(pipeline_id),
+    consumer_pipeline_id TEXT NOT NULL REFERENCES pipelines(pipeline_id),
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    required_columns JSONB NOT NULL DEFAULT '[]',
+    freshness_sla_minutes INTEGER NOT NULL DEFAULT 60,
+    retention_hours INTEGER NOT NULL DEFAULT 168,
+    cleanup_ownership TEXT NOT NULL DEFAULT 'none',
+    last_validated_at TEXT,
+    last_violation_at TEXT,
+    violation_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contract_violations (
+    violation_id TEXT PRIMARY KEY,
+    contract_id TEXT NOT NULL REFERENCES data_contracts(contract_id),
+    violation_type TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    producer_pipeline_id TEXT NOT NULL,
+    consumer_pipeline_id TEXT NOT NULL,
+    resolved BOOLEAN NOT NULL DEFAULT FALSE,
+    resolved_at TEXT,
+    created_at TEXT NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON runs(pipeline_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
@@ -1639,6 +1815,11 @@ CREATE INDEX IF NOT EXISTS idx_connector_migrations_connector ON connector_migra
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_pipeline_ns_key ON pipeline_metadata(pipeline_id, namespace, key);
 CREATE INDEX IF NOT EXISTS idx_metadata_pipeline ON pipeline_metadata(pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_data_contracts_producer ON data_contracts(producer_pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_data_contracts_consumer ON data_contracts(consumer_pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_data_contracts_status ON data_contracts(status);
+CREATE INDEX IF NOT EXISTS idx_contract_violations_contract ON contract_violations(contract_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_contract_violations_unresolved ON contract_violations(resolved) WHERE resolved = FALSE;
 """
 
 _ALTER_TABLES_SQL = """
@@ -1649,6 +1830,7 @@ ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS post_promotion_hooks JSONB NOT NU
 -- Build 15: Run context propagation
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS triggered_by_run_id TEXT;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS triggered_by_pipeline_id TEXT;
+-- Build 16: Data contracts (tables created via CREATE IF NOT EXISTS; no ALTER needed)
 """
 
 # Alias used by several modules (agent, scheduler, monitor, api).
