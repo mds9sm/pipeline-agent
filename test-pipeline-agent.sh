@@ -1868,6 +1868,361 @@ fi
 fi # --api (Build 21)
 
 # ============================================================================
+# GitOps API (Build 23)
+# ============================================================================
+
+if should_run "api"; then
+
+section "GitOps API (Build 23)"
+
+# Test 1: GitOps status
+test_name "GET /api/gitops/status"
+RESP=$(api_get "/api/gitops/status")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_ENABLED=$(echo "$BODY" | python3 -c "import sys,json; print('yes' if 'enabled' in json.load(sys.stdin) else 'no')" 2>/dev/null)
+    if [ "$HAS_ENABLED" = "yes" ]; then
+        pass "GitOps status returned (enabled field present)"
+    else
+        warn "GitOps status returned 200 but missing enabled field"
+    fi
+else
+    fail "GitOps status returned HTTP $CODE"
+fi
+
+# Test 2: GitOps log
+test_name "GET /api/gitops/log"
+RESP=$(api_get "/api/gitops/log")
+CODE=$(echo "$RESP" | tail -1)
+if [ "$CODE" = "200" ]; then
+    pass "GitOps log returned 200"
+else
+    fail "GitOps log returned HTTP $CODE"
+fi
+
+# Test 3: GitOps diff
+test_name "GET /api/gitops/diff"
+RESP=$(api_get "/api/gitops/diff")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_DIFF=$(echo "$BODY" | python3 -c "import sys,json; print('yes' if 'diff' in json.load(sys.stdin) else 'no')" 2>/dev/null)
+    if [ "$HAS_DIFF" = "yes" ]; then
+        pass "GitOps diff returned with diff field"
+    else
+        warn "GitOps diff returned 200 but missing diff field"
+    fi
+else
+    fail "GitOps diff returned HTTP $CODE"
+fi
+
+# Test 4: GitOps pipeline history (uses PIPELINE_ID from earlier)
+test_name "GET /api/gitops/pipelines/{id}/history"
+if [ -n "$PIPELINE_ID" ]; then
+    RESP=$(api_get "/api/gitops/pipelines/$PIPELINE_ID/history")
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ]; then
+        pass "GitOps pipeline history returned 200"
+    else
+        fail "GitOps pipeline history returned HTTP $CODE"
+    fi
+else
+    skip "No pipeline ID available"
+fi
+
+# Test 5: GitOps restore dry-run
+test_name "POST /api/gitops/restore?dry_run=true"
+RESP=$(curl -s -m 60 -w "\n%{http_code}" -X POST "$API_URL/api/gitops/restore?dry_run=true" \
+    ${AUTH_HEADER:+-H "$AUTH_HEADER"} 2>/dev/null)
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    IS_DRY=$(echo "$BODY" | python3 -c "import sys,json; print('yes' if json.load(sys.stdin).get('dry_run') else 'no')" 2>/dev/null)
+    FOUND=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('pipelines_found',0))" 2>/dev/null)
+    if [ "$IS_DRY" = "yes" ]; then
+        pass "GitOps restore dry-run returned 200 (pipelines_found: $FOUND)"
+    else
+        warn "GitOps restore returned 200 but dry_run not set"
+    fi
+elif [ "$CODE" = "404" ]; then
+    pass "GitOps restore: not enabled (expected when PIPELINE_REPO_PATH not set)"
+else
+    fail "GitOps restore returned HTTP $CODE"
+fi
+
+fi # --api (Build 23)
+
+# ============================================================================
+# Step DAG API (Build 18)
+# ============================================================================
+
+if should_run "api"; then
+
+section "Step DAG API (Build 18)"
+
+# We need a pipeline_id for testing — use the first pipeline available
+STEP_TEST_PID=$(api_get "/api/pipelines" | sed '$d' | python3 -c "import sys,json; ps=json.load(sys.stdin); print(ps[0]['pipeline_id'] if ps else '')" 2>/dev/null)
+
+if [ -n "$STEP_TEST_PID" ]; then
+
+# Test 1: Get pipeline steps (should be empty for legacy pipelines)
+test_name "GET /api/pipelines/{id}/steps"
+RESP=$(api_get "/api/pipelines/$STEP_TEST_PID/steps")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_STEPS=$(echo "$BODY" | python3 -c "import sys,json; print('yes' if 'steps' in json.load(sys.stdin) else 'no')" 2>/dev/null)
+    if [ "$HAS_STEPS" = "yes" ]; then
+        pass "Pipeline steps endpoint returns steps array"
+    else
+        fail "Pipeline steps endpoint missing 'steps' field"
+    fi
+else
+    fail "Pipeline steps returned HTTP $CODE"
+fi
+
+# Test 2: Validate step DAG (valid linear chain)
+test_name "POST /api/pipelines/{id}/steps/validate (valid DAG)"
+VALID_STEPS='[
+  {"step_id":"s1","step_name":"extract","step_type":"extract","depends_on":[]},
+  {"step_id":"s2","step_name":"gate","step_type":"quality_gate","depends_on":["s1"]},
+  {"step_id":"s3","step_name":"promote","step_type":"promote","depends_on":["s2"]}
+]'
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/pipelines/$STEP_TEST_PID/steps/validate" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "$VALID_STEPS")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    IS_VALID=$(echo "$BODY" | python3 -c "import sys,json; print('yes' if json.load(sys.stdin).get('valid') else 'no')" 2>/dev/null)
+    if [ "$IS_VALID" = "yes" ]; then
+        pass "Valid step DAG validated successfully"
+    else
+        fail "Valid step DAG reported as invalid"
+    fi
+else
+    fail "Step validate returned HTTP $CODE"
+fi
+
+# Test 3: Validate step DAG (cycle detection)
+test_name "POST /api/pipelines/{id}/steps/validate (cycle detection)"
+CYCLE_STEPS='[
+  {"step_id":"a","step_name":"A","step_type":"extract","depends_on":["b"]},
+  {"step_id":"b","step_name":"B","step_type":"promote","depends_on":["a"]}
+]'
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/pipelines/$STEP_TEST_PID/steps/validate" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "$CYCLE_STEPS")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    IS_VALID=$(echo "$BODY" | python3 -c "import sys,json; print('yes' if json.load(sys.stdin).get('valid') else 'no')" 2>/dev/null)
+    if [ "$IS_VALID" = "no" ]; then
+        pass "Cycle detected in step DAG"
+    else
+        fail "Cycle not detected in step DAG"
+    fi
+else
+    fail "Step validate (cycle) returned HTTP $CODE"
+fi
+
+# Test 4: Preview step execution (legacy pipeline — no steps)
+test_name "GET /api/pipelines/{id}/steps/preview"
+RESP=$(api_get "/api/pipelines/$STEP_TEST_PID/steps/preview")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    MODE=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mode',''))" 2>/dev/null)
+    if [ "$MODE" = "legacy" ] || [ "$MODE" = "step_dag" ]; then
+        pass "Step preview returns mode=$MODE"
+    else
+        fail "Step preview missing mode field"
+    fi
+else
+    fail "Step preview returned HTTP $CODE"
+fi
+
+# Test 5: PATCH pipeline with steps
+test_name "PATCH /api/pipelines/{id} with steps"
+PATCH_STEPS='{"steps":[{"step_name":"extract","step_type":"extract"},{"step_name":"promote","step_type":"promote","depends_on":[]}],"reason":"Build 18 test"}'
+RESP=$(curl -s -w "\n%{http_code}" -X PATCH "$BASE_URL/api/pipelines/$STEP_TEST_PID" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "$PATCH_STEPS")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    STEP_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('steps',[])))" 2>/dev/null)
+    if [ "$STEP_COUNT" = "2" ]; then
+        pass "Pipeline updated with 2 steps"
+    else
+        warn "Pipeline updated but step_count=$STEP_COUNT (expected 2)"
+    fi
+else
+    fail "PATCH with steps returned HTTP $CODE"
+fi
+
+# Revert: clear steps back to legacy mode
+curl -s -X PATCH "$BASE_URL/api/pipelines/$STEP_TEST_PID" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"steps":[],"reason":"Revert to legacy"}' > /dev/null 2>&1
+
+else
+    skip "No pipelines found for step DAG tests"
+fi
+
+fi # --api (Build 18)
+
+# ============================================================================
+# Agent Diagnostic & Reasoning (Build 24)
+# ============================================================================
+
+if should_run "api"; then
+
+section "Agent Diagnostic & Reasoning (Build 24)"
+
+# Get a pipeline for testing
+DIAG_PID=$(api_get "/api/pipelines" | sed '$d' | python3 -c "import sys,json; ps=json.load(sys.stdin); print(ps[0]['pipeline_id'] if ps else '')" 2>/dev/null)
+
+if [ -n "$DIAG_PID" ]; then
+
+# Test 1: Diagnose pipeline
+test_name "POST /api/pipelines/{id}/diagnose"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/pipelines/$DIAG_PID/diagnose" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_ROOT=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'root_cause' in d and 'category' in d else 'no')" 2>/dev/null)
+    if [ "$HAS_ROOT" = "yes" ]; then
+        CAT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('category',''))" 2>/dev/null)
+        pass "Pipeline diagnosed: category=$CAT"
+    else
+        fail "Diagnose response missing root_cause or category"
+    fi
+else
+    fail "Diagnose returned HTTP $CODE"
+fi
+
+# Test 2: Diagnose unknown pipeline (404)
+test_name "POST /api/pipelines/nonexistent/diagnose (404)"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/pipelines/nonexistent-id/diagnose" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+CODE=$(echo "$RESP" | tail -1)
+if [ "$CODE" = "404" ]; then
+    pass "Diagnose returns 404 for unknown pipeline"
+else
+    fail "Diagnose unknown pipeline returned HTTP $CODE (expected 404)"
+fi
+
+# Test 3: Impact analysis
+test_name "POST /api/pipelines/{id}/impact"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/pipelines/$DIAG_PID/impact" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_SEV=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'impact_severity' in d and 'blast_radius' in d else 'no')" 2>/dev/null)
+    if [ "$HAS_SEV" = "yes" ]; then
+        SEV=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('impact_severity',''))" 2>/dev/null)
+        pass "Impact analysis: severity=$SEV"
+    else
+        fail "Impact response missing impact_severity or blast_radius"
+    fi
+else
+    fail "Impact returned HTTP $CODE"
+fi
+
+# Test 4: Impact unknown pipeline (404)
+test_name "POST /api/pipelines/nonexistent/impact (404)"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/pipelines/nonexistent-id/impact" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+CODE=$(echo "$RESP" | tail -1)
+if [ "$CODE" = "404" ]; then
+    pass "Impact returns 404 for unknown pipeline"
+else
+    fail "Impact unknown pipeline returned HTTP $CODE (expected 404)"
+fi
+
+# Test 5: Platform anomalies
+test_name "GET /api/observability/anomalies"
+RESP=$(api_get "/api/observability/anomalies")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_HEALTH=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'platform_health' in d and 'anomalies' in d else 'no')" 2>/dev/null)
+    if [ "$HAS_HEALTH" = "yes" ]; then
+        HEALTH=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('platform_health',''))" 2>/dev/null)
+        ANOM_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('anomalies',[])))" 2>/dev/null)
+        pass "Platform anomalies: health=$HEALTH, anomalies=$ANOM_COUNT"
+    else
+        fail "Anomalies response missing platform_health or anomalies"
+    fi
+else
+    fail "Anomalies returned HTTP $CODE"
+fi
+
+# Test 6: Chat routing — diagnose
+test_name "Chat: 'why is demo-stripe-charges failing' routes to diagnose"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/command" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"text":"why is demo-stripe-charges failing"}')
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    ACTION=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action',''))" 2>/dev/null)
+    if [ "$ACTION" = "diagnose_pipeline" ]; then
+        pass "Chat routes 'why is X failing' to diagnose_pipeline"
+    else
+        warn "Chat routed to '$ACTION' instead of diagnose_pipeline (may vary by LLM)"
+    fi
+else
+    fail "Chat diagnose returned HTTP $CODE"
+fi
+
+# Test 7: Chat routing — impact
+test_name "Chat: 'what breaks if demo-ecommerce-orders goes down' routes to impact"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/command" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"text":"what breaks if demo-ecommerce-orders goes down"}')
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    ACTION=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action',''))" 2>/dev/null)
+    if [ "$ACTION" = "analyze_impact" ]; then
+        pass "Chat routes 'what breaks if' to analyze_impact"
+    else
+        warn "Chat routed to '$ACTION' instead of analyze_impact (may vary by LLM)"
+    fi
+else
+    fail "Chat impact returned HTTP $CODE"
+fi
+
+# Test 8: Chat routing — anomalies
+test_name "Chat: 'are there any anomalies' routes to check_anomalies"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/command" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"text":"are there any anomalies across the platform"}')
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    ACTION=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action',''))" 2>/dev/null)
+    if [ "$ACTION" = "check_anomalies" ]; then
+        pass "Chat routes anomaly question to check_anomalies"
+    else
+        warn "Chat routed to '$ACTION' instead of check_anomalies (may vary by LLM)"
+    fi
+else
+    fail "Chat anomalies returned HTTP $CODE"
+fi
+
+else
+    skip "No pipelines found for diagnostic tests"
+fi
+
+fi # --api (Build 24)
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -1927,6 +2282,9 @@ echo "    duplicate/self rejection, delete (Build 16)"
 echo "  - DAG visualization: graph endpoint, node structure, contract fields (Build 19)"
 echo "  - Topology reasoning: design endpoint, chat routing (Build 20)"
 echo "  - Source registry: register, list, get, update, discover, delete (Build 21)"
+echo "  - Step DAG: steps definition, validate, cycle detection, preview, PATCH update (Build 18)"
+echo "  - Agent diagnostics: diagnose, impact, anomalies, chat routing (Build 24)"
+echo "  - GitOps API: status, log, diff, pipeline history, restore dry-run (Build 23)"
 echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21)"
 echo "  - Interaction audit: list, export (Build 21)"
 echo ""

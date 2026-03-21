@@ -32,6 +32,7 @@ from contracts.models import (
     DataContract, ContractViolation,
     DataContractStatus, CleanupOwnership, ContractViolationType,
     PipelineChangeLog, PipelineChangeType, RegisteredSource,
+    StepDefinition, StepType,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -152,6 +153,7 @@ class CreatePipelineRequest(BaseModel):
     environment: str = "production"
     column_mappings: Optional[list[dict]] = None
     auto_approve_additive: bool = False
+    steps: Optional[list[dict]] = None
 
 
 class BatchCreateRequest(BaseModel):
@@ -186,6 +188,8 @@ class UpdatePipelineRequest(BaseModel):
     schema_change_policy: Optional[dict] = None
     # Post-promotion hooks (Build 13)
     post_promotion_hooks: Optional[list[dict]] = None
+    # Steps (Build 18)
+    steps: Optional[list[dict]] = None
     # Audit
     reason: Optional[str] = None
 
@@ -252,6 +256,7 @@ def create_app(
     runner: PipelineRunner,
     scheduler: Scheduler,
     monitor: MonitorEngine,
+    gitops=None,
 ) -> FastAPI:
     """Create and configure the FastAPI application with all routes."""
 
@@ -1013,6 +1018,70 @@ def create_app(
                     "fallback_text": "\n".join(lines) if lines else "Could not generate topology.",
                 }
 
+            # Build 24: Diagnostic & Reasoning actions
+            elif action == "diagnose_pipeline":
+                # Resolve pipeline by name/id from params or user text
+                query = params.get("pipeline_name", params.get("pipeline_id", params.get("query", req.text)))
+                target_p = await _resolve_pipeline(query, store)
+                if target_p:
+                    diagnosis = await agent.diagnose_pipeline(target_p.pipeline_id)
+                    lines = [f"**Diagnosis for {target_p.pipeline_name}:**"]
+                    lines.append(f"**Root cause:** {diagnosis.get('root_cause', 'Unknown')}")
+                    lines.append(f"**Category:** {diagnosis.get('category', 'unknown')}")
+                    if diagnosis.get("evidence"):
+                        lines.append("**Evidence:**")
+                        for ev in diagnosis["evidence"][:5]:
+                            lines.append(f"  - {ev}")
+                    if diagnosis.get("recommended_actions"):
+                        lines.append("**Recommended actions:**")
+                        for ra in diagnosis["recommended_actions"][:3]:
+                            lines.append(f"  - [{ra.get('priority', '?')}] {ra.get('action', '')}")
+                    if diagnosis.get("summary"):
+                        lines.append(f"\n{diagnosis['summary']}")
+                    result_data = {"diagnosis": diagnosis, "fallback_text": "\n".join(lines)}
+                else:
+                    result_data = {"fallback_text": "Could not identify which pipeline to diagnose. Please specify the pipeline name."}
+
+            elif action == "analyze_impact":
+                query = params.get("pipeline_name", params.get("pipeline_id", params.get("query", req.text)))
+                target_p = await _resolve_pipeline(query, store)
+                if target_p:
+                    impact = await agent.analyze_impact(target_p.pipeline_id)
+                    lines = [f"**Impact Analysis for {target_p.pipeline_name}:**"]
+                    lines.append(f"**Severity:** {impact.get('impact_severity', 'unknown')}")
+                    br = impact.get("blast_radius", {})
+                    lines.append(f"**Blast radius:** {br.get('pipelines', 0)} pipelines, {br.get('contracts', 0)} contracts")
+                    affected = impact.get("affected_pipelines", [])
+                    if affected:
+                        lines.append(f"**Affected pipelines ({len(affected)}):**")
+                        for ap in affected[:10]:
+                            lines.append(f"  - {ap.get('pipeline_name', '?')} (depth={ap.get('depth', '?')}, {ap.get('impact_type', '?')})")
+                    if impact.get("mitigation_options"):
+                        lines.append("**Mitigation options:**")
+                        for m in impact["mitigation_options"][:3]:
+                            lines.append(f"  - {m.get('option', '')} (effort: {m.get('effort', '?')})")
+                    if impact.get("summary"):
+                        lines.append(f"\n{impact['summary']}")
+                    result_data = {"impact": impact, "fallback_text": "\n".join(lines)}
+                else:
+                    result_data = {"fallback_text": "Could not identify which pipeline to analyze. Please specify the pipeline name."}
+
+            elif action == "check_anomalies":
+                anomalies = await agent.reason_about_anomalies()
+                lines = [f"**Platform Health:** {anomalies.get('platform_health', 'unknown')}"]
+                for a in anomalies.get("anomalies", []):
+                    sev = a.get("severity", "?")
+                    lines.append(f"- **{a.get('pipeline_name', '?')}** [{sev}]: {a.get('observation', '')}")
+                    if a.get("reasoning"):
+                        lines.append(f"  _{a['reasoning']}_")
+                if anomalies.get("cross_pipeline_patterns"):
+                    lines.append("\n**Cross-pipeline patterns:**")
+                    for pat in anomalies["cross_pipeline_patterns"]:
+                        lines.append(f"  - {pat}")
+                if anomalies.get("summary"):
+                    lines.append(f"\n{anomalies['summary']}")
+                result_data = {"anomalies": anomalies, "fallback_text": "\n".join(lines)}
+
             elif action == "explain":
                 # explain is inherently conversational — pass through
                 result_data = {
@@ -1632,6 +1701,12 @@ def create_app(
             owner=req.owner,
             tags=req.tags,
         )
+
+        # Build 18: Apply steps if provided
+        if req.steps:
+            pipeline.steps = _parse_step_dicts(req.steps)
+            await store.save_pipeline(pipeline)
+
         await _log_pipeline_change(
             pipeline.pipeline_id, pipeline.pipeline_name,
             PipelineChangeType.CREATED, caller,
@@ -1641,6 +1716,7 @@ def create_app(
                 "schedule": req.schedule_cron,
             },
         )
+        _gitops_commit_pipeline(gitops, pipeline, f"Create pipeline: {pipeline.pipeline_name}", caller)
         return _pipeline_summary(pipeline)
 
     @app.post("/api/pipelines/batch")
@@ -1782,6 +1858,19 @@ def create_app(
             }
             p.post_promotion_hooks = new_hooks
 
+        # --- Steps (Build 18) ---
+        if req.steps is not None:
+            old_steps = [
+                {"step_id": s.step_id, "step_name": s.step_name, "step_type": s.step_type.value if hasattr(s.step_type, "value") else s.step_type}
+                for s in (p.steps or [])
+            ]
+            new_steps = _parse_step_dicts(req.steps)
+            changes["steps"] = {
+                "old": old_steps,
+                "new": [{"step_id": s.step_id, "step_name": s.step_name, "step_type": s.step_type.value} for s in new_steps],
+            }
+            p.steps = new_steps
+
         if not changes:
             return await _pipeline_detail(p, store)
 
@@ -1817,6 +1906,7 @@ def create_app(
 
         # Persist contract YAML to disk
         _persist_contract_yaml(p, config)
+        _gitops_commit_pipeline(gitops, p, f"Update pipeline: {p.pipeline_name} (v{p.version})", caller)
 
         return await _pipeline_detail(p, store)
 
@@ -1879,6 +1969,7 @@ def create_app(
             PipelineChangeType.PAUSED, caller,
             changed_fields={"status": {"old": old_status, "new": "paused"}},
         )
+        _gitops_commit_pipeline(gitops, p, f"Pause pipeline: {p.pipeline_name}", caller)
         return {"status": "paused"}
 
     @app.post("/api/pipelines/{pipeline_id}/resume")
@@ -1900,6 +1991,7 @@ def create_app(
             PipelineChangeType.RESUMED, caller,
             changed_fields={"status": {"old": old_status, "new": "active"}},
         )
+        _gitops_commit_pipeline(gitops, p, f"Resume pipeline: {p.pipeline_name}", caller)
         return {"status": "active"}
 
     @app.get("/api/pipelines/{pipeline_id}/preview")
@@ -2324,7 +2416,18 @@ def create_app(
         caller: dict = Depends(auth_dep),
     ):
         proposals = await store.list_proposals(status=status)
-        return [_proposal_summary(p) for p in proposals]
+        results = []
+        for p in proposals:
+            s = _proposal_summary(p)
+            # Enrich with pipeline/connector names
+            if p.pipeline_id:
+                pipe = await store.get_pipeline(p.pipeline_id)
+                s["pipeline_name"] = pipe.pipeline_name if pipe else None
+            if p.connector_id:
+                conn = await store.get_connector(p.connector_id)
+                s["connector_name"] = conn.name if conn else None
+            results.append(s)
+        return results
 
     @app.post("/api/approvals/{proposal_id}")
     @limiter.limit("100/minute")
@@ -2347,7 +2450,7 @@ def create_app(
 
         if req.action == "approve":
             proposal.status = ProposalStatus.APPROVED
-            await _apply_proposal(proposal, store, registry, agent)
+            await _apply_proposal(proposal, store, registry, agent, gitops)
         elif req.action == "reject":
             proposal.status = ProposalStatus.REJECTED
             if req.note:
@@ -2435,6 +2538,8 @@ def create_app(
             snapshot = await store.get_latest_freshness(p.pipeline_id)
             if not snapshot:
                 continue
+            tier_cfg = p.get_tier_config()
+            last_run = await store.get_last_successful_run(p.pipeline_id)
             grouped.setdefault(p.tier, []).append(
                 {
                     "pipeline_id": p.pipeline_id,
@@ -2445,9 +2550,35 @@ def create_app(
                     "status": snapshot.status.value if hasattr(snapshot.status, "value") else snapshot.status,
                     "last_record_time": snapshot.last_record_time,
                     "checked_at": snapshot.checked_at,
+                    "schedule": p.schedule_cron,
+                    "freshness_column": p.get_freshness_col(),
+                    "freshness_critical_minutes": tier_cfg.get("freshness_critical_minutes"),
+                    "last_run_at": last_run.completed_at if last_run else None,
+                    "last_run_rows": last_run.rows_extracted if last_run else None,
+                    "source_connector_id": p.source_connector_id,
+                    "target_table": p.target_table,
                 }
             )
         return {"tiers": {str(k): v for k, v in sorted(grouped.items())}}
+
+    @app.get("/api/observability/freshness/{pipeline_id}/history")
+    @limiter.limit("100/minute")
+    async def freshness_history(
+        request: Request,
+        pipeline_id: str,
+        hours: int = Query(24, ge=1, le=168),
+        caller: dict = Depends(auth_dep),
+    ):
+        snapshots = await store.list_freshness_history(pipeline_id, hours)
+        return [
+            {
+                "staleness_minutes": s.staleness_minutes,
+                "sla_met": s.sla_met,
+                "status": s.status.value if hasattr(s.status, "value") else s.status,
+                "checked_at": s.checked_at,
+            }
+            for s in snapshots
+        ]
 
     @app.get("/api/observability/alerts")
     @limiter.limit("100/minute")
@@ -2466,9 +2597,11 @@ def create_app(
                 "pipeline_id": a.pipeline_id,
                 "pipeline_name": a.pipeline_name,
                 "summary": a.summary,
+                "detail": a.detail,
                 "created_at": a.created_at,
                 "acknowledged": a.acknowledged,
                 "acknowledged_by": getattr(a, "acknowledged_by", None),
+                "acknowledged_at": getattr(a, "acknowledged_at", None),
             }
             for a in alerts
         ]
@@ -3542,6 +3675,405 @@ def create_app(
         return {"status": "deleted"}
 
     # -----------------------------------------------------------------------
+    # GitOps
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/gitops/status")
+    @limiter.limit("100/minute")
+    async def gitops_status(request: Request, caller: dict = Depends(auth_dep)):
+        if not gitops:
+            return {"enabled": False}
+        return gitops.status()
+
+    @app.get("/api/gitops/log")
+    @limiter.limit("100/minute")
+    async def gitops_log(
+        request: Request,
+        limit: int = Query(20),
+        caller: dict = Depends(auth_dep),
+    ):
+        if not gitops:
+            return []
+        return gitops.get_log(limit=limit)
+
+    @app.get("/api/gitops/pipelines/{pipeline_id}/history")
+    @limiter.limit("100/minute")
+    async def gitops_pipeline_history(
+        request: Request,
+        pipeline_id: str,
+        limit: int = Query(20),
+        caller: dict = Depends(auth_dep),
+    ):
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        if not gitops:
+            return []
+        return gitops.get_pipeline_history(p.pipeline_name, limit=limit)
+
+    @app.get("/api/gitops/diff")
+    @limiter.limit("100/minute")
+    async def gitops_diff(
+        request: Request,
+        commit_a: str = Query("HEAD~1"),
+        commit_b: str = Query("HEAD"),
+        caller: dict = Depends(auth_dep),
+    ):
+        if not gitops:
+            return {"diff": ""}
+        return {"diff": gitops.get_diff(commit_a, commit_b)}
+
+    @app.get("/api/gitops/file")
+    @limiter.limit("100/minute")
+    async def gitops_file_at_commit(
+        request: Request,
+        filepath: str = Query(...),
+        commit: str = Query("HEAD"),
+        caller: dict = Depends(auth_dep),
+    ):
+        if not gitops:
+            raise HTTPException(404, "GitOps not enabled")
+        content = gitops.get_file_at_commit(filepath, commit)
+        if content is None:
+            raise HTTPException(404, "File not found at commit")
+        return PlainTextResponse(content)
+
+    @app.post("/api/gitops/restore")
+    @limiter.limit("5/minute")
+    async def gitops_restore(
+        request: Request,
+        dry_run: bool = Query(True),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Restore pipelines and connectors from GitOps repo into the database.
+
+        Reads all pipeline YAML and connector .py files from the repo and
+        upserts them into PostgreSQL. Use dry_run=true (default) to preview
+        what would be restored without making changes.
+        """
+        require_role(caller, "admin")
+        if not gitops or not gitops.enabled:
+            raise HTTPException(404, "GitOps not enabled")
+
+        # Pull latest from remote before restore (offloaded to thread)
+        if gitops.has_remote:
+            import asyncio as _aio
+            await _aio.get_running_loop().run_in_executor(None, gitops._pull)
+
+        results = {
+            "pipelines_found": 0,
+            "pipelines_restored": 0,
+            "pipelines_skipped": 0,
+            "connectors_found": 0,
+            "connectors_restored": 0,
+            "connectors_skipped": 0,
+            "errors": [],
+            "dry_run": dry_run,
+            "details": [],
+        }
+
+        # --- Restore pipelines from YAML ---
+        yamls = gitops.read_all_pipeline_yamls()
+        results["pipelines_found"] = len(yamls)
+
+        for yaml_str in yamls:
+            try:
+                pipelines = yaml_to_pipelines(yaml_str, preserve_id=True)
+                for p in pipelines:
+                    existing = await store.get_pipeline(p.pipeline_id)
+                    action = "update" if existing else "create"
+                    results["details"].append({
+                        "type": "pipeline",
+                        "name": p.pipeline_name,
+                        "id": p.pipeline_id,
+                        "action": action,
+                        "version": p.version,
+                    })
+                    if not dry_run:
+                        await store.save_pipeline(p)
+                        results["pipelines_restored"] += 1
+                    else:
+                        results["pipelines_skipped"] += 1
+            except Exception as e:
+                results["errors"].append(f"Pipeline YAML parse error: {e}")
+
+        # --- Restore connectors from .py files ---
+        connector_files = gitops.read_all_connector_files()
+        results["connectors_found"] = len(connector_files)
+
+        for cf in connector_files:
+            try:
+                name = cf.get("name", cf.get("filename", "unknown"))
+                connector_id = cf.get("connector_id", "")
+                code = cf.get("code", "")
+
+                if not code or code.strip() == "# No code available":
+                    results["details"].append({
+                        "type": "connector",
+                        "name": name,
+                        "action": "skip_empty",
+                    })
+                    results["connectors_skipped"] += 1
+                    continue
+
+                # Try to find existing connector by ID or name
+                existing = None
+                if connector_id:
+                    existing = await store.get_connector(connector_id)
+                if not existing:
+                    connectors = await store.list_connectors()
+                    existing = next((c for c in connectors if c.connector_name == name), None)
+
+                action = "update" if existing else "create"
+                results["details"].append({
+                    "type": "connector",
+                    "name": name,
+                    "id": connector_id or (existing.connector_id if existing else "new"),
+                    "action": action,
+                    "version": cf.get("version", 1),
+                })
+
+                if not dry_run:
+                    if existing:
+                        existing.code = code
+                        existing.version = cf.get("version", existing.version)
+                        existing.updated_at = now_iso()
+                        await store.save_connector(existing)
+                        registry.register_approved_connector(existing)
+                    else:
+                        from contracts.models import ConnectorRecord, ConnectorType, ConnectorStatus
+                        ct = cf.get("connector_type", "source").lower()
+                        new_conn = ConnectorRecord(
+                            connector_id=connector_id or new_id(),
+                            connector_name=name,
+                            connector_type=ConnectorType(ct) if ct in ("source", "target") else ConnectorType.SOURCE,
+                            code=code,
+                            version=cf.get("version", 1),
+                            status=ConnectorStatus.ACTIVE,
+                            generated_by="gitops-restore",
+                        )
+                        await store.save_connector(new_conn)
+                        registry.register_approved_connector(new_conn)
+                    results["connectors_restored"] += 1
+                else:
+                    results["connectors_skipped"] += 1
+            except Exception as e:
+                results["errors"].append(f"Connector '{cf.get('name', '?')}' restore error: {e}")
+
+        return results
+
+    # -----------------------------------------------------------------------
+    # Documentation API (Build 24)
+    # -----------------------------------------------------------------------
+
+    _docs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs")
+
+    @app.get("/api/docs")
+    async def list_docs():
+        """List available documentation files as a tree."""
+        if not os.path.exists(_docs_dir):
+            return {"docs": []}
+        result = []
+        for root, dirs, files in os.walk(_docs_dir):
+            dirs.sort()
+            for f in sorted(files):
+                if not f.endswith(".md"):
+                    continue
+                rel = os.path.relpath(os.path.join(root, f), _docs_dir)
+                # Parse title from first heading
+                full = os.path.join(root, f)
+                title = f.replace(".md", "").replace("-", " ").title()
+                try:
+                    with open(full, "r") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if line.startswith("# "):
+                                title = line[2:].strip()
+                                break
+                except Exception:
+                    pass
+                # Determine section from directory
+                parts = rel.replace("\\", "/").split("/")
+                section = parts[0] if len(parts) > 1 else "root"
+                result.append({
+                    "path": rel.replace("\\", "/"),
+                    "title": title,
+                    "section": section,
+                })
+        return {"docs": result}
+
+    @app.get("/api/docs/{doc_path:path}")
+    async def get_doc(doc_path: str):
+        """Get a documentation file's markdown content."""
+        if not doc_path.endswith(".md"):
+            doc_path += ".md"
+        safe_path = os.path.normpath(doc_path)
+        if ".." in safe_path:
+            raise HTTPException(400, "Invalid path")
+        full = os.path.join(_docs_dir, safe_path)
+        if not os.path.exists(full):
+            raise HTTPException(404, "Document not found")
+        try:
+            with open(full, "r") as f:
+                content = f.read()
+            return {"path": safe_path, "content": content}
+        except Exception as e:
+            raise HTTPException(500, f"Error reading doc: {e}")
+
+    # -----------------------------------------------------------------------
+    # Agent Diagnostic & Reasoning (Build 24)
+    # -----------------------------------------------------------------------
+
+    @app.post("/api/pipelines/{pipeline_id}/diagnose")
+    @limiter.limit("10/minute")
+    async def diagnose_pipeline_endpoint(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Root-cause diagnosis for a pipeline."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        result = await agent.diagnose_pipeline(pipeline_id)
+        return result
+
+    @app.post("/api/pipelines/{pipeline_id}/impact")
+    @limiter.limit("10/minute")
+    async def analyze_impact_endpoint(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Analyze downstream impact if a pipeline goes down."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        result = await agent.analyze_impact(pipeline_id)
+        return result
+
+    @app.get("/api/observability/anomalies")
+    @limiter.limit("10/minute")
+    async def get_anomalies_endpoint(
+        request: Request,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Platform-wide anomaly detection with contextual reasoning."""
+        result = await agent.reason_about_anomalies()
+        return result
+
+    # -----------------------------------------------------------------------
+    # Step DAG endpoints (Build 18)
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/pipelines/{pipeline_id}/steps")
+    async def get_pipeline_steps(
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get step DAG definition for a pipeline."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        return {
+            "pipeline_id": pipeline_id,
+            "pipeline_name": p.pipeline_name,
+            "steps": [
+                {
+                    "step_id": s.step_id,
+                    "step_name": s.step_name,
+                    "step_type": s.step_type.value if hasattr(s.step_type, "value") else s.step_type,
+                    "depends_on": s.depends_on,
+                    "config": s.config,
+                    "retry_max": s.retry_max,
+                    "timeout_seconds": s.timeout_seconds,
+                    "skip_on_fail": s.skip_on_fail,
+                    "enabled": s.enabled,
+                }
+                for s in (p.steps or [])
+            ],
+        }
+
+    @app.get("/api/runs/{run_id}/steps")
+    async def get_run_steps(
+        run_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get step executions for a specific run."""
+        run = await store.get_run(run_id)
+        if not run:
+            raise HTTPException(404, "Run not found")
+        step_execs = await store.list_step_executions(run_id)
+        return {
+            "run_id": run_id,
+            "pipeline_id": run.pipeline_id,
+            "steps": [
+                {
+                    "step_execution_id": se.step_execution_id,
+                    "step_id": se.step_id,
+                    "step_name": se.step_name,
+                    "step_type": se.step_type,
+                    "status": se.status.value if hasattr(se.status, "value") else se.status,
+                    "started_at": se.started_at,
+                    "completed_at": se.completed_at,
+                    "elapsed_ms": se.elapsed_ms,
+                    "output": se.output,
+                    "error": se.error,
+                    "retry_count": se.retry_count,
+                }
+                for se in step_execs
+            ],
+        }
+
+    @app.post("/api/pipelines/{pipeline_id}/steps/validate")
+    async def validate_steps(
+        pipeline_id: str,
+        steps: list[dict] = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Validate a step DAG for cycles and missing dependencies."""
+        require_role(caller, "admin", "operator")
+        parsed = _parse_step_dicts(steps)
+        from agent.autonomous import PipelineRunner as _PR
+        try:
+            ordered = _PR._topo_sort(parsed)
+            return {
+                "valid": True,
+                "execution_order": [
+                    {"step_id": s.step_id, "step_name": s.step_name, "step_type": s.step_type.value}
+                    for s in ordered
+                ],
+            }
+        except ValueError as e:
+            return {"valid": False, "error": str(e)}
+
+    @app.get("/api/pipelines/{pipeline_id}/steps/preview")
+    async def preview_step_execution(
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Preview the execution order for a pipeline's step DAG."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        if not p.steps:
+            return {"pipeline_id": pipeline_id, "mode": "legacy", "execution_order": []}
+        enabled = [s for s in p.steps if s.enabled]
+        from agent.autonomous import PipelineRunner as _PR
+        try:
+            ordered = _PR._topo_sort(enabled)
+            return {
+                "pipeline_id": pipeline_id,
+                "mode": "step_dag",
+                "execution_order": [
+                    {"step_id": s.step_id, "step_name": s.step_name, "step_type": s.step_type.value}
+                    for s in ordered
+                ],
+            }
+        except ValueError as e:
+            return {"pipeline_id": pipeline_id, "mode": "step_dag", "error": str(e)}
+
+    # -----------------------------------------------------------------------
     # Serve static UI
     # -----------------------------------------------------------------------
 
@@ -3577,6 +4109,7 @@ async def _apply_proposal(
     store: Store,
     registry: ConnectorRegistry,
     agent: AgentCore,
+    gitops=None,
 ):
     """Apply an approved proposal, updating connectors or pipeline schemas."""
     if proposal.change_type == ChangeType.NEW_CONNECTOR and proposal.connector_id:
@@ -3588,6 +4121,19 @@ async def _apply_proposal(
             await store.save_connector(c)
             registry.register_approved_connector(c)
             proposal.status = ProposalStatus.APPLIED
+            # GitOps: commit connector code (offloaded to thread)
+            if gitops and gitops.enabled:
+                import asyncio as _aio
+                def _commit_connector():
+                    try:
+                        gitops.commit_connector(
+                            c,
+                            f"Approve connector: {c.connector_name} (v{c.version})",
+                            author=proposal.resolved_by or "dapos",
+                        )
+                    except Exception as e:
+                        log.warning("GitOps commit_connector failed: %s", e)
+                _aio.get_running_loop().run_in_executor(None, _commit_connector)
         return
 
     if not proposal.pipeline_id:
@@ -3621,6 +4167,19 @@ async def _apply_proposal(
         )
         await store.save_schema_version(sv)
 
+        # GitOps: commit pipeline schema change (offloaded to thread)
+        if gitops and gitops.enabled:
+            import asyncio as _aio
+            _yaml = pipeline_to_yaml(pipeline, mask_credentials=True)
+            _msg = f"Schema change: {pipeline.pipeline_name} v{pipeline.version} ({proposal.change_type.value})"
+            _author = proposal.resolved_by or "dapos"
+            def _commit_schema():
+                try:
+                    gitops.commit_pipeline(pipeline, _yaml, _msg, author=_author)
+                except Exception as e:
+                    log.warning("GitOps commit_pipeline (schema) failed: %s", e)
+            _aio.get_running_loop().run_in_executor(None, _commit_schema)
+
     proposal.status = ProposalStatus.APPLIED
 
 
@@ -3641,6 +4200,54 @@ def _connector_summary(c) -> dict:
         "approved_by": c.approved_by,
         "created_at": c.created_at,
     }
+
+
+async def _resolve_pipeline(query: str, store: Store):
+    """Resolve a pipeline by name or id from a natural language query."""
+    if not query:
+        return None
+    pipelines = await store.list_pipelines()
+    query_lower = query.lower().strip()
+    # Exact ID match
+    for p in pipelines:
+        if p.pipeline_id == query_lower or p.pipeline_id == query:
+            return p
+    # Exact name match
+    for p in pipelines:
+        if p.pipeline_name.lower() == query_lower:
+            return p
+    # Substring match on name
+    for p in pipelines:
+        if p.pipeline_name.lower() in query_lower or query_lower in p.pipeline_name.lower():
+            return p
+    # Word overlap match
+    for p in pipelines:
+        name_words = set(p.pipeline_name.lower().replace("-", " ").replace("_", " ").split())
+        query_words = set(query_lower.replace("-", " ").replace("_", " ").split())
+        if name_words & query_words - {"pipeline", "the", "my", "is", "why", "what", "if", "for", "a"}:
+            return p
+    return None
+
+
+def _parse_step_dicts(raw_steps: list[dict]) -> list:
+    """Parse step dicts from API request into StepDefinition list."""
+    result = []
+    for s in raw_steps:
+        d = dict(s)
+        if "step_id" not in d or not d["step_id"]:
+            d["step_id"] = new_id()
+        st = d.get("step_type", "extract")
+        if isinstance(st, str):
+            try:
+                d["step_type"] = StepType(st.lower())
+            except ValueError:
+                d["step_type"] = StepType.EXTRACT
+        if "depends_on" not in d:
+            d["depends_on"] = []
+        if "config" not in d:
+            d["config"] = {}
+        result.append(StepDefinition(**d))
+    return result
 
 
 def _connector_detail(c) -> dict:
@@ -3668,6 +4275,7 @@ def _pipeline_summary(p) -> dict:
         "tags": p.tags,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
+        "step_count": len(p.steps) if p.steps else 0,
     }
 
 
@@ -3752,6 +4360,22 @@ async def _pipeline_detail(p, store: Store) -> dict:
     d["schema_change_policy"] = asdict(p.get_schema_policy())
     d["schema_change_policy_is_custom"] = p.schema_change_policy is not None
 
+    # Steps (Build 18)
+    d["steps"] = [
+        {
+            "step_id": s.step_id,
+            "step_name": s.step_name,
+            "step_type": s.step_type.value if hasattr(s.step_type, "value") else s.step_type,
+            "depends_on": s.depends_on,
+            "config": s.config,
+            "retry_max": s.retry_max,
+            "timeout_seconds": s.timeout_seconds,
+            "skip_on_fail": s.skip_on_fail,
+            "enabled": s.enabled,
+        }
+        for s in (p.steps or [])
+    ]
+
     # Post-promotion hooks (Build 13)
     d["post_promotion_hooks"] = [asdict(h) for h in p.post_promotion_hooks]
 
@@ -3814,6 +4438,33 @@ def _persist_contract_yaml(p, config):
         f.write(yaml_str)
 
 
+def _gitops_commit_pipeline_sync(gitops_repo, pipeline, message: str, caller=None):
+    """Synchronous: commit pipeline YAML to GitOps repo (never raises)."""
+    if not gitops_repo or not gitops_repo.enabled:
+        return
+    try:
+        yaml_content = pipeline_to_yaml(pipeline, mask_credentials=True)
+        author = (caller.get("sub", "dapos") if caller else "dapos")
+        gitops_repo.commit_pipeline(pipeline, yaml_content, message, author=author)
+    except Exception as e:
+        log.warning("GitOps commit_pipeline failed: %s", e)
+
+
+def _gitops_commit_pipeline(gitops_repo, pipeline, message: str, caller=None):
+    """Fire-and-forget: offload git commit to a thread so it never blocks the event loop."""
+    if not gitops_repo or not gitops_repo.enabled:
+        return
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(
+            None, _gitops_commit_pipeline_sync, gitops_repo, pipeline, message, caller
+        )
+    except RuntimeError:
+        # No running loop (e.g. called from sync context) — run directly
+        _gitops_commit_pipeline_sync(gitops_repo, pipeline, message, caller)
+
+
 def _run_summary(r) -> dict:
     return {
         "run_id": r.run_id,
@@ -3837,6 +4488,7 @@ def _run_summary(r) -> dict:
         "retry_count": r.retry_count,
         "triggered_by_run_id": r.triggered_by_run_id,
         "triggered_by_pipeline_id": r.triggered_by_pipeline_id,
+        "execution_log": r.execution_log,
     }
 
 
@@ -3851,6 +4503,12 @@ def _proposal_summary(p) -> dict:
         "reasoning": p.reasoning,
         "confidence": p.confidence,
         "impact_analysis": p.impact_analysis,
+        "current_state": p.current_state,
+        "proposed_state": p.proposed_state,
+        "trigger_detail": p.trigger_detail,
+        "rollback_plan": p.rollback_plan,
+        "contract_version_before": p.contract_version_before,
+        "contract_version_after": p.contract_version_after,
         "created_at": p.created_at,
         "resolved_at": p.resolved_at,
         "resolved_by": p.resolved_by,

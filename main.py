@@ -37,6 +37,7 @@ from scheduler.manager import Scheduler
 from monitor.engine import MonitorEngine
 from quality.gate import QualityGate
 from api.server import create_app
+from gitops.repo import GitOpsRepo
 
 log = logging.getLogger("pipeline-agent")
 
@@ -60,11 +61,12 @@ def setup_data_dirs(config: Config):
     os.makedirs(config.contracts_dir, exist_ok=True)
 
 
-async def observability_loop(config: Config, store: Store, agent: AgentCore):
+async def observability_loop(config: Config, store: Store, agent: AgentCore, gitops=None):
     """
     30s base tick:
     - Daily digest at 9 AM UTC via agent.generate_digest()
     - Quality trend summary every 15m (logged)
+    - GitOps reconciliation every 5m when conflicts detected
     """
     log.info("Observability loop started.")
     last_digest_day: int = -1
@@ -81,9 +83,14 @@ async def observability_loop(config: Config, store: Store, agent: AgentCore):
                 last_digest_day = now.day
                 await _send_daily_digest(store, agent)
 
-            # Log quality trend summary every 15m (30 ticks x 30s)
+            # Log quality trend summary + anomaly reasoning every 15m (30 ticks x 30s)
             if tick % 30 == 0:
                 await _log_quality_summary(store)
+                await _check_anomalies(store, agent)
+
+            # GitOps reconciliation every 5m (10 ticks x 30s) when conflicts detected
+            if gitops and gitops.needs_reconcile and tick % 10 == 0:
+                await _gitops_reconcile(store, gitops)
 
         except asyncio.CancelledError:
             log.info("Observability loop cancelled.")
@@ -126,6 +133,49 @@ async def _log_quality_summary(store: Store):
         log.warning("Quality summary -- issues: %s", "; ".join(issues))
     else:
         log.info("Quality summary -- all pipelines healthy.")
+
+
+async def _check_anomalies(store: Store, agent):
+    """Run proactive anomaly reasoning and create alerts for critical unexpected anomalies."""
+    try:
+        result = await agent.reason_about_anomalies()
+        anomalies = result.get("anomalies", [])
+        critical = [a for a in anomalies if a.get("severity") == "critical" and not a.get("is_expected")]
+        if critical:
+            log.warning(
+                "Anomaly reasoning: %d critical unexpected anomalies: %s",
+                len(critical),
+                "; ".join(f"{a.get('pipeline_name', '?')}: {a.get('observation', '')}" for a in critical),
+            )
+            for a in critical:
+                from contracts.models import AlertRecord, AlertSeverity
+                alert = AlertRecord(
+                    severity=AlertSeverity.CRITICAL,
+                    pipeline_id=a.get("pipeline_id", ""),
+                    pipeline_name=a.get("pipeline_name", ""),
+                    summary=f"Anomaly detected: {a.get('observation', 'Unknown anomaly')}",
+                    detail=a,
+                )
+                await store.save_alert(alert)
+        elif anomalies:
+            log.info("Anomaly reasoning: %d anomalies detected, none critical/unexpected.", len(anomalies))
+        else:
+            log.info("Anomaly reasoning: no anomalies detected.")
+    except Exception as e:
+        log.warning("Anomaly reasoning failed: %s", e)
+
+
+async def _gitops_reconcile(store: Store, gitops):
+    """Full reconciliation: rewrite all repo files from DB state (offloaded to thread)."""
+    try:
+        from contracts.yaml_codec import pipeline_to_yaml
+        all_pipelines = await store.list_pipelines()
+        all_connectors = await store.list_connectors()
+        pairs = [(p, pipeline_to_yaml(p, mask_credentials=True)) for p in all_pipelines]
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, gitops.reconcile, pairs, all_connectors)
+    except Exception as e:
+        log.error("GitOps reconcile failed: %s", e)
 
 
 async def _recover_stale_runs(store: Store):
@@ -222,9 +272,41 @@ async def main():
         pipelines = await store.list_pipelines(status="active")
         log.info("  Active pipelines: %d", len(pipelines))
 
+        # 7d. Initialize GitOps repo
+        gitops = GitOpsRepo(
+            config.pipeline_repo_path,
+            branch=config.pipeline_repo_branch,
+            remote_url=config.pipeline_repo_remote,
+            auto_push=config.gitops_auto_push,
+            auto_pull=config.gitops_auto_pull,
+        )
+        if config.has_gitops:
+            if gitops.init_repo():
+                remote_info = f", remote: {config.pipeline_repo_remote}" if config.pipeline_repo_remote else ""
+                log.info("  GitOps repo: %s (branch: %s%s)", config.pipeline_repo_path, config.pipeline_repo_branch, remote_info)
+                # Full sync: export all pipelines + connectors to repo
+                from contracts.yaml_codec import pipeline_to_yaml
+                all_pipelines = await store.list_pipelines()
+                all_connectors = await store.list_connectors()
+                pairs = [(p, pipeline_to_yaml(p, mask_credentials=True)) for p in all_pipelines]
+                commit = gitops.commit_all(
+                    pairs, all_connectors,
+                    message=f"Sync: {len(all_pipelines)} pipelines, {len(all_connectors)} connectors",
+                    author="dapos-boot",
+                )
+                if commit:
+                    log.info("  GitOps boot sync: %s", commit[:8])
+                else:
+                    log.info("  GitOps: no changes to commit.")
+            else:
+                log.warning("  GitOps repo init failed — continuing without GitOps.")
+        else:
+            log.info("  GitOps: disabled (set PIPELINE_REPO_PATH to enable)")
+
         # 8. Create FastAPI application
         app = create_app(
-            config, store, registry, agent, conversation, runner, scheduler, monitor
+            config, store, registry, agent, conversation, runner, scheduler, monitor,
+            gitops=gitops,
         )
 
         # 9. Build uvicorn config and run all 4 loops concurrently
@@ -241,7 +323,7 @@ async def main():
             server.serve(),
             scheduler.run_forever(),
             monitor.run_forever(),
-            observability_loop(config, store, agent),
+            observability_loop(config, store, agent, gitops=gitops),
         )
 
     finally:

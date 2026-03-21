@@ -70,7 +70,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `api/server.py` | FastAPI with 40+ endpoints, JWT auth, rate limiting |
 | `agent/core.py` | Claude API calls: route_command, propose_strategy, generate_connector, reason_about_quality, parse_schedule, guided_pipeline_response |
 | `agent/conversation.py` | Multi-turn onboarding/discovery flow |
-| `agent/autonomous.py` | Pipeline execution state machine (PENDING -> COMPLETE/HALTED) |
+| `agent/autonomous.py` | Pipeline execution state machine (PENDING -> COMPLETE/HALTED) with structured execution logging (13 steps) |
 | `contracts/models.py` | All dataclasses + enums (PipelineContract, ConnectorRecord, RunRecord, etc.) |
 | `contracts/store.py` | PostgreSQL CRUD via asyncpg for all entities |
 | `connectors/registry.py` | exec()-based connector loader, validator, hot-reloader |
@@ -85,7 +85,10 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `sandbox.py` | AST validation + restricted builtins + import whitelist |
 | `auth.py` | JWT auth with 3 roles (admin, operator, viewer) |
 | `crypto.py` | Fernet encryption for credentials at rest |
-| `ui/App.jsx` | React 18 SPA (CDN, no build) - 11 views including Chat, DAG |
+| `ui/App.jsx` | React 18 SPA (CDN, no build) - 11 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Settings, Sources, Docs |
+| `gitops/repo.py` | Separate git repo manager for pipeline YAML + connector code versioning |
+| `cli/__main__.py` | CLI interface — 14 commands, token caching, fuzzy pipeline resolution |
+| `docs/` | Structured documentation — quickstart, architecture, concepts, API/CLI reference |
 
 ## Critical Design Constraints
 
@@ -179,6 +182,9 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Source registry | 6 | register, list, get, update, delete, discover (Build 21) |
 | Pipeline changelog | 3 | per-pipeline, global, included in detail (Build 21) |
 | Interaction audit | 2 | list, export (Build 21) |
+| GitOps API | 5 | status, log, diff, pipeline history, restore dry-run (Build 23) |
+| Step DAG | 5 | steps definition, run steps, validate, preview, PATCH update (Build 18) |
+| Agent diagnostics | 8 | diagnose (200+404), impact (200+404), anomalies, chat routing x3 (Build 24) |
 
 ### Adding New Tests
 
@@ -210,6 +216,11 @@ All tests are in `test-pipeline-agent.sh`. To add a new source/target:
 8. **Store methods require `pipeline_id`** — Most store methods like `list_dependencies()` require a `pipeline_id` argument. Never call them without it.
 9. **Quality gate first-run leniency** — On the very first run (no prior COMPLETE runs), FAILs are auto-downgraded to WARNs so the first run establishes baselines. Don't rely on the first run's gate decision for regression testing.
 10. **`source_user`/`source_password` on PipelineContract** — Source credentials are stored on the contract just like target credentials. When creating pipelines, pass source auth via `source_user`/`source_password` fields, not hardcoded empty strings.
+11. **React hooks in `.map()` callbacks** — `useState`/`useEffect` inside `.map()` violates React's rules of hooks and crashes rendering. Extract to a proper component.
+12. **Browser-based Babel + IIFEs in JSX** — `{(() => { ... })()}` patterns can fail with CDN Babel transpilation. Use extracted components instead.
+13. **`checked_at` TEXT column in freshness_snapshots** — Column is TEXT not TIMESTAMP. Use `::timestamptz` cast when comparing to `NOW()` in SQL queries.
+14. **`schedule_cron` not `schedule`** — PipelineContract uses `schedule_cron` field name. `p.schedule` will AttributeError.
+15. **Cache busting for UI changes** — Static files need `?v=N` query params in `index.html` and `Cache-Control: no-cache` headers. Increment version on every UI change.
 
 ## Changelog
 

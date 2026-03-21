@@ -15,6 +15,7 @@ from config import Config
 from contracts.models import (
     PipelineContract, RunRecord, GateRecord, ColumnLineage,
     ErrorBudget, AlertRecord, SchemaVersion,
+    StepDefinition, StepExecution, StepType, StepStatus,
     RunStatus, GateDecision, RunMode, ConnectorStatus, AlertSeverity,
     CleanupOwnership,
     now_iso, new_id,
@@ -73,18 +74,46 @@ class PipelineRunner:
         ):
             return await self._execute_inner(contract, run)
 
+    def _log_step(self, run: RunRecord, step: str, detail: str = "", status: str = "ok"):
+        """Append a structured log entry to the run's execution_log."""
+        if run.execution_log is None:
+            run.execution_log = []
+        run.execution_log.append({
+            "ts": now_iso(),
+            "step": step,
+            "detail": detail,
+            "status": status,
+            "elapsed_ms": int((_time.time() - self._step_t0) * 1000) if hasattr(self, '_step_t0') else 0,
+        })
+        self._step_t0 = _time.time()
+
     async def _execute_inner(
         self,
         contract: PipelineContract,
         run: RunRecord,
     ) -> RunRecord:
-        """Inner execution logic (runs inside PipelineContext)."""
+        """Dispatch to legacy or step-DAG execution path."""
+        if contract.steps:
+            return await self._execute_step_dag(contract, run)
+        return await self._execute_legacy(contract, run)
+
+    async def _execute_legacy(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+    ) -> RunRecord:
+        """Legacy execution: fixed extract → load → gate → promote flow."""
+        self._step_t0 = _time.time()
+        run.execution_log = []
+        self._log_step(run, "start", f"mode={run.run_mode.value}")
         log.info("Starting run (mode=%s)", run.run_mode.value)
         try:
             # 1. Preflight checks
             if not await self._preflight(contract, run):
+                self._log_step(run, "preflight", "failed", "error")
                 await self._update_error_budget(contract, run)
                 return run
+            self._log_step(run, "preflight", "passed")
 
             # Build 15: Load upstream run context for data-triggered runs
             upstream_run = None
@@ -102,6 +131,7 @@ class PipelineRunner:
 
             # Ensure target table exists
             await target.create_table_if_not_exists(contract)
+            self._log_step(run, "connectors", f"source={contract.source_connector_id[:8]}, target={contract.target_connector_id[:8]}")
 
             # 2. EXTRACTING
             run.status = RunStatus.EXTRACTING
@@ -119,6 +149,7 @@ class PipelineRunner:
             run.staging_size_bytes = extract_result.staging_size_bytes
 
             log.info("Extracted %d rows", run.rows_extracted)
+            self._log_step(run, "extract", f"{run.rows_extracted} rows, {run.staging_size_bytes} bytes staged")
 
             # 3. Skip if incremental with 0 rows
             if (
@@ -126,8 +157,10 @@ class PipelineRunner:
                 and contract.refresh_type.value == "incremental"
             ):
                 log.info("No new rows -- marking complete.")
+                self._log_step(run, "skip", "no new rows (incremental)")
                 run.status = RunStatus.COMPLETE
                 run.completed_at = now_iso()
+                self._log_step(run, "complete", "0 rows — skipped")
                 await self.store.save_run(run)
                 await self._update_error_budget(contract, run)
                 return run
@@ -137,6 +170,7 @@ class PipelineRunner:
             await self.store.save_run(run)
             await target.load_staging(contract, run)
             log.info("Loaded to staging")
+            self._log_step(run, "load_staging", f"{run.rows_extracted} rows to staging table")
 
             # 5. QUALITY GATE
             run.status = RunStatus.QUALITY_GATE
@@ -157,9 +191,11 @@ class PipelineRunner:
                     for c in gate_record.checks
                 ],
             }
+            self._log_step(run, "quality_gate", f"decision={gate_record.decision.value}, {len(gate_record.checks)} checks")
 
             # 6. On HALT: preserve staging, don't clean up
             if gate_record.decision == GateDecision.HALT:
+                self._log_step(run, "halt", "quality gate halted run", "warn")
                 result = await self._handle_halt(contract, run, gate_record, target)
                 await self._update_error_budget(contract, result)
                 return result
@@ -169,6 +205,7 @@ class PipelineRunner:
             await self.store.save_run(run)
             await target.promote(contract, run)
             log.info("Promoted to target")
+            self._log_step(run, "promote", f"staging → {contract.target_table}")
 
             # 8. Update watermark (skip for backfills)
             if (
@@ -177,6 +214,7 @@ class PipelineRunner:
             ):
                 run.watermark_after = extract_result.max_watermark
                 contract.last_watermark = extract_result.max_watermark
+                self._log_step(run, "watermark", f"{run.watermark_before} → {run.watermark_after}")
 
             # Update baselines
             await self._update_baselines(contract, run)
@@ -184,19 +222,24 @@ class PipelineRunner:
 
             # Cleanup staging
             self.staging.cleanup_run(contract.pipeline_id, run.run_id)
+            self._log_step(run, "cleanup", "staging table dropped")
 
             # Track column lineage after successful promotion
             await self._track_column_lineage(contract)
+            self._log_step(run, "column_lineage", "tracked")
 
             # Write pipeline metadata (XCom-style)
             await self._write_run_metadata(contract, run, extract_result, upstream_run)
+            self._log_step(run, "metadata", "run metadata written")
 
             # Execute post-promotion SQL hooks
             await self._execute_post_promotion_hooks(contract, run, target, upstream_run)
+            self._log_step(run, "hooks", "post-promotion hooks executed")
 
             # 9. Mark COMPLETE
             run.status = RunStatus.COMPLETE
             run.completed_at = now_iso()
+            self._log_step(run, "complete", f"{run.rows_extracted} rows promoted successfully")
             await self.store.save_run(run)
             log.info("Run complete -- %d rows extracted", run.rows_extracted)
 
@@ -207,6 +250,7 @@ class PipelineRunner:
 
         except Exception as e:
             log.exception("Run failed: %s", e)
+            self._log_step(run, "error", str(e), "error")
             run.error = str(e)
             run.status = RunStatus.FAILED
             run.completed_at = now_iso()
@@ -527,7 +571,9 @@ class PipelineRunner:
     ) -> str:
         """Replace {{variable}} placeholders with run context values.
 
-        Supported variables (15 current + 9 upstream):
+        Supported variables (24 run context + 10 connection + 9 upstream = 43 total):
+
+        Run context (15):
           {{pipeline_id}}, {{pipeline_name}},
           {{run_id}}, {{run_mode}},
           {{watermark_before}}, {{watermark_after}},
@@ -536,6 +582,14 @@ class PipelineRunner:
           {{source_schema}}, {{source_table}},
           {{target_schema}}, {{target_table}},
           {{batch_id}} (alias for run_id[:8])
+
+        Connection/environment (10):
+          {{environment}},
+          {{source_host}}, {{source_database}}, {{source_user}}, {{source_port}},
+          {{target_host}}, {{target_database}}, {{target_user}}, {{target_port}},
+          {{target_ddl}}
+
+        Upstream (9):
           {{upstream_run_id}}, {{upstream_pipeline_id}},
           {{upstream_watermark_before}}, {{upstream_watermark_after}},
           {{upstream_rows_extracted}}, {{upstream_rows_loaded}},
@@ -558,6 +612,17 @@ class PipelineRunner:
             "target_schema": contract.target_schema,
             "target_table": contract.target_table,
             "batch_id": run.run_id[:8],
+            # Connection/environment variables — same SQL works across test/stg/prod
+            "environment": contract.environment,
+            "source_host": contract.source_host,
+            "source_database": contract.source_database,
+            "source_user": contract.source_user,
+            "source_port": str(contract.source_port),
+            "target_host": contract.target_host,
+            "target_database": contract.target_database,
+            "target_user": contract.target_user,
+            "target_port": str(contract.target_port),
+            "target_ddl": contract.target_ddl or "",
             # Build 15: upstream context variables
             "upstream_run_id": upstream_run.run_id if upstream_run else "",
             "upstream_pipeline_id": upstream_run.pipeline_id if upstream_run else "",
@@ -719,3 +784,458 @@ class PipelineRunner:
                 )
 
         return src_params, tgt_params
+
+    # ==================================================================
+    # Step DAG executor (Build 18)
+    # ==================================================================
+
+    @staticmethod
+    def _topo_sort(steps: list[StepDefinition]) -> list[StepDefinition]:
+        """Topological sort of step definitions by depends_on.
+
+        Returns steps in execution order. Raises ValueError on cycles.
+        """
+        by_id = {s.step_id: s for s in steps}
+        in_degree = {s.step_id: 0 for s in steps}
+        dependents: dict[str, list[str]] = {s.step_id: [] for s in steps}
+
+        for s in steps:
+            for dep_id in s.depends_on:
+                if dep_id not in by_id:
+                    raise ValueError(
+                        f"Step '{s.step_name}' depends on unknown step_id '{dep_id}'"
+                    )
+                in_degree[s.step_id] += 1
+                dependents[dep_id].append(s.step_id)
+
+        queue = [sid for sid, deg in in_degree.items() if deg == 0]
+        ordered = []
+        while queue:
+            # Sort for deterministic order among peers
+            queue.sort()
+            sid = queue.pop(0)
+            ordered.append(by_id[sid])
+            for child in dependents[sid]:
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+
+        if len(ordered) != len(steps):
+            raise ValueError("Cycle detected in step dependencies")
+        return ordered
+
+    async def _execute_step_dag(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+    ) -> RunRecord:
+        """Execute pipeline as a DAG of composable steps."""
+        self._step_t0 = _time.time()
+        run.execution_log = []
+        self._log_step(run, "start", f"mode={run.run_mode.value}, steps={len(contract.steps)}")
+        log.info("Starting step-DAG run (mode=%s, %d steps)", run.run_mode.value, len(contract.steps))
+
+        # Filter enabled steps only
+        enabled_steps = [s for s in contract.steps if s.enabled]
+        if not enabled_steps:
+            log.warning("No enabled steps — marking complete.")
+            run.status = RunStatus.COMPLETE
+            run.completed_at = now_iso()
+            self._log_step(run, "complete", "no enabled steps")
+            await self.store.save_run(run)
+            return run
+
+        # Topological sort
+        try:
+            ordered = self._topo_sort(enabled_steps)
+        except ValueError as e:
+            run.status = RunStatus.FAILED
+            run.error = f"Step DAG validation failed: {e}"
+            run.completed_at = now_iso()
+            self._log_step(run, "error", run.error, "error")
+            await self.store.save_run(run)
+            return run
+
+        # Preflight
+        if not await self._preflight(contract, run):
+            self._log_step(run, "preflight", "failed", "error")
+            await self._update_error_budget(contract, run)
+            return run
+        self._log_step(run, "preflight", "passed")
+
+        # Resolve connectors once (steps that need them pull from context)
+        src_params, tgt_params = self._connector_params(contract, "both")
+        source = await self.registry.get_source(contract.source_connector_id, src_params)
+        target = await self.registry.get_target(contract.target_connector_id, tgt_params)
+        await target.create_table_if_not_exists(contract)
+        self._log_step(run, "connectors", f"source={contract.source_connector_id[:8]}, target={contract.target_connector_id[:8]}")
+
+        # Load upstream run context
+        upstream_run = None
+        if run.triggered_by_run_id:
+            upstream_run = await self.store.get_run(run.triggered_by_run_id)
+
+        # Step context: shared dict passed between steps (XCom equivalent)
+        ctx: dict = {
+            "source": source,
+            "target": target,
+            "contract": contract,
+            "run": run,
+            "upstream_run": upstream_run,
+            "extract_result": None,
+            "gate_record": None,
+        }
+        step_statuses: dict[str, StepStatus] = {}
+
+        try:
+            for step_def in ordered:
+                # Check if all dependencies succeeded
+                deps_ok = all(
+                    step_statuses.get(d) == StepStatus.COMPLETE
+                    for d in step_def.depends_on
+                )
+                if not deps_ok:
+                    if step_def.skip_on_fail:
+                        step_statuses[step_def.step_id] = StepStatus.SKIPPED
+                        self._log_step(run, f"step:{step_def.step_name}", "skipped (dependency failed)", "warn")
+                        await self._save_step_exec(
+                            run, contract, step_def, StepStatus.SKIPPED,
+                            error="Dependency not met",
+                        )
+                        continue
+                    else:
+                        step_statuses[step_def.step_id] = StepStatus.FAILED
+                        self._log_step(run, f"step:{step_def.step_name}", "failed (dependency not met)", "error")
+                        await self._save_step_exec(
+                            run, contract, step_def, StepStatus.FAILED,
+                            error="Dependency not met",
+                        )
+                        continue
+
+                # Execute the step
+                result_status = await self._execute_step(step_def, ctx, run, contract)
+                step_statuses[step_def.step_id] = result_status
+
+                # If a step halted (quality gate), stop the DAG
+                if result_status == StepStatus.HALTED:
+                    run.status = RunStatus.HALTED
+                    run.completed_at = now_iso()
+                    self._log_step(run, "halt", f"step '{step_def.step_name}' halted the run", "warn")
+                    await self.store.save_run(run)
+                    await self._update_error_budget(contract, run)
+                    return run
+
+                # If a step failed and skip_on_fail is False, fail the run
+                if result_status == StepStatus.FAILED and not step_def.skip_on_fail:
+                    run.status = RunStatus.FAILED
+                    run.completed_at = now_iso()
+                    self._log_step(run, "error", f"step '{step_def.step_name}' failed", "error")
+                    await self.store.save_run(run)
+                    await self._update_error_budget(contract, run)
+                    return run
+
+            # All steps done — finalize
+            run.status = RunStatus.COMPLETE
+            run.completed_at = now_iso()
+
+            # Update baselines and watermark from context
+            extract_result = ctx.get("extract_result")
+            if extract_result and run.run_mode != RunMode.BACKFILL and extract_result.max_watermark:
+                run.watermark_after = extract_result.max_watermark
+                contract.last_watermark = extract_result.max_watermark
+
+            await self._update_baselines(contract, run)
+            await self.store.save_pipeline(contract)
+            await self._track_column_lineage(contract)
+            await self._write_run_metadata(contract, run, extract_result, upstream_run)
+
+            self._log_step(run, "complete", f"{run.rows_extracted} rows, {len(ordered)} steps executed")
+            await self.store.save_run(run)
+            await self._update_error_budget(contract, run)
+            return run
+
+        except Exception as e:
+            log.exception("Step-DAG run failed: %s", e)
+            self._log_step(run, "error", str(e), "error")
+            run.error = str(e)
+            run.status = RunStatus.FAILED
+            run.completed_at = now_iso()
+            await self.store.save_run(run)
+            await self._update_error_budget(contract, run)
+            return run
+
+    async def _execute_step(
+        self,
+        step_def: StepDefinition,
+        ctx: dict,
+        run: RunRecord,
+        contract: PipelineContract,
+    ) -> StepStatus:
+        """Execute a single step and return its status."""
+        t0 = _time.monotonic()
+        step_exec = StepExecution(
+            run_id=run.run_id,
+            pipeline_id=contract.pipeline_id,
+            step_id=step_def.step_id,
+            step_name=step_def.step_name,
+            step_type=step_def.step_type.value if hasattr(step_def.step_type, "value") else step_def.step_type,
+            status=StepStatus.RUNNING,
+            started_at=now_iso(),
+        )
+
+        handler = self._step_handlers.get(step_def.step_type)
+        if not handler:
+            step_exec.status = StepStatus.FAILED
+            step_exec.error = f"Unknown step type: {step_def.step_type}"
+            step_exec.completed_at = now_iso()
+            step_exec.elapsed_ms = int((_time.monotonic() - t0) * 1000)
+            await self.store.save_step_execution(step_exec)
+            self._log_step(run, f"step:{step_def.step_name}", step_exec.error, "error")
+            return StepStatus.FAILED
+
+        retry_count = 0
+        max_retries = step_def.retry_max
+
+        while True:
+            try:
+                output = await handler(self, step_def, ctx, run, contract)
+                step_exec.status = StepStatus.COMPLETE
+                step_exec.output = _json_safe(output) if output else {}
+                step_exec.completed_at = now_iso()
+                step_exec.elapsed_ms = int((_time.monotonic() - t0) * 1000)
+                step_exec.retry_count = retry_count
+                await self.store.save_step_execution(step_exec)
+                self._log_step(run, f"step:{step_def.step_name}", f"complete ({step_exec.elapsed_ms}ms)")
+                return StepStatus.COMPLETE
+
+            except _StepHalt as e:
+                step_exec.status = StepStatus.HALTED
+                step_exec.error = str(e)
+                step_exec.completed_at = now_iso()
+                step_exec.elapsed_ms = int((_time.monotonic() - t0) * 1000)
+                step_exec.retry_count = retry_count
+                await self.store.save_step_execution(step_exec)
+                self._log_step(run, f"step:{step_def.step_name}", f"halted: {e}", "warn")
+                return StepStatus.HALTED
+
+            except Exception as e:
+                retry_count += 1
+                if retry_count <= max_retries:
+                    log.warning(
+                        "Step '%s' failed (attempt %d/%d): %s",
+                        step_def.step_name, retry_count, max_retries + 1, e,
+                    )
+                    continue
+
+                step_exec.status = StepStatus.FAILED
+                step_exec.error = str(e)
+                step_exec.completed_at = now_iso()
+                step_exec.elapsed_ms = int((_time.monotonic() - t0) * 1000)
+                step_exec.retry_count = retry_count - 1
+                await self.store.save_step_execution(step_exec)
+                self._log_step(run, f"step:{step_def.step_name}", f"failed: {e}", "error")
+                return StepStatus.FAILED
+
+    async def _save_step_exec(
+        self,
+        run: RunRecord,
+        contract: PipelineContract,
+        step_def: StepDefinition,
+        status: StepStatus,
+        error: str = "",
+    ) -> None:
+        """Save a step execution record for skipped/blocked steps."""
+        step_exec = StepExecution(
+            run_id=run.run_id,
+            pipeline_id=contract.pipeline_id,
+            step_id=step_def.step_id,
+            step_name=step_def.step_name,
+            step_type=step_def.step_type.value if hasattr(step_def.step_type, "value") else step_def.step_type,
+            status=status,
+            started_at=now_iso(),
+            completed_at=now_iso(),
+            error=error,
+        )
+        await self.store.save_step_execution(step_exec)
+
+    # ------------------------------------------------------------------
+    # Step type handlers
+    # ------------------------------------------------------------------
+
+    async def _step_extract(self, step_def, ctx, run, contract):
+        """Extract data from source."""
+        source = ctx["source"]
+        run.status = RunStatus.EXTRACTING
+        run.watermark_before = contract.last_watermark
+        await self.store.save_run(run)
+
+        staging_dir = self.staging.ensure_run_dir(contract.pipeline_id, run.run_id)
+        extract_result = await source.extract(
+            contract, run, staging_dir, self.config.batch_size,
+        )
+        run.rows_extracted = extract_result.rows_extracted
+        run.staging_path = str(extract_result.staging_path)
+        run.staging_size_bytes = extract_result.staging_size_bytes
+        ctx["extract_result"] = extract_result
+
+        return {
+            "rows_extracted": extract_result.rows_extracted,
+            "staging_size_bytes": extract_result.staging_size_bytes,
+            "max_watermark": extract_result.max_watermark,
+        }
+
+    async def _step_transform(self, step_def, ctx, run, contract):
+        """Execute SQL transform against target."""
+        target = ctx["target"]
+        sql = step_def.config.get("sql", "")
+        if not sql:
+            raise ValueError("Transform step requires 'sql' in config")
+
+        upstream_run = ctx.get("upstream_run")
+        rendered = self._render_hook_sql(sql, contract, run, upstream_run)
+        rows = await target.execute_sql(rendered, step_def.timeout_seconds or 300)
+        return {
+            "rows_affected": len(rows) if rows else 0,
+            "sql": rendered,
+        }
+
+    async def _step_quality_gate(self, step_def, ctx, run, contract):
+        """Run quality gate checks."""
+        target = ctx["target"]
+
+        # Skip if 0 rows extracted and incremental
+        if run.rows_extracted == 0 and contract.refresh_type.value == "incremental":
+            return {"decision": "skip", "reason": "no new rows"}
+
+        run.status = RunStatus.QUALITY_GATE
+        await self.store.save_run(run)
+
+        gate_record = await self.gate.run(contract, run, target)
+        await self.store.save_gate(gate_record)
+        run.gate_decision = gate_record.decision
+        run.quality_results = {
+            "decision": gate_record.decision.value,
+            "checks": [
+                {"name": c.check_name, "status": c.status.value, "detail": c.detail}
+                for c in gate_record.checks
+            ],
+        }
+        ctx["gate_record"] = gate_record
+
+        if gate_record.decision == GateDecision.HALT:
+            raise _StepHalt(f"Quality gate halted: {len(gate_record.checks)} checks")
+
+        return {
+            "decision": gate_record.decision.value,
+            "checks_count": len(gate_record.checks),
+        }
+
+    async def _step_promote(self, step_def, ctx, run, contract):
+        """Promote staging data to target table."""
+        target = ctx["target"]
+
+        # Skip promotion if 0 rows and incremental
+        if run.rows_extracted == 0 and contract.refresh_type.value == "incremental":
+            return {"action": "skipped", "reason": "no new rows"}
+
+        run.status = RunStatus.PROMOTING
+        await self.store.save_run(run)
+
+        # Load to staging first if not already done
+        run.status = RunStatus.LOADING
+        await self.store.save_run(run)
+        await target.load_staging(contract, run)
+
+        run.status = RunStatus.PROMOTING
+        await self.store.save_run(run)
+        await target.promote(contract, run)
+
+        return {"rows_promoted": run.rows_extracted}
+
+    async def _step_cleanup(self, step_def, ctx, run, contract):
+        """Clean up staging data."""
+        self.staging.cleanup_run(contract.pipeline_id, run.run_id)
+        return {"action": "staging_cleaned"}
+
+    async def _step_hook(self, step_def, ctx, run, contract):
+        """Execute a post-promotion SQL hook."""
+        target = ctx["target"]
+        sql = step_def.config.get("sql", "")
+        if not sql:
+            raise ValueError("Hook step requires 'sql' in config")
+
+        upstream_run = ctx.get("upstream_run")
+        rendered = self._render_hook_sql(sql, contract, run, upstream_run)
+
+        # Cleanup guard
+        if any(kw in rendered.upper() for kw in ("DELETE", "TRUNCATE")):
+            if not await self._check_cleanup_allowed(contract):
+                return {"action": "skipped", "reason": "cleanup blocked by data contract"}
+
+        rows = await target.execute_sql(rendered, step_def.timeout_seconds or 300)
+        result_value = _json_safe(dict(rows[0])) if rows else {}
+        return {
+            "rows_returned": len(rows) if rows else 0,
+            "result": result_value,
+        }
+
+    async def _step_sensor(self, step_def, ctx, run, contract):
+        """Wait for a condition to be met before proceeding.
+
+        Config options:
+          - sql: SQL query that must return at least 1 row
+          - timeout_seconds: max wait time (default 300)
+          - poll_seconds: check interval (default 30)
+        """
+        import asyncio
+        target = ctx["target"]
+        sql = step_def.config.get("sql", "")
+        if not sql:
+            raise ValueError("Sensor step requires 'sql' in config")
+
+        timeout = step_def.timeout_seconds or step_def.config.get("timeout_seconds", 300)
+        poll = step_def.config.get("poll_seconds", 30)
+        upstream_run = ctx.get("upstream_run")
+        rendered = self._render_hook_sql(sql, contract, run, upstream_run)
+
+        deadline = _time.monotonic() + timeout
+        attempts = 0
+        while _time.monotonic() < deadline:
+            attempts += 1
+            rows = await target.execute_sql(rendered, 30)
+            if rows:
+                return {"triggered": True, "attempts": attempts, "rows": len(rows)}
+            await asyncio.sleep(poll)
+
+        raise TimeoutError(f"Sensor timed out after {timeout}s ({attempts} attempts)")
+
+    async def _step_custom(self, step_def, ctx, run, contract):
+        """Execute a custom step via its config.
+
+        Currently supports 'sql' execution. Extensible for future step types.
+        """
+        target = ctx["target"]
+        sql = step_def.config.get("sql", "")
+        if sql:
+            upstream_run = ctx.get("upstream_run")
+            rendered = self._render_hook_sql(sql, contract, run, upstream_run)
+            rows = await target.execute_sql(rendered, step_def.timeout_seconds or 300)
+            return {"rows_returned": len(rows) if rows else 0}
+        return {"action": "noop", "reason": "no sql in config"}
+
+    # Map step types to handler methods
+    _step_handlers = {
+        StepType.EXTRACT: _step_extract,
+        StepType.TRANSFORM: _step_transform,
+        StepType.QUALITY_GATE: _step_quality_gate,
+        StepType.PROMOTE: _step_promote,
+        StepType.CLEANUP: _step_cleanup,
+        StepType.HOOK: _step_hook,
+        StepType.SENSOR: _step_sensor,
+        StepType.CUSTOM: _step_custom,
+    }
+
+
+class _StepHalt(Exception):
+    """Raised by a step handler to indicate the DAG should halt (not fail)."""
+    pass

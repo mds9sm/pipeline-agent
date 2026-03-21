@@ -972,6 +972,9 @@ Available actions:
 - pause_pipeline: Pause a pipeline (params: pipeline_id)
 - resume_pipeline: Resume a paused pipeline (params: pipeline_id)
 - design_topology: Design a multi-pipeline architecture from a description (params: description of what the user needs)
+- diagnose_pipeline: Diagnose why a pipeline is failing or unhealthy (params: pipeline_name or pipeline_id)
+- analyze_impact: Analyze downstream impact if a pipeline/table goes down (params: pipeline_name or pipeline_id)
+- check_anomalies: Check for platform-wide anomalies and unusual patterns (params: none)
 - explain: Explain something about the system (params: topic)
 - unknown: Could not determine intent
 
@@ -1129,6 +1132,39 @@ Respond with JSON:
                 "action": "design_topology",
                 "params": {"description": user_text},
                 "response_text": "Designing pipeline topology...",
+            }
+
+        # Diagnose (Build 24)
+        if any(kw in text_lower for kw in (
+            "diagnose", "root cause", "debug pipeline",
+            "why is it failing", "why did it fail", "why failed",
+        )):
+            return {
+                "action": "diagnose_pipeline",
+                "params": {"query": user_text},
+                "response_text": "Diagnosing pipeline...",
+            }
+
+        # Impact analysis (Build 24)
+        if any(kw in text_lower for kw in (
+            "impact", "what breaks", "what happens if",
+            "blast radius", "downstream effect", "who depends",
+        )):
+            return {
+                "action": "analyze_impact",
+                "params": {"query": user_text},
+                "response_text": "Analyzing downstream impact...",
+            }
+
+        # Anomalies (Build 24)
+        if any(kw in text_lower for kw in (
+            "anomal", "unusual", "something wrong", "platform health",
+            "anything weird", "any issues",
+        )):
+            return {
+                "action": "check_anomalies",
+                "params": {},
+                "response_text": "Checking for anomalies across all pipelines...",
             }
 
         # Explain / help
@@ -1387,3 +1423,481 @@ Respond naturally. Guide toward the next step or propose the final pipeline if r
         except Exception as e:
             log.warning("guided_pipeline_response error: %s", e)
             return result_data.get("fallback_text", "Let me help you set up that pipeline.")
+
+    # ------------------------------------------------------------------
+    # Build 24: Diagnostic & Reasoning Layer
+    # ------------------------------------------------------------------
+
+    async def diagnose_pipeline(self, pipeline_id: str) -> dict:
+        """Root-cause diagnosis for a pipeline. Gathers all context, reasons via Claude."""
+        # Gather data
+        p = await self.store.get_pipeline(pipeline_id)
+        if not p:
+            return {"error": "Pipeline not found", "root_cause": "unknown", "summary": "Pipeline not found"}
+
+        runs = await self.store.list_runs(pipeline_id, limit=10)
+        gates = await self.store.get_quality_trend(pipeline_id, limit=10)
+        budget = await self.store.get_error_budget(pipeline_id)
+        deps = await self.store.list_dependencies(pipeline_id)
+        alerts = await self.store.list_alerts_for_pipeline(pipeline_id, limit=10)
+        volume = await self.store.get_volume_history(pipeline_id, limit=10)
+
+        # Upstream health
+        upstream_info = []
+        for dep in deps:
+            up = await self.store.get_pipeline(dep.depends_on_id)
+            up_runs = await self.store.list_runs(dep.depends_on_id, limit=3) if up else []
+            upstream_info.append({
+                "name": up.pipeline_name if up else dep.depends_on_id,
+                "status": up.status.value if up and hasattr(up.status, "value") else "unknown",
+                "recent_runs": [
+                    {"status": r.status.value if hasattr(r.status, "value") else r.status, "error": r.error or ""}
+                    for r in up_runs
+                ],
+            })
+
+        # Source connector status
+        connectors = await self.store.list_connectors()
+        src_conn = next((c for c in connectors if c.connector_id == p.source_connector_id), None)
+
+        if not self.has_api:
+            return self._rule_based_diagnosis(p, runs, gates, budget, upstream_info, src_conn)
+
+        # Format context for Claude
+        runs_text = "\n".join(
+            f"  {r.started_at}: {r.status.value if hasattr(r.status, 'value') else r.status}"
+            f" | rows={r.rows_extracted} | error={r.error or 'none'}"
+            for r in runs
+        ) or "  No recent runs"
+
+        gates_text = "\n".join(
+            f"  {g.evaluated_at}: {g.decision.value if hasattr(g.decision, 'value') else g.decision}"
+            for g in gates
+        ) or "  No quality gate history"
+
+        budget_text = "No error budget data"
+        if budget:
+            budget_text = (
+                f"success_rate={budget.success_rate:.1%}, "
+                f"budget_remaining={budget.budget_remaining:.3f}, "
+                f"escalated={budget.escalated}, "
+                f"window={budget.window_days}d, "
+                f"{budget.failed_runs}/{budget.total_runs} failed"
+            )
+
+        upstream_text = "\n".join(
+            f"  {u['name']}: status={u['status']}, recent=[{', '.join(r['status'] for r in u['recent_runs'])}]"
+            for u in upstream_info
+        ) or "  No upstream dependencies"
+
+        alerts_text = "\n".join(
+            f"  [{a.severity.value if hasattr(a.severity, 'value') else a.severity}] {a.summary}"
+            for a in alerts[:5]
+        ) or "  No recent alerts"
+
+        volume_text = "\n".join(
+            f"  {v.get('started_at', '?')}: {v.get('rows_extracted', 0)} rows"
+            for v in volume[:10]
+        ) or "  No volume history"
+
+        user_prompt = f"""Diagnose this pipeline and identify the root cause of its issues.
+
+Pipeline: {p.pipeline_name} ({p.pipeline_id[:8]})
+Status: {p.status.value if hasattr(p.status, 'value') else p.status}
+Schedule: {p.schedule_cron}
+Source: {p.source_schema}.{p.source_table} (connector: {src_conn.connector_name if src_conn else 'unknown'}, status: {src_conn.status.value if src_conn and hasattr(src_conn.status, 'value') else 'unknown'})
+Target: {p.target_schema}.{p.target_table}
+Environment: {p.environment}
+
+Recent runs (newest first):
+{runs_text}
+
+Quality gate trend:
+{gates_text}
+
+Error budget: {budget_text}
+
+Upstream dependencies:
+{upstream_text}
+
+Recent alerts:
+{alerts_text}
+
+Volume history:
+{volume_text}
+
+Respond with JSON:
+{{
+  "root_cause": "concise description of the primary issue",
+  "category": "source_issue|connector_issue|upstream_dependency|quality_regression|scheduling|configuration|data_issue|unknown",
+  "confidence": 0.0-1.0,
+  "evidence": ["list of specific evidence points"],
+  "recommended_actions": [
+    {{"action": "description", "priority": "critical|high|medium|low", "automated": true/false}}
+  ],
+  "upstream_health": "healthy|degraded|failing",
+  "pattern_detected": "description of any recurring pattern or null",
+  "summary": "2-3 sentence human-readable summary"
+}}"""
+
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=pipeline_id,
+                operation="diagnose_pipeline",
+                temperature=0.2,
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("diagnose_pipeline Claude error: %s. Using rule-based fallback.", e)
+            return self._rule_based_diagnosis(p, runs, gates, budget, upstream_info, src_conn)
+
+    def _rule_based_diagnosis(self, p, runs, gates, budget, upstream_info, src_conn) -> dict:
+        """Simple heuristic diagnosis when no API key is available."""
+        evidence = []
+        category = "unknown"
+        root_cause = "Unable to determine root cause without more data"
+
+        # Check last run
+        if runs:
+            last = runs[0]
+            status = last.status.value if hasattr(last.status, "value") else last.status
+            if status == "failed" and last.error:
+                evidence.append(f"Last run failed: {last.error}")
+                if "connector" in last.error.lower() or "connection" in last.error.lower():
+                    category = "connector_issue"
+                    root_cause = f"Connection failure: {last.error}"
+                elif "upstream" in last.error.lower():
+                    category = "upstream_dependency"
+                    root_cause = f"Upstream dependency issue: {last.error}"
+                else:
+                    category = "data_issue"
+                    root_cause = last.error
+            elif status == "halted":
+                evidence.append("Last run halted by quality gate")
+                category = "quality_regression"
+                root_cause = "Quality gate halted the last run — data quality check failed"
+
+            # Count recent failures
+            fail_count = sum(1 for r in runs if (r.status.value if hasattr(r.status, "value") else r.status) in ("failed", "halted"))
+            if fail_count > 3:
+                evidence.append(f"{fail_count}/{len(runs)} recent runs failed/halted")
+
+        # Check upstream
+        for u in upstream_info:
+            if u["status"] != "active":
+                evidence.append(f"Upstream '{u['name']}' is {u['status']}")
+                category = "upstream_dependency"
+                root_cause = f"Upstream pipeline '{u['name']}' is {u['status']}"
+            for r in u["recent_runs"]:
+                if r["status"] in ("failed", "halted"):
+                    evidence.append(f"Upstream '{u['name']}' has recent {r['status']}")
+
+        # Check connector
+        if src_conn:
+            conn_status = src_conn.status.value if hasattr(src_conn.status, "value") else src_conn.status
+            if conn_status != "active":
+                evidence.append(f"Source connector '{src_conn.connector_name}' is {conn_status}")
+                category = "connector_issue"
+                root_cause = f"Source connector is {conn_status}"
+
+        # Check error budget
+        if budget and budget.escalated:
+            evidence.append(f"Error budget exhausted: {budget.success_rate:.1%} success rate")
+
+        return {
+            "root_cause": root_cause,
+            "category": category,
+            "confidence": 0.5,
+            "evidence": evidence or ["No specific evidence found — pipeline may be healthy"],
+            "recommended_actions": [
+                {"action": "Check pipeline logs and recent run errors", "priority": "high", "automated": False},
+            ],
+            "upstream_health": "unknown",
+            "pattern_detected": None,
+            "summary": f"Rule-based diagnosis for {p.pipeline_name}: {root_cause}",
+        }
+
+    async def analyze_impact(self, pipeline_id: str) -> dict:
+        """Analyze downstream impact if a pipeline goes down."""
+        p = await self.store.get_pipeline(pipeline_id)
+        if not p:
+            return {"error": "Pipeline not found", "impact_severity": "unknown"}
+
+        downstream = await self.store.get_all_downstream_recursive(pipeline_id)
+        contracts = await self.store.list_data_contracts(producer_id=pipeline_id)
+
+        # Column lineage
+        lineage = []
+        try:
+            all_lineage = await self.store.list_column_lineage(pipeline_id)
+            lineage = [
+                {"source": f"{l.source_column}", "target": f"{l.target_table}.{l.target_column}"}
+                for l in all_lineage[:20]
+            ]
+        except Exception:
+            pass
+
+        if not self.has_api:
+            return self._rule_based_impact(p, downstream, contracts, lineage)
+
+        downstream_text = "\n".join(
+            f"  [{d['depth']}] {d['pipeline_name']} (status={d['status']}, schedule={d['schedule_cron']}, tier={d['tier']})"
+            for d in downstream
+        ) or "  No downstream pipelines"
+
+        contracts_text = "\n".join(
+            f"  consumer={c.consumer_pipeline_id[:8]}, freshness_sla={c.freshness_sla_minutes}m, cleanup={c.cleanup_ownership.value if hasattr(c.cleanup_ownership, 'value') else c.cleanup_ownership}"
+            for c in contracts
+        ) or "  No data contracts as producer"
+
+        lineage_text = "\n".join(
+            f"  {l['source']} → {l['target']}" for l in lineage[:15]
+        ) or "  No column lineage tracked"
+
+        user_prompt = f"""Analyze the downstream impact if this pipeline goes down or becomes unavailable.
+
+Pipeline: {p.pipeline_name} ({p.pipeline_id[:8]})
+Target table: {p.target_schema}.{p.target_table}
+Tier: {p.tier}
+Schedule: {p.schedule_cron}
+
+Downstream pipelines (transitive, [depth] name):
+{downstream_text}
+
+Data contracts (this pipeline is producer):
+{contracts_text}
+
+Column lineage from this pipeline:
+{lineage_text}
+
+Respond with JSON:
+{{
+  "impact_severity": "critical|high|medium|low|none",
+  "affected_pipelines": [
+    {{"pipeline_name": "...", "pipeline_id": "...", "depth": N, "impact_type": "direct|transitive", "sla_at_risk": true/false}}
+  ],
+  "affected_contracts": [
+    {{"consumer": "...", "freshness_sla_minutes": N, "will_violate": true/false}}
+  ],
+  "blast_radius": {{"pipelines": N, "tables": N, "contracts": N}},
+  "mitigation_options": [
+    {{"option": "description", "effort": "low|medium|high"}}
+  ],
+  "summary": "2-3 sentence plain English summary"
+}}"""
+
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=pipeline_id,
+                operation="analyze_impact",
+                temperature=0.2,
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("analyze_impact Claude error: %s. Using rule-based fallback.", e)
+            return self._rule_based_impact(p, downstream, contracts, lineage)
+
+    def _rule_based_impact(self, p, downstream, contracts, lineage) -> dict:
+        """Heuristic impact analysis."""
+        total = len(downstream)
+        severity = "none"
+        if total >= 5 or p.tier == 1:
+            severity = "critical"
+        elif total >= 3 or contracts:
+            severity = "high"
+        elif total >= 1:
+            severity = "medium"
+
+        return {
+            "impact_severity": severity,
+            "affected_pipelines": [
+                {
+                    "pipeline_name": d["pipeline_name"],
+                    "pipeline_id": d["pipeline_id"],
+                    "depth": d["depth"],
+                    "impact_type": "direct" if d["depth"] == 1 else "transitive",
+                    "sla_at_risk": True,
+                }
+                for d in downstream
+            ],
+            "affected_contracts": [
+                {
+                    "consumer": c.consumer_pipeline_id[:8],
+                    "freshness_sla_minutes": c.freshness_sla_minutes,
+                    "will_violate": True,
+                }
+                for c in contracts
+            ],
+            "blast_radius": {
+                "pipelines": total,
+                "tables": total,
+                "contracts": len(contracts),
+            },
+            "mitigation_options": [
+                {"option": "Investigate and fix the root cause", "effort": "medium"},
+                {"option": "Pause downstream pipelines to prevent cascading failures", "effort": "low"},
+            ],
+            "summary": f"{p.pipeline_name} has {total} downstream pipeline(s) and {len(contracts)} data contract(s). "
+                       f"Impact severity: {severity}.",
+        }
+
+    async def reason_about_anomalies(self) -> dict:
+        """Platform-wide anomaly detection with contextual reasoning."""
+        from datetime import datetime, timezone
+
+        pipelines = await self.store.list_pipelines(status="active")
+        recent_failures = await self.store.list_recent_failures(hours=24)
+
+        # Pre-filter: only include pipelines with anomalous signals
+        anomalous = []
+        for p in pipelines:
+            signals = []
+            volume = await self.store.get_volume_history(p.pipeline_id, limit=10)
+
+            # Volume anomaly: >30% deviation from average
+            if len(volume) >= 3:
+                counts = [v.get("rows_extracted", 0) for v in volume]
+                avg = sum(counts) / len(counts) if counts else 0
+                latest = counts[0] if counts else 0
+                if avg > 0:
+                    deviation = abs(latest - avg) / avg
+                    if deviation > 0.3:
+                        direction = "drop" if latest < avg else "spike"
+                        signals.append({
+                            "type": f"volume_{direction}",
+                            "latest": latest,
+                            "average": round(avg, 1),
+                            "deviation_pct": round(deviation * 100, 1),
+                        })
+
+            # Recent failures for this pipeline
+            p_failures = [f for f in recent_failures if f.pipeline_id == p.pipeline_id]
+            if len(p_failures) >= 2:
+                signals.append({
+                    "type": "repeated_failure",
+                    "count": len(p_failures),
+                    "errors": list(set(f.error or "unknown" for f in p_failures[:3])),
+                })
+
+            # Error budget
+            budget = await self.store.get_error_budget(p.pipeline_id)
+            if budget and budget.budget_remaining < 0.05 and budget.total_runs > 0:
+                signals.append({
+                    "type": "error_budget_low",
+                    "success_rate": budget.success_rate,
+                    "remaining": budget.budget_remaining,
+                })
+
+            if signals:
+                anomalous.append({
+                    "pipeline_id": p.pipeline_id,
+                    "pipeline_name": p.pipeline_name,
+                    "tier": p.tier,
+                    "schedule_cron": p.schedule_cron,
+                    "signals": signals,
+                })
+
+        # Short-circuit if nothing anomalous — skip Claude call
+        if not anomalous:
+            return {
+                "anomalies": [],
+                "cross_pipeline_patterns": [],
+                "platform_health": "healthy",
+                "summary": f"All {len(pipelines)} active pipelines are operating normally. No anomalies detected.",
+            }
+
+        if not self.has_api:
+            return self._rule_based_anomalies(pipelines, anomalous, recent_failures)
+
+        now = datetime.now(timezone.utc)
+        anomaly_text = ""
+        for a in anomalous[:20]:  # Cap at 20 to manage context
+            anomaly_text += f"\n  {a['pipeline_name']} (tier {a['tier']}, schedule: {a['schedule_cron']}):\n"
+            for s in a["signals"]:
+                if s["type"].startswith("volume_"):
+                    anomaly_text += f"    - {s['type']}: latest={s['latest']}, avg={s['average']}, deviation={s['deviation_pct']}%\n"
+                elif s["type"] == "repeated_failure":
+                    anomaly_text += f"    - {s['count']} failures in 24h: {', '.join(s['errors'][:2])}\n"
+                elif s["type"] == "error_budget_low":
+                    anomaly_text += f"    - Error budget low: {s['success_rate']:.1%} success, {s['remaining']:.3f} remaining\n"
+
+        user_prompt = f"""Analyze these anomalies across the data platform and provide contextual reasoning.
+Today is {now.strftime('%Y-%m-%d')}, {now.strftime('%A')}.
+
+Platform summary:
+- Active pipelines: {len(pipelines)}
+- Pipelines with anomalies: {len(anomalous)}
+- Total failures (24h): {len(recent_failures)}
+
+Anomalies detected:
+{anomaly_text}
+
+Consider:
+- Is the anomaly expected for this day/time (weekends, month-end, holidays)?
+- Are multiple pipelines failing for the same root cause (shared source, same connector)?
+- Is this a gradual degradation or a sudden change?
+
+Respond with JSON:
+{{
+  "anomalies": [
+    {{
+      "pipeline_id": "...",
+      "pipeline_name": "...",
+      "anomaly_type": "volume_drop|volume_spike|repeated_failure|error_budget_low",
+      "severity": "critical|warning|info",
+      "observation": "what was observed",
+      "reasoning": "contextual explanation",
+      "is_expected": true/false,
+      "recommended_action": "what to do"
+    }}
+  ],
+  "cross_pipeline_patterns": ["correlated patterns across pipelines"],
+  "platform_health": "healthy|degraded|critical",
+  "summary": "2-3 sentence overall assessment"
+}}"""
+
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                operation="reason_about_anomalies",
+                temperature=0.3,
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("reason_about_anomalies Claude error: %s. Using rule-based fallback.", e)
+            return self._rule_based_anomalies(pipelines, anomalous, recent_failures)
+
+    def _rule_based_anomalies(self, pipelines, anomalous, recent_failures) -> dict:
+        """Heuristic anomaly assessment."""
+        anomalies = []
+        for a in anomalous:
+            for s in a["signals"]:
+                severity = "warning"
+                if a["tier"] == 1 or s["type"] == "error_budget_low":
+                    severity = "critical"
+                anomalies.append({
+                    "pipeline_id": a["pipeline_id"],
+                    "pipeline_name": a["pipeline_name"],
+                    "anomaly_type": s["type"],
+                    "severity": severity,
+                    "observation": json.dumps(s),
+                    "reasoning": "Rule-based detection — no contextual reasoning available without API key",
+                    "is_expected": False,
+                    "recommended_action": "Investigate manually",
+                })
+
+        health = "healthy"
+        if any(a["severity"] == "critical" for a in anomalies):
+            health = "critical"
+        elif anomalies:
+            health = "degraded"
+
+        return {
+            "anomalies": anomalies,
+            "cross_pipeline_patterns": [],
+            "platform_health": health,
+            "summary": f"{len(anomalous)} of {len(pipelines)} active pipelines show anomalies. "
+                       f"{len(recent_failures)} failures in last 24h.",
+        }

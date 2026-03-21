@@ -16,6 +16,7 @@ import yaml
 from contracts.models import (
     PipelineContract, ColumnMapping, QualityConfig,
     PipelineStatus, RefreshType, ReplicationMethod, LoadType,
+    StepDefinition, StepType,
     new_id, now_iso,
 )
 
@@ -109,6 +110,21 @@ def pipeline_to_dict(
         "notification_policy_id": contract.notification_policy_id,
         "tier_config": contract.tier_config or {},
         "agent_reasoning": contract.agent_reasoning or {},
+
+        "steps": [
+            {
+                "step_id": s.step_id,
+                "step_name": s.step_name,
+                "step_type": _enum_val(s.step_type),
+                "depends_on": s.depends_on,
+                "config": s.config,
+                "retry_max": s.retry_max,
+                "timeout_seconds": s.timeout_seconds,
+                "skip_on_fail": s.skip_on_fail,
+                "enabled": s.enabled,
+            }
+            for s in (contract.steps or [])
+        ],
 
         "_metadata": {
             "pipeline_id": contract.pipeline_id,
@@ -276,6 +292,9 @@ def dict_to_pipeline(
         # Approval
         auto_approve_additive_schema=appr.get("auto_approve_additive_schema", False),
         approval_notification_channel=appr.get("notification_channel", ""),
+
+        # Steps (Build 18)
+        steps=_parse_steps_from_dict(data.get("steps", [])),
     )
 
 
@@ -386,6 +405,24 @@ def snapshot_state(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _parse_steps_from_dict(raw_steps: list) -> list:
+    """Parse steps from YAML dict to StepDefinition list."""
+    if not raw_steps:
+        return []
+    result = []
+    for s in raw_steps:
+        # Work on a copy to avoid mutating the input
+        d = dict(s)
+        st = d.get("step_type", "extract")
+        if isinstance(st, str):
+            try:
+                d["step_type"] = StepType(st)
+            except ValueError:
+                d["step_type"] = StepType.EXTRACT
+        result.append(StepDefinition(**d))
+    return result
+
 
 def _to_enum(enum_cls, value):
     """Safely convert a string to an enum, handling already-enum values."""

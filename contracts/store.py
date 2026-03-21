@@ -138,6 +138,7 @@ class ContractStore:
         qc_json = json.dumps(asdict(p.quality_config))
         scp_json = json.dumps(asdict(p.schema_change_policy)) if p.schema_change_policy else json.dumps({})
         hooks_json = json.dumps([asdict(h) for h in p.post_promotion_hooks])
+        steps_json = json.dumps([asdict(s) for s in p.steps])
         await self.pool.execute("""
             INSERT INTO pipelines (
                 pipeline_id, pipeline_name, version, created_at, updated_at,
@@ -156,11 +157,11 @@ class ContractStore:
                 baseline_row_count, baseline_null_rates, baseline_null_stddevs,
                 baseline_cardinality, baseline_volume_avg, baseline_volume_stddev,
                 auto_approve_additive_schema, approval_notification_channel,
-                schema_change_policy, post_promotion_hooks
+                schema_change_policy, post_promotion_hooks, steps
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
                 $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
-                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55
+                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56
             )
             ON CONFLICT (pipeline_id) DO UPDATE SET
                 pipeline_name=EXCLUDED.pipeline_name, version=EXCLUDED.version,
@@ -204,7 +205,8 @@ class ContractStore:
                 auto_approve_additive_schema=EXCLUDED.auto_approve_additive_schema,
                 approval_notification_channel=EXCLUDED.approval_notification_channel,
                 schema_change_policy=EXCLUDED.schema_change_policy,
-                post_promotion_hooks=EXCLUDED.post_promotion_hooks
+                post_promotion_hooks=EXCLUDED.post_promotion_hooks,
+                steps=EXCLUDED.steps
         """,
             p.pipeline_id, p.pipeline_name, p.version, p.created_at, p.updated_at,
             p.status.value, p.environment,
@@ -227,7 +229,7 @@ class ContractStore:
             json.dumps(p.baseline_null_stddevs), json.dumps(p.baseline_cardinality),
             p.baseline_volume_avg, p.baseline_volume_stddev,
             p.auto_approve_additive_schema, p.approval_notification_channel,
-            scp_json, hooks_json,
+            scp_json, hooks_json, steps_json,
         )
 
     async def get_pipeline(self, pipeline_id: str) -> Optional[PipelineContract]:
@@ -267,8 +269,9 @@ class ContractStore:
                 staging_path, staging_size_bytes,
                 drift_detected, quality_results, gate_decision,
                 error, retry_count,
-                triggered_by_run_id, triggered_by_pipeline_id
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                triggered_by_run_id, triggered_by_pipeline_id,
+                execution_log
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
             ON CONFLICT (run_id) DO UPDATE SET
                 completed_at=EXCLUDED.completed_at, status=EXCLUDED.status,
                 rows_extracted=EXCLUDED.rows_extracted, rows_loaded=EXCLUDED.rows_loaded,
@@ -281,7 +284,8 @@ class ContractStore:
                 gate_decision=EXCLUDED.gate_decision,
                 error=EXCLUDED.error, retry_count=EXCLUDED.retry_count,
                 triggered_by_run_id=EXCLUDED.triggered_by_run_id,
-                triggered_by_pipeline_id=EXCLUDED.triggered_by_pipeline_id
+                triggered_by_pipeline_id=EXCLUDED.triggered_by_pipeline_id,
+                execution_log=EXCLUDED.execution_log
         """,
             r.run_id, r.pipeline_id, r.started_at, r.completed_at,
             r.status.value, r.run_mode.value,
@@ -294,6 +298,7 @@ class ContractStore:
             r.gate_decision.value if r.gate_decision else None,
             r.error, r.retry_count,
             r.triggered_by_run_id, r.triggered_by_pipeline_id,
+            json.dumps(r.execution_log) if r.execution_log else None,
         )
 
     async def get_run(self, run_id: str) -> Optional[RunRecord]:
@@ -763,6 +768,17 @@ class ContractStore:
             ORDER BY checked_at DESC LIMIT 1
         """, pipeline_id)
         return _row_to_freshness(row) if row else None
+
+    async def list_freshness_history(
+        self, pipeline_id: str, hours: int = 24,
+    ) -> list[FreshnessSnapshot]:
+        rows = await self.pool.fetch("""
+            SELECT * FROM freshness_snapshots
+            WHERE pipeline_id = $1
+              AND checked_at::timestamptz >= NOW() - make_interval(hours => $2)
+            ORDER BY checked_at ASC
+        """, pipeline_id, hours)
+        return [_row_to_freshness(r) for r in rows]
 
     # ==================================================================
     # Alerts
@@ -1335,6 +1351,119 @@ class ContractStore:
             WHERE source_id = $1
         """, source_id, json.dumps(cache), now_iso())
 
+    # ------------------------------------------------------------------
+    # Step Executions (Build 18)
+    # ------------------------------------------------------------------
+
+    async def save_step_execution(self, se) -> None:
+        """Upsert a step execution record."""
+        from contracts.models import StepExecution
+        await self.pool.execute("""
+            INSERT INTO step_executions (
+                step_execution_id, run_id, pipeline_id, step_id, step_name,
+                step_type, status, started_at, completed_at, output,
+                error, retry_count, elapsed_ms
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ON CONFLICT (step_execution_id) DO UPDATE SET
+                status=EXCLUDED.status,
+                started_at=EXCLUDED.started_at,
+                completed_at=EXCLUDED.completed_at,
+                output=EXCLUDED.output,
+                error=EXCLUDED.error,
+                retry_count=EXCLUDED.retry_count,
+                elapsed_ms=EXCLUDED.elapsed_ms
+        """,
+            se.step_execution_id, se.run_id, se.pipeline_id, se.step_id,
+            se.step_name, se.step_type, se.status.value if hasattr(se.status, "value") else se.status,
+            se.started_at, se.completed_at,
+            json.dumps(se.output), se.error, se.retry_count, se.elapsed_ms,
+        )
+
+    async def list_step_executions(self, run_id: str) -> list:
+        """List all step executions for a run."""
+        from contracts.models import StepExecution, StepStatus
+        rows = await self.pool.fetch(
+            "SELECT * FROM step_executions WHERE run_id = $1 ORDER BY started_at ASC NULLS LAST",
+            run_id,
+        )
+        results = []
+        for row in rows:
+            results.append(StepExecution(
+                step_execution_id=row["step_execution_id"],
+                run_id=row["run_id"],
+                pipeline_id=row["pipeline_id"],
+                step_id=row["step_id"],
+                step_name=row["step_name"],
+                step_type=row["step_type"],
+                status=StepStatus(row["status"]),
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                output=json.loads(row["output"]) if row["output"] else {},
+                error=row["error"],
+                retry_count=row["retry_count"],
+                elapsed_ms=row["elapsed_ms"],
+            ))
+        return results
+
+    # ==================================================================
+    # Diagnostic queries (Build 24)
+    # ==================================================================
+
+    async def list_recent_failures(self, hours: int = 48) -> list[RunRecord]:
+        """All failed/halted runs across all pipelines in the given window."""
+        rows = await self.pool.fetch("""
+            SELECT * FROM runs
+            WHERE status IN ('failed', 'halted')
+              AND started_at >= (NOW() - make_interval(hours => $1))::text
+            ORDER BY started_at DESC
+        """, hours)
+        return [_row_to_run(r) for r in rows]
+
+    async def get_quality_trend(self, pipeline_id: str, limit: int = 20) -> list[GateRecord]:
+        """Recent quality gate evaluations for a pipeline."""
+        rows = await self.pool.fetch(
+            "SELECT * FROM gates WHERE pipeline_id = $1 ORDER BY evaluated_at DESC LIMIT $2",
+            pipeline_id, limit,
+        )
+        return [_row_to_gate(r) for r in rows]
+
+    async def get_volume_history(self, pipeline_id: str, limit: int = 20) -> list[dict]:
+        """Recent completed run row counts for volume trend analysis."""
+        rows = await self.pool.fetch("""
+            SELECT run_id, started_at, completed_at, status, rows_extracted, rows_loaded
+            FROM runs WHERE pipeline_id = $1 AND status = 'complete'
+            ORDER BY started_at DESC LIMIT $2
+        """, pipeline_id, limit)
+        return [dict(r) for r in rows]
+
+    async def get_all_downstream_recursive(
+        self, pipeline_id: str, max_depth: int = 10,
+    ) -> list[dict]:
+        """Walk the dependency graph to find all transitive downstream pipelines."""
+        visited: set[str] = set()
+        result: list[dict] = []
+        queue: list[tuple[str, int]] = [(pipeline_id, 0)]
+        while queue:
+            current_id, depth = queue.pop(0)
+            if current_id in visited or depth > max_depth:
+                continue
+            visited.add(current_id)
+            dependents = await self.list_dependents(current_id)
+            for dep in dependents:
+                if dep.pipeline_id not in visited:
+                    p = await self.get_pipeline(dep.pipeline_id)
+                    if p:
+                        result.append({
+                            "pipeline_id": p.pipeline_id,
+                            "pipeline_name": p.pipeline_name,
+                            "status": p.status.value if hasattr(p.status, "value") else p.status,
+                            "schedule_cron": p.schedule_cron,
+                            "tier": p.tier,
+                            "depth": depth + 1,
+                        })
+                    queue.append((dep.pipeline_id, depth + 1))
+        return result
+
 
 # ======================================================================
 # Row-to-model helpers (module-level, stateless)
@@ -1424,6 +1553,7 @@ def _row_to_pipeline(row: asyncpg.Record) -> PipelineContract:
         approval_notification_channel=row["approval_notification_channel"],
         schema_change_policy=_parse_schema_change_policy(row),
         post_promotion_hooks=_parse_post_promotion_hooks(row),
+        steps=_parse_steps(row),
     )
 
 
@@ -1448,6 +1578,7 @@ def _row_to_run(row: asyncpg.Record) -> RunRecord:
         gate_decision=GateDecision(row["gate_decision"]) if row["gate_decision"] else None,
         error=row["error"],
         retry_count=row["retry_count"],
+        execution_log=json.loads(row["execution_log"]) if row.get("execution_log") else None,
         triggered_by_run_id=row.get("triggered_by_run_id"),
         triggered_by_pipeline_id=row.get("triggered_by_pipeline_id"),
     )
@@ -1545,6 +1676,27 @@ def _parse_post_promotion_hooks(row: asyncpg.Record) -> list[PostPromotionHook]:
     if not parsed:
         return []
     return [PostPromotionHook(**h) for h in parsed]
+
+
+def _parse_steps(row: asyncpg.Record) -> list:
+    """Deserialize steps JSON from a pipeline row."""
+    raw = row.get("steps")
+    if not raw:
+        return []
+    parsed = json.loads(raw) if isinstance(raw, str) else raw
+    if not parsed:
+        return []
+    from contracts.models import StepDefinition, StepType
+    result = []
+    for s in parsed:
+        st = s.get("step_type", "extract")
+        if isinstance(st, str):
+            try:
+                s["step_type"] = StepType(st)
+            except ValueError:
+                s["step_type"] = StepType.EXTRACT
+        result.append(StepDefinition(**s))
+    return result
 
 
 def _row_to_dependency(row: asyncpg.Record) -> PipelineDependency:
@@ -1807,7 +1959,8 @@ CREATE TABLE IF NOT EXISTS pipelines (
     auto_approve_additive_schema BOOLEAN NOT NULL DEFAULT FALSE,
     approval_notification_channel TEXT NOT NULL DEFAULT '',
     schema_change_policy JSONB NOT NULL DEFAULT '{}',
-    post_promotion_hooks JSONB NOT NULL DEFAULT '[]'
+    post_promotion_hooks JSONB NOT NULL DEFAULT '[]',
+    steps JSONB NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -2097,7 +2250,25 @@ CREATE TABLE IF NOT EXISTS pipeline_changelog (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS step_executions (
+    step_execution_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    pipeline_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    step_name TEXT NOT NULL DEFAULT '',
+    step_type TEXT NOT NULL DEFAULT 'extract',
+    status TEXT NOT NULL DEFAULT 'pending',
+    started_at TEXT,
+    completed_at TEXT,
+    output JSONB NOT NULL DEFAULT '{}',
+    error TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    elapsed_ms INTEGER NOT NULL DEFAULT 0
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_step_executions_run ON step_executions(run_id);
+CREATE INDEX IF NOT EXISTS idx_step_executions_pipeline ON step_executions(pipeline_id);
 CREATE INDEX IF NOT EXISTS idx_chat_interactions_session ON chat_interactions(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_interactions_username ON chat_interactions(username, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_interactions_created ON chat_interactions(created_at DESC);
@@ -2143,7 +2314,10 @@ ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS post_promotion_hooks JSONB NOT NU
 -- Build 15: Run context propagation
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS triggered_by_run_id TEXT;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS triggered_by_pipeline_id TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_log JSONB;
 -- Build 16: Data contracts (tables created via CREATE IF NOT EXISTS; no ALTER needed)
+-- Build 18: Composable step DAGs
+ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS steps JSONB NOT NULL DEFAULT '[]';
 """
 
 # Alias used by several modules (agent, scheduler, monitor, api).

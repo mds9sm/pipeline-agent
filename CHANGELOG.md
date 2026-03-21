@@ -14,14 +14,346 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 15 | Run context propagation | **Done** | Upstream run context (watermarks, batch IDs) flows to downstream pipelines |
 | 16 | Data contracts between pipelines | **Done** | Formalize producer/consumer relationships, cleanup policies, retention |
 | 17 | SQL-native intra-DB steps | **Skipped** | Agent handles per-pipeline via custom connectors/hooks — not a platform feature |
-| 18 | Composable step DAG | Deferred | Needs user experience to inform design. Discussed, deferred until real usage patterns emerge |
+| 18 | Composable step DAG | **Done** | Replace fixed extract→load→promote with configurable step DAGs (Airflow replacement path) |
 | 19 | DAG visualization UI | **Done** | Visual pipeline dependency graph with execution status |
 | 20 | Agent topology reasoning | **Done** | Agent designs multi-pipeline architectures from natural language |
 | 21 | Analyst experience layer | **Done** | Source registry, guided conversation, schedule parser, pipeline changelog, interaction audit |
+| 22 | Observability UX — execution logs, freshness charts, lineage consolidation | **Done** | Full pipeline execution visibility, time-series freshness, unified DAG+lineage view |
+| 23 | GitOps pipeline config versioning | **Done** | Separate git repo for pipeline YAML + connector code, auto-committed on every mutation |
 
 ---
 
 ## [Unreleased]
+
+### Build 25: In-App Documentation & CLI — 2026-03-21 (Claude Opus 4.6)
+
+**Documentation available within the DAPOS web UI, plus a full CLI for scripting and CI/CD.**
+
+#### Added
+- **In-app documentation** (`api/server.py`, `ui/App.jsx`):
+  - `GET /api/docs` — returns doc tree from `docs/` directory
+  - `GET /api/docs/{path}` — serves markdown content with path traversal protection
+  - `DocsView` React component with sidebar navigation, internal link handling, back history
+  - `simpleMarkdown()` renderer: code blocks, headings, bold/italic, links, tables, lists
+  - "Docs" tab added to main navigation (icon: `i`)
+- **CLI** (`cli/__main__.py`):
+  - 14 commands: health, pipelines list/get/trigger/pause/resume, trigger, runs, steps, connectors, diagnose, impact, anomalies, alerts, chat, export, token
+  - Token caching to `~/.dapos_token`, fuzzy pipeline name resolution
+  - `--json` flag on all data commands, config via `DAPOS_URL`/`DAPOS_USER`/`DAPOS_PASSWORD`
+- **Structured documentation** (`docs/`):
+  - 8 doc files: index, quickstart, architecture, configuration, cli-reference, api-reference, concepts/pipelines, concepts/step-dags
+  - Modeled after Apache Airflow docs structure
+
+#### Changed
+- Cache version bumped to v=37 in `index.html`
+
+### Build 24: Agent Diagnostic & Reasoning Layer - 2026-03-21 (Claude Opus 4.6)
+
+**The agent reasons about pipeline health, downstream impact, and platform-wide anomalies — capabilities that Fivetran, Airflow, and Monte Carlo cannot replicate without an LLM reasoning layer.**
+
+#### Added
+- **Pipeline diagnosis** (`agent/core.py: diagnose_pipeline`):
+  - Gathers 10 data sources: recent runs, quality gate trend, error budget, upstream dependencies + their run health, source connector status, alerts, volume history
+  - Claude reasons about root cause with structured output: category, confidence, evidence, recommended actions, pattern detection
+  - Rule-based fallback when no API key: checks last run errors, upstream failures, connector status, error budget
+  - Categories: `source_issue`, `connector_issue`, `upstream_dependency`, `quality_regression`, `scheduling`, `configuration`, `data_issue`, `unknown`
+
+- **Impact analysis** (`agent/core.py: analyze_impact`):
+  - Recursive BFS walk of dependency graph (`store.get_all_downstream_recursive`) with max_depth=10
+  - Gathers downstream pipelines, data contracts (as producer), column lineage
+  - Claude assesses blast radius, SLA risk, mitigation options
+  - Rule-based fallback: severity by downstream count and tier
+
+- **Proactive anomaly reasoning** (`agent/core.py: reason_about_anomalies`):
+  - Pre-filters all active pipelines for anomalous signals before Claude call (cost optimization):
+    - Volume deviation >30% from historical average
+    - 2+ failures in 24h
+    - Error budget remaining <5%
+  - Short-circuits with "healthy" response if no anomalies detected (no Claude call)
+  - Claude considers day-of-week patterns, correlated failures, gradual vs sudden changes
+  - Runs automatically every 15 minutes in observability loop
+  - Critical unexpected anomalies auto-create CRITICAL alerts
+
+- **4 new store methods** (`contracts/store.py`):
+  - `list_recent_failures(hours)` — failed/halted runs across all pipelines
+  - `get_quality_trend(pipeline_id, limit)` — recent gate evaluations
+  - `get_volume_history(pipeline_id, limit)` — completed run row counts
+  - `get_all_downstream_recursive(pipeline_id, max_depth)` — transitive dependency walk
+
+- **3 REST API endpoints** (`api/server.py`):
+  - `POST /api/pipelines/{id}/diagnose` — root-cause diagnosis (10/min rate limit)
+  - `POST /api/pipelines/{id}/impact` — downstream impact analysis (10/min rate limit)
+  - `GET /api/observability/anomalies` — platform-wide anomaly scan (10/min rate limit)
+
+- **3 chat actions** routed via natural language:
+  - "Why is X failing?" / "diagnose" → `diagnose_pipeline`
+  - "What breaks if X goes down?" / "impact" / "blast radius" → `analyze_impact`
+  - "Any anomalies?" / "platform health" / "anything unusual" → `check_anomalies`
+
+- **Pipeline name resolution** (`_resolve_pipeline` helper):
+  - Matches by exact ID, exact name, substring, or word overlap
+  - Filters out common stop words for better fuzzy matching
+
+- **Proactive observability** (`main.py`):
+  - `_check_anomalies()` runs every 15 minutes in the observability loop
+  - Creates CRITICAL alerts for unexpected anomalies automatically
+  - Logs anomaly count even when all are expected/non-critical
+
+- **CLI** (`cli/__main__.py`) — Full command-line interface for DAPOS:
+  - `python -m cli health` — platform health check
+  - `python -m cli pipelines list` — list pipelines with table formatting
+  - `python -m cli pipelines get <name>` — pipeline detail
+  - `python -m cli trigger <name>` — trigger a run
+  - `python -m cli runs <name>` — recent runs
+  - `python -m cli steps <name>` — show step DAG
+  - `python -m cli connectors` — list connectors
+  - `python -m cli diagnose <name>` — root cause diagnosis
+  - `python -m cli impact <name>` — downstream impact
+  - `python -m cli anomalies` — platform-wide anomaly scan
+  - `python -m cli alerts` — recent alerts
+  - `python -m cli chat <text>` — natural language command
+  - `python -m cli export` — YAML export
+  - `python -m cli token` — print auth token for scripting
+  - All commands support `--json` for machine-readable output
+  - Pipeline name fuzzy resolution (substring match)
+  - Token caching in `~/.dapos_token`
+  - Config via `DAPOS_URL`, `DAPOS_USER`, `DAPOS_PASSWORD` env vars
+
+- **Documentation** (`docs/`):
+  - `docs/index.md` — Documentation index with Getting Started, Concepts, Operations, Agent, Advanced sections
+  - `docs/quickstart.md` — 5-minute quickstart guide
+  - `docs/architecture.md` — System architecture diagram and component map
+  - `docs/configuration.md` — Full environment variable reference
+  - `docs/cli-reference.md` — CLI command reference with examples
+  - `docs/api-reference.md` — REST API endpoint reference (40+ endpoints)
+  - `docs/concepts/pipelines.md` — Pipeline contracts, lifecycle, strategies
+  - `docs/concepts/step-dags.md` — Composable step DAGs, step types, execution model
+
+- **8 new tests** in `test-pipeline-agent.sh`:
+  - Diagnose (200 + 404), impact (200 + 404), anomalies (200), chat routing (3 tests)
+
+#### Key Design Decisions
+- **Pre-filter before Claude call** — Anomaly reasoning iterates all active pipelines but only sends anomalous ones to Claude. If nothing is anomalous, the Claude call is skipped entirely. This keeps cost proportional to problems, not pipeline count.
+- **Rule-based fallbacks everywhere** — All three methods work without an API key via heuristic analysis. The agent degrades gracefully.
+- **Recursive BFS for impact** — Uses iterative BFS with visited set and max_depth=10 to handle circular dependencies safely.
+- **34 template variables** — Added 10 connection/environment variables (host, database, user, port, environment) so the same transform SQL works across test/stg/prod.
+
+---
+
+### Build 18: Composable Step DAGs - 2026-03-21 (Claude Opus 4.6)
+
+**Replace the fixed extract→load→promote flow with configurable step DAGs, enabling Airflow-style pipeline composition.**
+
+#### Added
+- **Step data model** (`contracts/models.py`):
+  - `StepType` enum: `extract`, `transform`, `quality_gate`, `promote`, `cleanup`, `hook`, `sensor`, `custom`
+  - `StepStatus` enum: `pending`, `running`, `complete`, `failed`, `skipped`, `halted`
+  - `StepDefinition` dataclass: step_id, step_name, step_type, depends_on, config, retry_max, timeout_seconds, skip_on_fail, enabled
+  - `StepExecution` dataclass: tracks per-step execution with status, output, error, timing, retries
+  - Added `steps: list[StepDefinition]` to `PipelineContract`
+
+- **Step DAG executor** (`agent/autonomous.py`):
+  - **Dual-path execution**: `_execute_inner()` dispatches to `_execute_legacy()` (empty steps) or `_execute_step_dag()` (steps defined)
+  - Full backward compatibility — existing pipelines with `steps=[]` use the legacy path unchanged
+  - Topological sort with cycle detection (`_topo_sort()`)
+  - Step context dict passed between steps (XCom equivalent in-memory)
+  - Per-step retry logic with configurable `retry_max`
+  - `skip_on_fail` support — failed dependency → skip downstream vs fail run
+  - `_StepHalt` exception for quality gate halts (distinct from failures)
+  - 8 step type handlers:
+    - `_step_extract` — extract from source, populate staging
+    - `_step_transform` — execute SQL against target with template variable rendering
+    - `_step_quality_gate` — run 7-check quality gate, halt on HALT decision
+    - `_step_promote` — load staging + promote to target table
+    - `_step_cleanup` — clean up staging files
+    - `_step_hook` — execute post-promotion SQL with cleanup guard
+    - `_step_sensor` — poll SQL query until condition met (with timeout)
+    - `_step_custom` — extensible SQL execution
+
+- **Database schema** (`contracts/store.py`):
+  - `steps JSONB NOT NULL DEFAULT '[]'` column on `pipelines` table
+  - `step_executions` table with indexes on run_id, pipeline_id, step_id
+  - `save_step_execution()` and `list_step_executions()` store methods
+  - `_parse_steps()` helper for deserializing JSONB to StepDefinition list
+  - ALTER TABLE migration for existing databases
+
+- **YAML codec** (`contracts/yaml_codec.py`):
+  - Steps exported in `pipeline_to_dict()` with full step definition
+  - Steps imported via `_parse_steps_from_dict()` in `dict_to_pipeline()`
+  - Round-trip serialization: YAML ↔ StepDefinition
+
+- **10 connection/environment template variables** (`agent/autonomous.py`):
+  - `{{environment}}` — resolves to `test`, `staging`, `production` etc.
+  - `{{source_host}}`, `{{source_database}}`, `{{source_user}}`, `{{source_port}}`
+  - `{{target_host}}`, `{{target_database}}`, `{{target_user}}`, `{{target_port}}`
+  - `{{target_ddl}}`
+  - Same SQL works across environments — connection details resolve from the pipeline contract
+  - Total template variables: 34 (15 run context + 10 connection + 9 upstream)
+
+- **5 REST API endpoints** (`api/server.py`):
+  - `GET /api/pipelines/{id}/steps` — step DAG definition
+  - `GET /api/runs/{run_id}/steps` — step executions for a run
+  - `POST /api/pipelines/{id}/steps/validate` — validate DAG (cycle detection, missing deps)
+  - `GET /api/pipelines/{id}/steps/preview` — preview execution order
+  - Steps included in pipeline detail response and PATCH updates
+  - `steps` field on `CreatePipelineRequest` and `UpdatePipelineRequest`
+  - `step_count` in pipeline summary responses
+
+#### Key Design Decisions
+- **Dual-path execution** — Existing pipelines continue working via `_execute_legacy()`. Only pipelines with `steps` defined use the DAG executor. Zero migration required.
+- **Step context as in-memory dict** — Like Airflow's XCom but simpler. Steps pass data through `ctx` dict during execution. Outputs persisted to `step_executions.output` for post-run inspection.
+- **Halt vs Fail distinction** — Quality gate steps raise `_StepHalt` to stop the DAG without marking it as a failure. Preserves staging for investigation.
+- **Sensor pattern** — Sensor steps poll a SQL condition, enabling event-driven DAGs within a pipeline (e.g., wait for upstream table to be populated).
+- **Retry per step** — Each step has its own `retry_max`, enabling different retry strategies for extract (retry 3x) vs promote (no retry).
+
+---
+
+### Build 23: GitOps Pipeline Config Versioning - 2026-03-21 (Claude Opus 4.6)
+
+**Separate git repo for pipeline configs and connector code, auto-committed on every structural change**
+
+#### Added
+- **`gitops/repo.py`** — `GitOpsRepo` class managing a separate git repository:
+  - `init_repo()` — creates repo with README, `pipelines/` and `connectors/` directories
+  - `commit_pipeline(pipeline, yaml_content, message, author)` — writes YAML and commits
+  - `commit_connector(connector, message, author)` — writes Python code with metadata header
+  - `commit_all(pipelines, connectors, message, author)` — bulk sync, single commit
+  - `delete_pipeline(pipeline_name, message, author)` — removes YAML file
+  - `get_log(limit)`, `get_file_at_commit()`, `get_diff()`, `get_pipeline_history()` — read operations
+  - `status()` — returns repo state summary (branch, head, file counts)
+  - All git operations via `subprocess.run()` with 30s timeout
+
+- **GitOps auto-commit hooks** — Pipeline YAML auto-committed on every structural change:
+  - Pipeline create → commit YAML
+  - Pipeline update (PATCH) → commit YAML with version
+  - Pipeline pause/resume → commit YAML
+  - Approval applied → commit pipeline YAML (schema changes) or connector code (new connectors)
+  - Author tracked from JWT caller identity
+
+- **Boot sync** — On startup, all pipelines + connectors bulk-committed to repo:
+  - Full export of all pipeline YAML (credentials masked) and connector code
+  - Single commit with summary message
+
+- **Multi-developer remote sync** — Supports team environments with shared remote:
+  - `_pull()` — fetch + rebase before every commit (auto_pull)
+  - `_push()` — push after every commit with retry on reject (auto_push)
+  - Clone from remote on first init if `PIPELINE_REPO_REMOTE` is set
+  - Conflict resolution: rebase for non-overlapping changes; abort + preserve local on true conflicts (DAPOS DB is source of truth, next boot sync reconciles)
+  - `status()` reports sync state: `in_sync`, `ahead`, `behind`, `diverged`
+
+- **Branch-per-environment** — `PIPELINE_REPO_BRANCH` enables isolation:
+  - `dev`, `staging`, `prod` branches on same remote repo
+  - Each DAPOS instance targets its own branch
+  - Review/promote via standard git merge/PR workflow between branches
+
+- **Configuration** — 6 environment variables:
+  - `PIPELINE_REPO_PATH` — path to the local git repo (empty = disabled)
+  - `PIPELINE_REPO_BRANCH` — branch name (default: `main`)
+  - `PIPELINE_REPO_REMOTE` — remote URL for shared repo (empty = local only)
+  - `GITOPS_AUTO_PUSH` — push after commit (default: `true`, requires remote)
+  - `GITOPS_AUTO_PULL` — pull before commit (default: `true`, requires remote)
+  - `GITOPS_SYNC_ON_BOOT` — enable/disable boot sync (default: `false`)
+  - `Config.has_gitops` property for feature toggle
+
+- **Disaster recovery: restore from repo** — `POST /api/gitops/restore?dry_run=true`:
+  - Reads all `pipelines/*.yaml` and `connectors/*.py` from the git repo
+  - Upserts into PostgreSQL using existing `save_pipeline()` / `save_connector()` (idempotent)
+  - Dry-run mode (default) previews what would be restored without making changes
+  - Pipeline YAML parsed via `yaml_to_pipelines(preserve_id=True)` to preserve original IDs
+  - Connector code parsed from `.py` files with metadata header extraction
+  - Admin-only endpoint, rate-limited to 5/minute
+  - Pulls latest from remote before restore if remote is configured
+
+- **Automatic conflict reconciliation** — Observability loop checks every 5 minutes:
+  - When a rebase conflict is detected, `_needs_reconcile` flag is set
+  - On next 5-minute tick, full DB state is rewritten to repo and force-pushed
+  - `reconcile()` method rewrites all files from PostgreSQL (source of truth)
+  - Uses `--force-with-lease` for safe force-push
+
+- **6 GitOps REST API endpoints**:
+  - `GET /api/gitops/status` — repo status (enabled, branch, head, file counts, sync_status)
+  - `GET /api/gitops/log?limit=20` — recent commit log
+  - `GET /api/gitops/pipelines/{id}/history?limit=20` — per-pipeline commit history
+  - `GET /api/gitops/diff?commit_a=HEAD~1&commit_b=HEAD` — diff between commits
+  - `GET /api/gitops/file?filepath=...&commit=HEAD` — file content at commit
+  - `POST /api/gitops/restore?dry_run=true` — restore DB from repo (admin-only)
+
+- **5 new tests** in `test-pipeline-agent.sh`:
+  - GitOps status endpoint, log endpoint, diff endpoint, per-pipeline history, restore dry-run
+
+#### Key Design Decisions
+- **Separate repo (Option A) over internal versioning** — Pipeline configs live in their own git repo (`client1-dags-repo`), not mixed with DAPOS source code. Enables independent review, external CI/CD triggers, and clear separation between platform code and pipeline definitions.
+- **Fire-and-forget commits** — GitOps commits never block or fail the primary operation. All wrapped in try/except with warning logs. A failed git commit doesn't prevent a pipeline from being created or updated.
+- **Credentials masked in YAML** — All committed YAML uses `pipeline_to_yaml(mask_credentials=True)` to prevent secrets from entering version control.
+- **Author propagation** — JWT `sub` claim flows through to git commit author, creating an audit trail of who changed what.
+- **DAPOS is source of truth** — On conflict, local state (from PostgreSQL) wins. The repo is a derived artifact of DB state, not the other way around. Boot sync reconciles any drift.
+
+---
+
+### Build 22: Observability UX — Execution Logs, Freshness Charts, Lineage Consolidation - 2026-03-21 (Claude Opus 4.6)
+
+**Structured execution logging, freshness time-series charts, consolidated lineage/DAG view, expandable run details**
+
+#### Added
+- **Structured execution logging** — Every pipeline run captures a step-by-step execution log with timing:
+  - `RunRecord.execution_log` field (JSONB) stores structured entries: `{ts, step, detail, status, elapsed_ms}`
+  - `PipelineRunner._log_step()` helper appends entries during execution
+  - 13 instrumented steps: start, preflight, connectors, extract, skip, load_staging, quality_gate, halt, promote, watermark, cleanup, column_lineage, metadata, hooks, complete, error
+  - `execution_log` column added to runs table via `_ALTER_TABLES_SQL`
+  - Exposed in `_run_summary()` API response
+
+- **Execution log timeline UI** — Expandable run detail (`ActivityRunDetail`) shows:
+  - Visual timeline with color-coded dots (green=ok, amber=warn, red=error)
+  - Step name, detail text, and elapsed milliseconds per step
+  - Vertical connector line for timeline flow
+
+- **Expandable run details in Activity tab** — `ActivityRunDetail` component:
+  - Metadata grid: duration, mode, rows extracted/loaded, staging size, retries, timestamps
+  - Watermark before→after with visual arrows
+  - Triggered-by info with pipeline/run IDs
+  - Quality gate checks with per-check status dots
+  - Error detail in red box
+  - Filter buttons (All/Completed/Failed/Halted)
+
+- **Freshness time-series chart** — `FreshnessChart` SVG component:
+  - Staleness plotted over time (X=check timestamp, Y=staleness minutes)
+  - Dashed threshold lines for warn (amber) and critical (red) SLA levels
+  - Color-coded dots per snapshot (green/amber/red by status)
+  - Green area fill gradient under the curve
+  - Time range selector: 6h, 24h, 3d, 7d
+  - Y-axis labels auto-scaled, grid lines, time tick labels
+
+- **Freshness history API** — `GET /api/observability/freshness/{pipeline_id}/history?hours=24`:
+  - `Store.list_freshness_history(pipeline_id, hours)` queries accumulated snapshots
+  - Returns staleness_minutes, sla_met, status, checked_at per snapshot
+
+- **Expandable freshness cards** — `FreshnessCard` component with detail grid:
+  - Warn/critical thresholds, freshness column, schedule, last record time, last run, rows, target table
+  - Chart embedded in expanded view
+  - API enriched with schedule_cron, freshness_column, freshness_critical_minutes, last_run_at, last_run_rows, target_table
+
+- **Consolidated Lineage + DAG view** — Merged separate Lineage and Pipeline DAG tabs:
+  - Single "Lineage" tab with full DAG visualization
+  - Search input filters nodes by name/source/target/owner with highlight + neighbor visibility
+  - SVG zoom/pan via viewBox manipulation, mouse events, scroll wheel
+  - +/-/fit controls
+  - Column-level lineage in node detail panel (fetches `/api/lineage/{id}`)
+
+- **Pipeline detail fixes**:
+  - Fixed blank screen on demo-stripe-charges (ErrorBudgetCard, RunRow extracted as proper components)
+  - Fixed quality_results rendering (reads `.checks` array, not `Object.entries`)
+  - Fixed lineage API 500 error (replaced broken `get_downstream_columns` call)
+  - Fixed ColumnLineage attribute names (`id` not `lineage_id`, `transformation` not `transform_logic`)
+  - Changelog section in pipeline detail (amber box, shows `recent_changes`)
+  - Cache-Control headers on HTML responses
+
+#### Key Design Decisions
+- **Execution log on RunRecord, not separate table** — Logs are always accessed with their run. JSONB column avoids join overhead and keeps the run as the unit of observability.
+- **SVG for charts, no external library** — Consistent with DAG visualization approach. No Chart.js/D3 dependency. Pure React + SVG.
+- **Freshness snapshots already accumulated** — `save_freshness` inserts new rows (unique snapshot_id per check). History API just needed a time-filtered query.
+- **Consolidated lineage over separate views** — User confirmed Lineage tab showed nothing useful alone. Combined with DAG for one comprehensive view.
+
+---
 
 ### Build 21: Analyst Experience — Source Registry, Guided Conversation, Audit Trail - 2026-03-21 (Claude Opus 4.6)
 

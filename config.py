@@ -54,6 +54,14 @@ class Config:
         # Encryption (Fernet key for credentials at rest)
         self.encryption_key = os.getenv("ENCRYPTION_KEY", "")
 
+        # GitOps (external repo for pipeline configs)
+        self.pipeline_repo_path = os.getenv("PIPELINE_REPO_PATH", "")
+        self.pipeline_repo_branch = os.getenv("PIPELINE_REPO_BRANCH", "main")
+        self.gitops_sync_on_boot = os.getenv("GITOPS_SYNC_ON_BOOT", "false").lower() == "true"
+        self.pipeline_repo_remote = os.getenv("PIPELINE_REPO_REMOTE", "")  # e.g. git@github.com:org/client1-dags-repo.git
+        self.gitops_auto_push = os.getenv("GITOPS_AUTO_PUSH", "true").lower() == "true"
+        self.gitops_auto_pull = os.getenv("GITOPS_AUTO_PULL", "true").lower() == "true"
+
     @property
     def staging_dir(self):
         return os.path.join(self.data_dir, "staging")
@@ -77,6 +85,10 @@ class Config:
     @property
     def has_embeddings(self):
         return bool(self.voyage_api_key)
+
+    @property
+    def has_gitops(self):
+        return bool(self.pipeline_repo_path)
 
     @property
     def pg_dsn(self):

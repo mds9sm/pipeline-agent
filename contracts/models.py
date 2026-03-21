@@ -445,6 +445,9 @@ class PipelineContract:
     # Post-promotion SQL hooks (Build 13)
     post_promotion_hooks: list[PostPromotionHook] = field(default_factory=list)
 
+    # Composable step DAG (Build 18) — empty list = legacy mode
+    steps: list[StepDefinition] = field(default_factory=list)
+
     def get_schema_policy(self) -> SchemaChangePolicy:
         """Return the effective schema change policy (explicit > tier default)."""
         if self.schema_change_policy:
@@ -481,6 +484,7 @@ class RunRecord:
     gate_decision: Optional[GateDecision] = None
     error: Optional[str] = None
     retry_count: int = 0
+    execution_log: Optional[list] = None  # structured step-by-step execution log
     # Build 15: upstream trigger context
     triggered_by_run_id: Optional[str] = None
     triggered_by_pipeline_id: Optional[str] = None
@@ -797,6 +801,26 @@ class RegisteredSource:
     updated_at: str = field(default_factory=now_iso)
 
 
+class StepType(str, Enum):
+    EXTRACT = "extract"
+    TRANSFORM = "transform"
+    QUALITY_GATE = "quality_gate"
+    PROMOTE = "promote"
+    CLEANUP = "cleanup"
+    HOOK = "hook"
+    SENSOR = "sensor"
+    CUSTOM = "custom"
+
+
+class StepStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    HALTED = "halted"
+
+
 class PipelineChangeType(str, Enum):
     CREATED = "created"
     UPDATED = "updated"
@@ -849,6 +873,42 @@ class ChatInteraction:
     model: str = ""
     error: Optional[str] = None
     created_at: str = field(default_factory=now_iso)
+
+
+# ---------------------------------------------------------------------------
+# Build 18: Composable Step DAGs
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StepDefinition:
+    """One step in a pipeline's step DAG. Stored as JSONB on PipelineContract."""
+    step_id: str = field(default_factory=new_id)
+    step_name: str = ""
+    step_type: StepType = StepType.EXTRACT
+    depends_on: list[str] = field(default_factory=list)  # step_ids within this pipeline
+    config: dict = field(default_factory=dict)  # type-specific config
+    retry_max: int = 0       # 0 = use pipeline default
+    timeout_seconds: int = 0  # 0 = use pipeline default
+    skip_on_fail: bool = False  # if True, downstream steps continue
+    enabled: bool = True
+
+
+@dataclass
+class StepExecution:
+    """Runtime record for a single step within a run."""
+    step_execution_id: str = field(default_factory=new_id)
+    run_id: str = ""
+    pipeline_id: str = ""
+    step_id: str = ""        # FK to StepDefinition.step_id
+    step_name: str = ""
+    step_type: str = ""
+    status: StepStatus = StepStatus.PENDING
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    output: dict = field(default_factory=dict)  # step results (XCom-like)
+    error: Optional[str] = None
+    retry_count: int = 0
+    elapsed_ms: int = 0
 
 
 @dataclass

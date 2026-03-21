@@ -260,6 +260,55 @@ function Login({ onLogin }) {
 }
 
 // ---------------------------------------------------------------------------
+// Onboarding Guide — spotlight style, no overlay
+// ---------------------------------------------------------------------------
+
+const GUIDE_HINTS = {
+  command: {
+    title: "Welcome to DAPOS",
+    text: "Describe what you need and the AI builds, runs, and monitors your pipelines. This is your Command tab \u2014 ask anything in plain language. Try: \"list my pipelines\" or \"why is orders failing\"",
+  },
+  pipelines: {
+    title: "Pipelines",
+    text: "All your data pipelines with status, schedule, and quick actions. Click any pipeline to see config, trigger runs, or edit settings.",
+  },
+  activity: {
+    title: "Activity",
+    text: "Every pipeline run with a 13-step execution timeline. Expand a run to see extract \u2192 load \u2192 quality gate \u2192 promote detail.",
+  },
+  freshness: {
+    title: "Freshness",
+    text: "Data staleness monitoring with time-series charts. Each pipeline is measured against its SLA \u2014 green means fresh, red means stale.",
+  },
+  quality: {
+    title: "Quality",
+    text: "7-check quality gate trends: count reconciliation, schema consistency, PK uniqueness, null rates, volume z-score, sample verification, freshness.",
+  },
+  alerts: {
+    title: "Alerts",
+    text: "Pipeline failures, SLA breaches, and anomaly alerts. Dispatches to Slack, email, or PagerDuty based on tier.",
+  },
+  dag: {
+    title: "Lineage",
+    text: "Visual dependency graph showing how pipelines connect. See upstream/downstream relationships and data contracts.",
+  },
+  connectors: {
+    title: "Connectors",
+    text: "Source and target connectors \u2014 8 built-in, unlimited via AI generation. Ask the agent to generate any connector you need.",
+  },
+  costs: {
+    title: "Costs",
+    text: "Every AI call tracked with token counts and latency. See exactly what the agent costs per operation.",
+  },
+  docs: {
+    title: "Docs",
+    text: "Full documentation: quickstart, architecture, API reference, concepts, and more \u2014 all available in-app.",
+  },
+};
+
+const GUIDE_ORDER = ["command", "pipelines", "activity", "freshness", "quality", "alerts", "dag", "connectors", "costs", "docs"];
+
+// ---------------------------------------------------------------------------
 // Sidebar
 // ---------------------------------------------------------------------------
 
@@ -274,32 +323,64 @@ const NAV = [
   { id: "connectors", label: "Connectors", icon: "@" },
   { id: "alerts", label: "Alerts", icon: "!" },
   { id: "costs", label: "Costs", icon: "$" },
+  { id: "docs", label: "Docs", icon: "i" },
 ];
 
-function Sidebar({ view, setView, tierFilter, setTierFilter, user, onLogout }) {
+function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSearchQuery, user, onLogout, guideStep, onGuideNav }) {
+  const guideId = guideStep !== null ? GUIDE_ORDER[guideStep] : null;
+
   return (
-    <div className="w-56 min-h-screen bg-white border-r border-stone-200 flex flex-col">
+    <div className="w-56 min-h-screen bg-white border-r border-stone-200 flex flex-col shrink-0">
       <div className="px-5 py-4 border-b border-stone-200">
         <div className="text-sm font-semibold text-stone-800 font-ui">DAPOS</div>
         <div className="text-xs text-stone-400 mt-0.5">Agentic Data Platform</div>
       </div>
       <nav className="flex-1 px-2 py-3 space-y-0.5">
-        {NAV.map((n) => (
-          <button
-            key={n.id}
-            onClick={() => setView(n.id)}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors ${
-              view === n.id
-                ? "bg-blue-50 text-blue-700 font-medium"
-                : "text-stone-500 hover:bg-stone-100 hover:text-stone-700"
-            }`}
-          >
-            <span className="text-xs font-mono w-4 text-center opacity-60">{n.icon}</span>
-            {n.label}
-          </button>
-        ))}
+        {NAV.map((n) => {
+          const isGuideTarget = guideId === n.id;
+          return (
+            <button
+              key={n.id}
+              data-nav-id={n.id}
+              onClick={() => {
+                setView(n.id);
+                if (guideStep !== null && GUIDE_ORDER.includes(n.id)) {
+                  onGuideNav(n.id);
+                }
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors ${
+                view === n.id
+                  ? "bg-blue-50 text-blue-700 font-medium"
+                  : "text-stone-500 hover:bg-stone-100 hover:text-stone-700"
+              } ${isGuideTarget ? "ring-2 ring-blue-400 ring-offset-1" : ""}`}
+            >
+              <span className="text-xs font-mono w-4 text-center opacity-60">{n.icon}</span>
+              {n.label}
+              {isGuideTarget && (
+                <span className="ml-auto w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+              )}
+            </button>
+          );
+        })}
       </nav>
-      <div className="px-3 py-3 border-t border-stone-200">
+      <div className="px-3 py-2 border-t border-stone-200">
+        <div className="relative">
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search pipelines..."
+            className="w-full text-xs px-2.5 py-1.5 border border-stone-200 rounded-lg bg-stone-50 focus:outline-none focus:border-blue-300 focus:bg-white font-mono"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery("")}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 text-xs"
+            >&times;</button>
+          )}
+        </div>
+      </div>
+      <div className="px-3 py-2 border-t border-stone-200">
         <div className="text-xs text-stone-400 mb-2 px-1">Tier filter</div>
         <div className="flex gap-1">
           {["All", "T1", "T2", "T3"].map((t) => (
@@ -335,17 +416,89 @@ function Sidebar({ view, setView, tierFilter, setTierFilter, user, onLogout }) {
 }
 
 // ---------------------------------------------------------------------------
+// Guide Tooltip — rendered as a fixed-position portal in the App, not inside sidebar
+// ---------------------------------------------------------------------------
+
+function GuideTooltip({ guideStep, setView, onGuideNav, onGuideFinish }) {
+  const guideId = GUIDE_ORDER[guideStep];
+  const hint = GUIDE_HINTS[guideId];
+  const isLastStep = guideStep === GUIDE_ORDER.length - 1;
+  const [pos, setPos] = useState({ top: 100, left: 240 });
+
+  useEffect(() => {
+    const el = document.querySelector(`[data-nav-id="${guideId}"]`);
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      setPos({ top: rect.top, left: rect.right + 12 });
+    }
+  }, [guideId]);
+
+  if (!hint) return null;
+
+  return (
+    <div className="fixed z-50" style={{ top: pos.top, left: pos.left, width: 300 }}>
+      <div className="bg-white border border-stone-200 rounded-xl shadow-lg p-4">
+        {/* Arrow pointing left */}
+        <div className="absolute -left-2 top-3 w-0 h-0" style={{ borderTop: "6px solid transparent", borderBottom: "6px solid transparent", borderRight: "8px solid #e5e0d8" }} />
+        <div className="absolute top-3 w-0 h-0" style={{ left: "-5.5px", borderTop: "5px solid transparent", borderBottom: "5px solid transparent", borderRight: "7px solid white", marginTop: "1px" }} />
+
+        <div className="text-xs text-blue-600 font-semibold uppercase tracking-wider mb-1">{hint.title}</div>
+        <p className="text-sm text-stone-600 leading-relaxed">{hint.text}</p>
+
+        <div className="flex items-center justify-between mt-3 pt-3 border-t border-stone-100">
+          <span className="text-xs text-stone-300">{guideStep + 1} / {GUIDE_ORDER.length}</span>
+          <div className="flex gap-2">
+            <button
+              onClick={onGuideFinish}
+              className="text-xs text-stone-400 hover:text-stone-600 px-2 py-1"
+            >
+              End tour
+            </button>
+            <button
+              onClick={() => {
+                if (isLastStep) {
+                  onGuideFinish();
+                } else {
+                  const nextId = GUIDE_ORDER[guideStep + 1];
+                  setView(nextId);
+                  onGuideNav(nextId);
+                }
+              }}
+              className="text-xs text-white bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded-md font-medium"
+            >
+              {isLastStep ? "Done" : "Next"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 1. Command View (agent-routed)
 // ---------------------------------------------------------------------------
 
+const CHAT_GREETING = { role: "agent", text: "Hello! I'm DAPOS. I can help you connect to databases, discover schemas, set up data pipelines, analyze quality, and much more.\n\nTry asking me to discover tables in a database, profile a table, or create a pipeline. What would you like to do?" };
+
 function CommandView() {
-  const [messages, setMessages] = useState([
-    { role: "agent", text: "Hello! I'm DAPOS. I can help you connect to databases, discover schemas, set up data pipelines, analyze quality, and much more.\n\nTry asking me to discover tables in a database, profile a table, or create a pipeline. What would you like to do?" },
-  ]);
+  const [messages, setMessages] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem("pa_chat");
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return [CHAT_GREETING];
+  });
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [sessionId] = useState(() => "session-" + Date.now());
+  const [sessionId] = useState(() => sessionStorage.getItem("pa_session") || "session-" + Date.now());
   const endRef = useRef();
+
+  // Persist chat and session to sessionStorage
+  useEffect(() => {
+    try { sessionStorage.setItem("pa_chat", JSON.stringify(messages)); } catch {}
+  }, [messages]);
+  useEffect(() => { sessionStorage.setItem("pa_session", sessionId); }, [sessionId]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -451,7 +604,7 @@ function CommandView() {
 // ---------------------------------------------------------------------------
 
 
-function PipelinesView({ tierFilter }) {
+function PipelinesView({ tierFilter, searchQuery }) {
   const [pipelines, setPipelines] = useState([]);
   const [expanded, setExpanded] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -465,6 +618,10 @@ function PipelinesView({ tierFilter }) {
     const tierParam = tierFilter !== "All" ? `&tier=${tierFilter[1]}` : "";
     api("GET", `/api/pipelines?${tierParam}`).then(setPipelines).catch(console.error);
   }, [tierFilter]);
+
+  const filteredPipelines = searchQuery
+    ? pipelines.filter((p) => p.pipeline_name?.toLowerCase().includes(searchQuery))
+    : pipelines;
 
   async function expand(p) {
     if (expanded === p.pipeline_id) {
@@ -660,7 +817,7 @@ function PipelinesView({ tierFilter }) {
     <div className="px-6 py-4">
       <h1 className="text-lg font-semibold mb-4 text-stone-800">Pipelines</h1>
       <div className="space-y-2">
-        {pipelines.map((p) => (
+        {filteredPipelines.map((p) => (
           <div key={p.pipeline_id} className="bg-white border border-stone-200 rounded-xl overflow-hidden">
             <div
               className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-stone-50 transition-colors"
@@ -1282,6 +1439,28 @@ function ActivityRunDetail({ r }) {
             </div>
           )}
 
+          {/* Execution Log */}
+          {r.execution_log && r.execution_log.length > 0 && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Execution Log</div>
+              <div className="relative pl-4 border-l-2 border-stone-200 space-y-1.5">
+                {r.execution_log.map((entry, i) => {
+                  const stepColor = entry.status === "error" ? "bg-red-400" : entry.status === "warn" ? "bg-amber-400" : "bg-green-400";
+                  return (
+                    <div key={i} className="relative flex items-start gap-2 text-xs">
+                      <div className={`absolute -left-[21px] top-1 w-2.5 h-2.5 rounded-full ${stepColor} ring-2 ring-white`} />
+                      <div className="flex-1 flex items-baseline gap-2 min-w-0">
+                        <span className="font-mono font-medium text-stone-700 whitespace-nowrap">{entry.step}</span>
+                        {entry.detail && <span className="text-stone-400 truncate">{entry.detail}</span>}
+                      </div>
+                      <span className="text-stone-300 font-mono whitespace-nowrap text-[10px]">{entry.elapsed_ms}ms</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Error detail */}
           {r.error && (
             <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2">
@@ -1298,7 +1477,7 @@ function ActivityRunDetail({ r }) {
   );
 }
 
-function ActivityView() {
+function ActivityView({ searchQuery }) {
   const [runs, setRuns] = useState([]);
   const [filter, setFilter] = useState("all");
   useEffect(() => {
@@ -1317,10 +1496,11 @@ function ActivityView() {
       .catch(console.error);
   }, []);
 
-  const filtered = filter === "all" ? runs
-    : filter === "failed" ? runs.filter((r) => r.status === "failed" || r.status === "halted")
-    : filter === "complete" ? runs.filter((r) => r.status === "complete")
-    : runs;
+  const searched = searchQuery ? runs.filter((r) => r.pipeline_name?.toLowerCase().includes(searchQuery)) : runs;
+  const filtered = filter === "all" ? searched
+    : filter === "failed" ? searched.filter((r) => r.status === "failed" || r.status === "halted")
+    : filter === "complete" ? searched.filter((r) => r.status === "complete")
+    : searched;
 
   return (
     <div className="px-6 py-4">
@@ -1356,7 +1536,174 @@ function ActivityView() {
 // 4. Freshness View
 // ---------------------------------------------------------------------------
 
-function FreshnessView({ tierFilter }) {
+function FreshnessChart({ pipelineId, warnMin, critMin }) {
+  const [history, setHistory] = useState([]);
+  const [hours, setHours] = useState(24);
+  useEffect(() => {
+    api("GET", `/api/observability/freshness/${pipelineId}/history?hours=${hours}`)
+      .then(setHistory).catch(() => setHistory([]));
+  }, [pipelineId, hours]);
+
+  if (!history.length) return React.createElement("div", { className: "text-xs text-stone-400 py-4 text-center" }, "No history data yet \u2014 freshness snapshots accumulate over time.");
+
+  const W = 560, H = 140, PAD_L = 48, PAD_R = 12, PAD_T = 8, PAD_B = 24;
+  const chartW = W - PAD_L - PAD_R, chartH = H - PAD_T - PAD_B;
+
+  const points = history.map((s) => ({
+    t: new Date(s.checked_at).getTime(),
+    v: s.staleness_minutes,
+    status: s.status,
+  }));
+  const tMin = points[0].t, tMax = points[points.length - 1].t;
+  const tRange = Math.max(tMax - tMin, 1);
+  const maxVal = Math.max(critMin * 1.3, ...points.map((p) => p.v)) || critMin * 1.5;
+
+  const x = (t) => PAD_L + ((t - tMin) / tRange) * chartW;
+  const y = (v) => PAD_T + chartH - (Math.min(v, maxVal) / maxVal) * chartH;
+
+  const linePath = points.map((pt, i) => `${i === 0 ? "M" : "L"}${x(pt.t).toFixed(1)},${y(pt.v).toFixed(1)}`).join(" ");
+  const areaPath = linePath + ` L${x(points[points.length - 1].t).toFixed(1)},${(PAD_T + chartH).toFixed(1)} L${x(points[0].t).toFixed(1)},${(PAD_T + chartH).toFixed(1)} Z`;
+
+  const warnY = y(warnMin), critY = y(critMin);
+  const fmtMin = (m) => m >= 1440 ? `${(m/1440).toFixed(0)}d` : m >= 60 ? `${(m/60).toFixed(0)}h` : `${Math.round(m)}m`;
+
+  const ticks = 5;
+  const yTicks = Array.from({ length: ticks + 1 }, (_, i) => (maxVal / ticks) * i);
+
+  const timeTicks = [];
+  const tickCount = Math.min(6, points.length);
+  for (let i = 0; i < tickCount; i++) {
+    const idx = Math.round((i / (tickCount - 1)) * (points.length - 1));
+    timeTicks.push(points[idx]);
+  }
+
+  return React.createElement("div", null,
+    React.createElement("div", { className: "flex items-center justify-between mb-1" },
+      React.createElement("span", { className: "text-[10px] uppercase text-stone-400 font-semibold" }, "Staleness Over Time"),
+      React.createElement("div", { className: "flex gap-1" },
+        [6, 24, 72, 168].map((h) =>
+          React.createElement("button", {
+            key: h, onClick: (e) => { e.stopPropagation(); setHours(h); },
+            className: `px-2 py-0.5 rounded text-[10px] font-medium ${hours === h ? "bg-stone-800 text-white" : "bg-stone-100 text-stone-500 hover:bg-stone-200"}`
+          }, h <= 24 ? `${h}h` : `${h/24}d`)
+        )
+      )
+    ),
+    React.createElement("svg", { viewBox: `0 0 ${W} ${H}`, className: "w-full", style: { maxHeight: 180 } },
+      // Grid lines
+      yTicks.map((v, i) => React.createElement("line", { key: `g${i}`, x1: PAD_L, x2: W - PAD_R, y1: y(v), y2: y(v), stroke: "#e5e0d8", strokeWidth: 0.5 })),
+      // Y-axis labels
+      yTicks.map((v, i) => React.createElement("text", { key: `y${i}`, x: PAD_L - 4, y: y(v) + 3, textAnchor: "end", fontSize: 9, fill: "#9c9590", fontFamily: "JetBrains Mono, monospace" }, fmtMin(v))),
+      // Warn threshold
+      warnY >= PAD_T && React.createElement("line", { x1: PAD_L, x2: W - PAD_R, y1: warnY, y2: warnY, stroke: "#d97706", strokeWidth: 1, strokeDasharray: "4 3", opacity: 0.6 }),
+      warnY >= PAD_T && React.createElement("text", { x: W - PAD_R + 2, y: warnY + 3, fontSize: 8, fill: "#d97706", fontFamily: "JetBrains Mono, monospace" }, "warn"),
+      // Critical threshold
+      critY >= PAD_T && React.createElement("line", { x1: PAD_L, x2: W - PAD_R, y1: critY, y2: critY, stroke: "#dc2626", strokeWidth: 1, strokeDasharray: "4 3", opacity: 0.6 }),
+      critY >= PAD_T && React.createElement("text", { x: W - PAD_R + 2, y: critY + 3, fontSize: 8, fill: "#dc2626", fontFamily: "JetBrains Mono, monospace" }, "crit"),
+      // Area fill
+      React.createElement("path", { d: areaPath, fill: "url(#freshGrad)", opacity: 0.3 }),
+      // Line
+      React.createElement("path", { d: linePath, fill: "none", stroke: "#16a34a", strokeWidth: 1.5, strokeLinejoin: "round" }),
+      // Dots
+      points.map((pt, i) => React.createElement("circle", {
+        key: i, cx: x(pt.t), cy: y(pt.v), r: 2.5,
+        fill: pt.status === "fresh" ? "#16a34a" : pt.status === "warning" ? "#d97706" : "#dc2626",
+        stroke: "white", strokeWidth: 1,
+      })),
+      // Time labels
+      timeTicks.map((pt, i) => {
+        const d = new Date(pt.t);
+        const label = `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+        return React.createElement("text", { key: `t${i}`, x: x(pt.t), y: H - 2, textAnchor: "middle", fontSize: 9, fill: "#9c9590", fontFamily: "JetBrains Mono, monospace" }, label);
+      }),
+      // Gradient def
+      React.createElement("defs", null,
+        React.createElement("linearGradient", { id: "freshGrad", x1: 0, y1: 0, x2: 0, y2: 1 },
+          React.createElement("stop", { offset: "0%", stopColor: "#16a34a", stopOpacity: 0.4 }),
+          React.createElement("stop", { offset: "100%", stopColor: "#16a34a", stopOpacity: 0.05 })
+        )
+      )
+    )
+  );
+}
+
+function FreshnessCard({ p }) {
+  const [expanded, setExpanded] = useState(false);
+  const pct = Math.min(100, (p.staleness_minutes / (p.freshness_sla_minutes * 5)) * 100);
+  const color = p.status === "fresh" ? "green" : p.status === "warning" ? "amber" : "red";
+  const fmtMin = (m) => {
+    if (m == null) return "--";
+    if (m >= 1440) return `${(m / 1440).toFixed(1)}d`;
+    if (m >= 60) return `${(m / 60).toFixed(1)}h`;
+    return `${Math.round(m)}m`;
+  };
+  return (
+    <div
+      className={`bg-white border rounded-xl px-4 py-3 cursor-pointer transition-colors hover:bg-stone-50/50 ${
+        p.status === "critical" ? "border-red-200 bg-red-50" : "border-stone-200"
+      }`}
+      onClick={() => setExpanded(!expanded)}
+    >
+      <div className="flex items-center gap-3 mb-2">
+        <StatusDot status={p.status} />
+        <span className="font-mono text-sm font-medium flex-1 text-stone-700">{p.pipeline_name}</span>
+        <Pill label={p.status} color={color} />
+        <span className="text-xs text-stone-400">
+          {fmtMin(p.staleness_minutes)} / {fmtMin(p.freshness_sla_minutes)} SLA
+        </span>
+        <span className="text-stone-300 text-xs">{expanded ? "\u25B2" : "\u25BC"}</span>
+      </div>
+      <ProgressBar pct={pct} color={color} />
+      {expanded && (
+        <div className="mt-3 pt-3 border-t border-stone-100 space-y-3" onClick={(e) => e.stopPropagation()}>
+          {/* Staleness time-series chart */}
+          <FreshnessChart pipelineId={p.pipeline_id} warnMin={p.freshness_sla_minutes} critMin={p.freshness_critical_minutes || p.freshness_sla_minutes * 3} />
+
+          {/* Detail grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+            <div>
+              <span className="text-stone-400 block">Warn Threshold</span>
+              <span className="font-mono text-stone-700">{fmtMin(p.freshness_sla_minutes)}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Critical Threshold</span>
+              <span className="font-mono text-stone-700">{fmtMin(p.freshness_critical_minutes)}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Freshness Column</span>
+              <span className="font-mono text-stone-700">{p.freshness_column || React.createElement("span", { className: "text-stone-300 italic" }, "last run time")}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Schedule</span>
+              <span className="font-mono text-stone-700">{p.schedule || "--"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Last Record</span>
+              <span className="font-mono text-stone-700">{p.last_record_time ? p.last_record_time.replace("T", " ").slice(0, 19) : "--"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Last Successful Run</span>
+              <span className="font-mono text-stone-700">{p.last_run_at ? p.last_run_at.replace("T", " ").slice(0, 19) : "--"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Rows (last run)</span>
+              <span className="font-mono text-stone-700">{p.last_run_rows?.toLocaleString() ?? "--"}</span>
+            </div>
+            <div>
+              <span className="text-stone-400 block">Target Table</span>
+              <span className="font-mono text-stone-700">{p.target_table || "--"}</span>
+            </div>
+          </div>
+          <div className="text-[10px] font-mono text-stone-400">
+            Checked: {p.checked_at?.replace("T", " ").slice(0, 19) || "--"} &middot; Pipeline: {p.pipeline_id?.slice(0, 12)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FreshnessView({ tierFilter, searchQuery }) {
   const [data, setData] = useState({});
   useEffect(() => {
     const tierParam = tierFilter !== "All" ? `?tier=${tierFilter[1]}` : "";
@@ -1368,38 +1715,21 @@ function FreshnessView({ tierFilter }) {
   return (
     <div className="px-6 py-4">
       <h1 className="text-lg font-semibold mb-4 text-stone-800">Freshness</h1>
-      {Object.entries(data).map(([tier, pipelines]) => (
-        <div key={tier} className="mb-6">
-          <div className="flex items-center gap-2 mb-3">
-            <TierBadge tier={parseInt(tier)} />
-            <span className="text-sm font-medium text-stone-500">{pipelines.length} pipeline(s)</span>
+      {Object.entries(data).map(([tier, pipelines]) => {
+        const filtered = searchQuery ? pipelines.filter((p) => p.pipeline_name?.toLowerCase().includes(searchQuery)) : pipelines;
+        if (filtered.length === 0) return null;
+        return (
+          <div key={tier} className="mb-6">
+            <div className="flex items-center gap-2 mb-3">
+              <TierBadge tier={parseInt(tier)} />
+              <span className="text-sm font-medium text-stone-500">{filtered.length} pipeline(s)</span>
+            </div>
+            <div className="space-y-2">
+              {filtered.map((p) => <FreshnessCard key={p.pipeline_id} p={p} />)}
+            </div>
           </div>
-          <div className="space-y-2">
-            {pipelines.map((p) => {
-              const pct = Math.min(100, (p.staleness_minutes / (p.freshness_sla_minutes * 5)) * 100);
-              const color = p.status === "fresh" ? "green" : p.status === "warning" ? "amber" : "red";
-              return (
-                <div
-                  key={p.pipeline_id}
-                  className={`bg-white border rounded-xl px-4 py-3 ${
-                    p.status === "critical" ? "border-red-200 bg-red-50" : "border-stone-200"
-                  }`}
-                >
-                  <div className="flex items-center gap-3 mb-2">
-                    <StatusDot status={p.status} />
-                    <span className="font-mono text-sm font-medium flex-1 text-stone-700">{p.pipeline_name}</span>
-                    <Pill label={p.status} color={color} />
-                    <span className="text-xs text-stone-400">
-                      {p.staleness_minutes?.toFixed(0)}m / {p.freshness_sla_minutes}m SLA
-                    </span>
-                  </div>
-                  <ProgressBar pct={pct} color={color} />
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ))}
+        );
+      })}
       {Object.keys(data).length === 0 && (
         <div className="text-sm text-stone-400 py-8 text-center">No freshness data yet.</div>
       )}
@@ -1411,7 +1741,142 @@ function FreshnessView({ tierFilter }) {
 // 5. Quality View
 // ---------------------------------------------------------------------------
 
-function QualityView({ tierFilter }) {
+function QualityCard({ p }) {
+  const [expanded, setExpanded] = useState(false);
+  const q = p.quality;
+  const passRate = q?.summary?.pass_rate ?? null;
+  const gates = q?.gates?.slice(0, 20) || [];
+  const checkStats = q?.summary?.check_stats || {};
+  const halted = q?.summary?.halted || 0;
+  const totalRuns = q?.summary?.total_runs || 0;
+  const lastGate = gates[0] || null;
+
+  const gateColor = (d) =>
+    d === "promote" ? "bg-green-500" : d === "promote_with_warning" ? "bg-amber-500" : "bg-red-500";
+
+  // Find worst check by fail rate
+  const checkEntries = Object.entries(checkStats);
+  let worstCheck = null;
+  if (checkEntries.length > 0) {
+    worstCheck = checkEntries.reduce((worst, [name, stats]) => {
+      const total = (stats.pass || 0) + (stats.warn || 0) + (stats.fail || 0);
+      const failRate = total > 0 ? (stats.fail || 0) / total : 0;
+      if (!worst || failRate > worst.failRate) return { name, failRate, stats, total };
+      return worst;
+    }, null);
+    if (worstCheck && worstCheck.failRate === 0) worstCheck = null;
+  }
+
+  return (
+    <div
+      className="bg-white border border-stone-200 rounded-xl px-4 py-4 cursor-pointer hover:bg-stone-50/50 transition-colors"
+      onClick={() => setExpanded(!expanded)}
+    >
+      <div className="flex items-center gap-2 mb-2">
+        <TierBadge tier={p.tier} />
+        <span className="font-mono text-sm font-medium flex-1 truncate text-stone-700">{p.pipeline_name}</span>
+        <span className="text-stone-300 text-xs">{expanded ? "\u25B2" : "\u25BC"}</span>
+      </div>
+      {q ? (
+        <>
+          <div className="flex items-baseline gap-3 mb-1">
+            <div
+              className="text-3xl font-semibold font-mono"
+              style={{ color: passRate > 0.95 ? "#16a34a" : passRate > 0.8 ? "#d97706" : "#dc2626" }}
+            >
+              {passRate !== null ? `${(passRate * 100).toFixed(1)}%` : "--"}
+            </div>
+            <div className="text-xs text-stone-400">
+              {totalRuns} runs (7d)
+              {halted > 0 && <span className="text-red-500 font-medium ml-2">{halted} halted</span>}
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-1 mb-1">
+            {gates.map((g, i) => (
+              <div key={i} className={`w-3.5 h-3.5 rounded-sm ${gateColor(g.decision)}`} title={`${g.decision} — ${g.evaluated_at?.slice(0, 16)}`} />
+            ))}
+          </div>
+          {worstCheck && (
+            <div className="text-[10px] text-red-500 mt-1">
+              Weakest: <span className="font-mono font-medium">{worstCheck.name}</span> ({worstCheck.stats.fail} fail / {worstCheck.total})
+            </div>
+          )}
+
+          {expanded && (
+            <div className="mt-3 pt-3 border-t border-stone-100 space-y-3" onClick={(e) => e.stopPropagation()}>
+              {/* Per-check breakdown */}
+              {checkEntries.length > 0 && (
+                <div>
+                  <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Check Breakdown (7d)</div>
+                  <div className="space-y-1.5">
+                    {checkEntries.map(([name, stats]) => {
+                      const total = (stats.pass || 0) + (stats.warn || 0) + (stats.fail || 0);
+                      const passPct = total > 0 ? ((stats.pass || 0) / total) * 100 : 0;
+                      const warnPct = total > 0 ? ((stats.warn || 0) / total) * 100 : 0;
+                      const failPct = total > 0 ? ((stats.fail || 0) / total) * 100 : 0;
+                      return (
+                        <div key={name}>
+                          <div className="flex items-center justify-between text-xs mb-0.5">
+                            <span className="font-mono text-stone-600 truncate flex-1">{name}</span>
+                            <span className="text-stone-400 text-[10px] ml-2 whitespace-nowrap">
+                              {stats.pass}p {stats.warn > 0 ? `${stats.warn}w ` : ""}{stats.fail > 0 ? `${stats.fail}f` : ""}
+                            </span>
+                          </div>
+                          <div className="flex h-1.5 rounded-full overflow-hidden bg-stone-100">
+                            {passPct > 0 && <div className="bg-green-400" style={{ width: `${passPct}%` }} />}
+                            {warnPct > 0 && <div className="bg-amber-400" style={{ width: `${warnPct}%` }} />}
+                            {failPct > 0 && <div className="bg-red-400" style={{ width: `${failPct}%` }} />}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Last gate detail */}
+              {lastGate && (
+                <div>
+                  <div className="text-[10px] uppercase text-stone-400 font-semibold mb-1">Last Gate</div>
+                  <div className="bg-stone-50 border border-stone-200 rounded-lg px-3 py-2">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="text-xs font-mono text-stone-400">{lastGate.evaluated_at?.replace("T", " ").slice(0, 19)}</span>
+                      <Pill
+                        label={lastGate.decision}
+                        color={lastGate.decision === "halt" ? "red" : lastGate.decision === "promote_with_warning" ? "amber" : "green"}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      {(lastGate.checks || []).map((c, i) => (
+                        <div key={i} className="flex items-center gap-2 text-xs">
+                          <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                            c.status === "pass" ? "bg-green-400" : c.status === "warn" ? "bg-amber-400" : "bg-red-400"
+                          }`} />
+                          <span className="font-medium text-stone-600 w-36">{c.name}</span>
+                          <span className="text-stone-400 truncate">{c.detail}</span>
+                        </div>
+                      ))}
+                    </div>
+                    {lastGate.agent_reasoning && (
+                      <div className="mt-2 pt-2 border-t border-stone-100">
+                        <div className="text-[10px] uppercase text-stone-400 font-semibold mb-1">Agent Reasoning</div>
+                        <div className="text-xs text-stone-500 italic">{lastGate.agent_reasoning}</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="text-xs text-stone-300">No data yet</div>
+      )}
+    </div>
+  );
+}
+
+function QualityView({ tierFilter, searchQuery }) {
   const [cards, setCards] = useState([]);
   useEffect(() => {
     const tierParam = tierFilter !== "All" ? `?tier=${tierFilter[1]}` : "";
@@ -1432,48 +1897,13 @@ function QualityView({ tierFilter }) {
       .catch(console.error);
   }, [tierFilter]);
 
-  const gateColor = (d) =>
-    d === "promote" ? "bg-green-500" : d === "promote_with_warning" ? "bg-amber-500" : "bg-red-500";
+  const filtered = searchQuery ? cards.filter((p) => p.pipeline_name?.toLowerCase().includes(searchQuery)) : cards;
 
   return (
     <div className="px-6 py-4">
       <h1 className="text-lg font-semibold mb-4 text-stone-800">Quality</h1>
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {cards.map((p) => {
-          const q = p.quality;
-          const passRate = q?.summary?.pass_rate ?? null;
-          const gates = q?.gates?.slice(0, 20) || [];
-          return (
-            <div key={p.pipeline_id} className="bg-white border border-stone-200 rounded-xl px-4 py-4">
-              <div className="flex items-center gap-2 mb-2">
-                <TierBadge tier={p.tier} />
-                <span className="font-mono text-sm font-medium flex-1 truncate text-stone-700">
-                  {p.pipeline_name}
-                </span>
-              </div>
-              {q ? (
-                <>
-                  <div
-                    className="text-3xl font-semibold font-mono mb-1"
-                    style={{
-                      color: passRate > 0.95 ? "#16a34a" : passRate > 0.8 ? "#d97706" : "#dc2626",
-                    }}
-                  >
-                    {passRate !== null ? `${(passRate * 100).toFixed(1)}%` : "--"}
-                  </div>
-                  <div className="text-xs text-stone-400 mb-3">{q.summary?.total_runs} runs (7d)</div>
-                  <div className="flex flex-wrap gap-1">
-                    {gates.map((g, i) => (
-                      <div key={i} className={`w-3.5 h-3.5 rounded-sm ${gateColor(g.decision)}`} title={g.decision} />
-                    ))}
-                  </div>
-                </>
-              ) : (
-                <div className="text-xs text-stone-300">No data yet</div>
-              )}
-            </div>
-          );
-        })}
+        {filtered.map((p) => <QualityCard key={p.pipeline_id} p={p} />)}
       </div>
     </div>
   );
@@ -1483,24 +1913,17 @@ function QualityView({ tierFilter }) {
 // 6. Approvals View
 // ---------------------------------------------------------------------------
 
-function ApprovalsView() {
-  const [pending, setPending] = useState([]);
-  const [resolved, setResolved] = useState([]);
-  const [note, setNote] = useState({});
-  const [connectorCode, setConnectorCode] = useState({});
-  const [expandedCode, setExpandedCode] = useState({});
-  const [testResults, setTestResults] = useState({});
-  const [testing, setTesting] = useState({});
+function ApprovalCard({ p, isPending, note, setNote, onResolve, connectorCode, setConnectorCode, expandedCode, setExpandedCode, testResults, setTestResults, testing, setTesting }) {
+  const [expanded, setExpanded] = useState(false);
 
-  useEffect(() => {
-    api("GET", "/api/approvals?status=pending").then(setPending).catch(console.error);
-    api("GET", "/api/approvals?status=applied").then(setResolved).catch(console.error);
-  }, []);
+  const changeColor = (t) =>
+    ({ add_column: "green", drop_column: "red", alter_column_type: "amber", new_connector: "purple",
+       change_refresh_type: "blue", change_load_type: "blue", change_merge_keys: "blue",
+       change_schedule: "blue", add_table: "green", remove_table: "red", update_connector: "purple" }[t] || "blue");
 
-  async function resolve(id, action) {
-    await api("POST", `/api/approvals/${id}`, { action, note: note[id] || "" });
-    setPending((p) => p.filter((x) => x.proposal_id !== id));
-  }
+  const riskColor = (r) => ({ high: "text-red-600 bg-red-50", medium: "text-amber-600 bg-amber-50", low: "text-green-600 bg-green-50" }[r] || "text-stone-500 bg-stone-50");
+
+  const confidenceColor = (c) => c >= 0.9 ? "text-green-600" : c >= 0.7 ? "text-amber-600" : "text-red-600";
 
   async function toggleCode(proposalId, connectorId) {
     if (expandedCode[proposalId]) {
@@ -1529,100 +1952,302 @@ function ApprovalsView() {
     setTesting((s) => ({ ...s, [connectorId]: false }));
   }
 
-  const changeColor = (t) =>
-    ({ add_column: "green", drop_column: "red", alter_column_type: "amber", new_connector: "purple" }[t] || "blue");
+  const impact = p.impact_analysis || {};
+  const hasStateDiff = (p.current_state && Object.keys(p.current_state).length > 0) || (p.proposed_state && Object.keys(p.proposed_state).length > 0);
+
+  return (
+    <div className={`border rounded-xl overflow-hidden ${
+      isPending
+        ? (impact.breaking_change ? "border-red-300 bg-red-50/50" : "border-amber-200 bg-amber-50")
+        : "border-stone-200 bg-white"
+    }`}>
+      <div
+        className="flex items-center gap-2 px-4 py-3 cursor-pointer hover:bg-white/50 transition-colors"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <Pill label={p.change_type} color={changeColor(p.change_type)} />
+        <Pill label={p.trigger_type} color="gray" />
+        {p.pipeline_name && (
+          <span className="font-mono text-xs text-stone-600">{p.pipeline_name}</span>
+        )}
+        {p.connector_name && (
+          <span className="font-mono text-xs text-purple-600">{p.connector_name}</span>
+        )}
+        <span className="flex-1" />
+        {impact.breaking_change && <Pill label="BREAKING" color="red" />}
+        <span className={`text-xs font-medium ${confidenceColor(p.confidence)}`}>
+          {(p.confidence * 100).toFixed(0)}% confidence
+        </span>
+        {!isPending && <Pill label={p.status} color={p.status === "applied" || p.status === "approved" ? "green" : p.status === "rolled_back" ? "amber" : "red"} />}
+        <span className="text-xs text-stone-400">{(isPending ? p.created_at : p.resolved_at)?.slice(0, 16)}</span>
+        <span className="text-stone-300 text-xs">{expanded ? "\u25B2" : "\u25BC"}</span>
+      </div>
+
+      {expanded && (
+        <div className="px-4 pb-4 space-y-3 border-t border-stone-100">
+          {/* Reasoning */}
+          <div className="pt-3">
+            <div className="text-[10px] uppercase text-stone-400 font-semibold mb-1">Agent Reasoning</div>
+            <p className="text-sm text-stone-600">{p.reasoning}</p>
+          </div>
+
+          {/* Impact analysis */}
+          {Object.keys(impact).length > 0 && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Impact Analysis</div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                {impact.breaking_change != null && (
+                  <div>
+                    <span className="text-stone-400 block">Breaking Change</span>
+                    <span className={`font-medium ${impact.breaking_change ? "text-red-600" : "text-green-600"}`}>
+                      {impact.breaking_change ? "Yes" : "No"}
+                    </span>
+                  </div>
+                )}
+                {impact.data_loss_risk && (
+                  <div>
+                    <span className="text-stone-400 block">Data Loss Risk</span>
+                    <span className={`font-medium px-1.5 py-0.5 rounded text-xs ${riskColor(impact.data_loss_risk)}`}>
+                      {impact.data_loss_risk}
+                    </span>
+                  </div>
+                )}
+                {impact.downtime_required != null && (
+                  <div>
+                    <span className="text-stone-400 block">Downtime Required</span>
+                    <span className="font-mono text-stone-700">{impact.downtime_required ? "Yes" : "No"}</span>
+                  </div>
+                )}
+                {impact.affected_pipelines != null && (
+                  <div>
+                    <span className="text-stone-400 block">Affected Pipelines</span>
+                    <span className="font-mono text-stone-700">{impact.affected_pipelines}</span>
+                  </div>
+                )}
+                {impact.affected_consumers != null && (
+                  <div>
+                    <span className="text-stone-400 block">Affected Consumers</span>
+                    <span className="font-mono text-stone-700">{impact.affected_consumers}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* State diff */}
+          {hasStateDiff && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Change Diff</div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <div className="text-[10px] text-red-400 font-semibold mb-1">Current</div>
+                  <pre className="text-xs font-mono text-stone-600 bg-red-50/50 rounded p-2 overflow-x-auto max-h-32 overflow-y-auto">
+                    {JSON.stringify(p.current_state, null, 2) || "{}"}
+                  </pre>
+                </div>
+                <div>
+                  <div className="text-[10px] text-green-500 font-semibold mb-1">Proposed</div>
+                  <pre className="text-xs font-mono text-stone-600 bg-green-50/50 rounded p-2 overflow-x-auto max-h-32 overflow-y-auto">
+                    {JSON.stringify(p.proposed_state, null, 2) || "{}"}
+                  </pre>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Trigger detail */}
+          {p.trigger_detail && Object.keys(p.trigger_detail).length > 0 && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-1">Trigger Detail</div>
+              <pre className="text-xs font-mono text-stone-600 overflow-x-auto">
+                {JSON.stringify(p.trigger_detail, null, 2)}
+              </pre>
+            </div>
+          )}
+
+          {/* Rollback plan */}
+          {p.rollback_plan && (
+            <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-blue-400 font-semibold mb-1">Rollback Plan</div>
+              <p className="text-xs text-blue-700">{p.rollback_plan}</p>
+            </div>
+          )}
+
+          {/* Connector code review (for new_connector / update_connector) */}
+          {(p.change_type === "new_connector" || p.change_type === "update_connector") && p.connector_id && (
+            <div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => toggleCode(p.proposal_id, p.connector_id)}
+                  className="text-xs text-purple-600 hover:text-purple-800 font-medium"
+                >
+                  {expandedCode[p.proposal_id] ? "Hide Code" : "Review Connector Code"}
+                </button>
+                {isPending && (
+                  <button
+                    onClick={() => testConnector(p.connector_id)}
+                    disabled={testing[p.connector_id]}
+                    className="text-xs px-2.5 py-1 bg-purple-100 text-purple-700 border border-purple-200 rounded-lg hover:bg-purple-200 disabled:opacity-50"
+                  >
+                    {testing[p.connector_id] ? "Testing..." : "Test Connector"}
+                  </button>
+                )}
+                {testResults[p.connector_id] && (
+                  <span className={`text-xs font-medium ${testResults[p.connector_id].success ? "text-green-600" : "text-red-600"}`}>
+                    {testResults[p.connector_id].success ? "PASSED" : "FAILED"}
+                    {testResults[p.connector_id].error && ` — ${testResults[p.connector_id].error}`}
+                  </span>
+                )}
+              </div>
+              {expandedCode[p.proposal_id] && connectorCode[p.connector_id] && (
+                <pre className="mt-2 bg-stone-900 text-green-300 text-xs p-3 rounded-lg overflow-x-auto max-h-80 overflow-y-auto font-mono leading-relaxed">
+                  {connectorCode[p.connector_id]}
+                </pre>
+              )}
+            </div>
+          )}
+
+          {/* Version info */}
+          <div className="flex items-center gap-4 text-[10px] font-mono text-stone-400">
+            {p.contract_version_before != null && (
+              <span>Contract v{p.contract_version_before}{p.contract_version_after != null && ` → v${p.contract_version_after}`}</span>
+            )}
+            <span>ID: {p.proposal_id?.slice(0, 12)}</span>
+            {p.pipeline_id && <span>Pipeline: {p.pipeline_id?.slice(0, 12)}</span>}
+          </div>
+
+          {/* Resolved info */}
+          {!isPending && p.resolved_by && (
+            <div className="bg-stone-50 border border-stone-200 rounded-lg px-3 py-2">
+              <div className="flex items-center gap-3 text-xs">
+                <span className="text-stone-400">Resolved by</span>
+                <span className="font-medium text-stone-600">{p.resolved_by}</span>
+                <span className="text-stone-400">{p.resolved_at?.replace("T", " ").slice(0, 19)}</span>
+              </div>
+              {p.resolution_note && (
+                <p className="text-xs text-stone-500 mt-1 italic">"{p.resolution_note}"</p>
+              )}
+            </div>
+          )}
+
+          {/* Approve/Reject actions */}
+          {isPending && (
+            <div className="flex items-center gap-2 pt-1">
+              <input
+                value={note[p.proposal_id] || ""}
+                onChange={(e) => setNote((n) => ({ ...n, [p.proposal_id]: e.target.value }))}
+                placeholder="Approval note (required for production changes)..."
+                className="flex-1 text-xs px-3 py-1.5 border border-stone-300 rounded-lg bg-white text-stone-600 outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400"
+              />
+              <button
+                onClick={() => onResolve(p.proposal_id, "approve")}
+                className="text-xs px-4 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium"
+              >
+                Approve
+              </button>
+              <button
+                onClick={() => onResolve(p.proposal_id, "reject")}
+                className="text-xs px-4 py-1.5 bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 font-medium"
+              >
+                Reject
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ApprovalsView({ searchQuery }) {
+  const [pending, setPending] = useState([]);
+  const [resolved, setResolved] = useState([]);
+  const [note, setNote] = useState({});
+  const [connectorCode, setConnectorCode] = useState({});
+  const [expandedCode, setExpandedCode] = useState({});
+  const [testResults, setTestResults] = useState({});
+  const [testing, setTesting] = useState({});
+  const [showResolved, setShowResolved] = useState(false);
+
+  useEffect(() => {
+    api("GET", "/api/approvals?status=pending").then(setPending).catch(console.error);
+    // Fetch all non-pending: applied, approved, rejected, rolled_back
+    api("GET", "/api/approvals")
+      .then((all) => setResolved(all.filter((p) => p.status !== "pending")))
+      .catch(console.error);
+  }, []);
+
+  async function handleResolve(id, action) {
+    await api("POST", `/api/approvals/${id}`, { action, note: note[id] || "" });
+    const resolved_item = pending.find((x) => x.proposal_id === id);
+    setPending((p) => p.filter((x) => x.proposal_id !== id));
+    if (resolved_item) {
+      setResolved((r) => [{ ...resolved_item, status: action === "approve" ? "applied" : "rejected", resolved_at: new Date().toISOString() }, ...r]);
+    }
+  }
+
+  const matchApproval = (p) => !searchQuery ||
+    (p.reasoning || "").toLowerCase().includes(searchQuery) ||
+    (p.change_type || "").toLowerCase().includes(searchQuery) ||
+    (p.pipeline_name || "").toLowerCase().includes(searchQuery) ||
+    (p.connector_name || "").toLowerCase().includes(searchQuery);
+  const filteredPending = pending.filter(matchApproval);
+  const filteredResolved = resolved.filter(matchApproval);
+
+  const breakingCount = filteredPending.filter((p) => p.impact_analysis?.breaking_change).length;
+  const sharedProps = { note, setNote, connectorCode, setConnectorCode, expandedCode, setExpandedCode, testResults, setTestResults, testing, setTesting };
 
   return (
     <div className="px-6 py-4">
-      <h1 className="text-lg font-semibold mb-4 text-stone-800">Approvals</h1>
-      {pending.length > 0 && (
-        <div className="mb-6 space-y-3">
-          <div className="text-sm font-medium text-amber-600">Pending ({pending.length})</div>
-          {pending.map((p) => (
-            <div key={p.proposal_id} className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-4">
-              <div className="flex items-center gap-2 mb-2">
-                <Pill label={p.change_type} color={changeColor(p.change_type)} />
-                <Pill label={p.trigger_type} color="gray" />
-                <span className="text-xs text-stone-400 ml-auto">
-                  confidence: {(p.confidence * 100).toFixed(0)}%
-                </span>
-              </div>
-              <p className="text-sm text-stone-600 mb-2">{p.reasoning}</p>
-              {p.impact_analysis?.breaking_change && (
-                <div className="text-xs text-red-600 mb-2">
-                  Breaking change -- {p.impact_analysis.data_loss_risk} data loss risk
-                </div>
-              )}
-              {p.change_type === "new_connector" && p.connector_id && (
-                <div className="mt-2 mb-2">
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => toggleCode(p.proposal_id, p.connector_id)}
-                      className="text-xs text-purple-600 hover:text-purple-800 font-medium"
-                    >
-                      {expandedCode[p.proposal_id] ? "Hide Code" : "View Connector Code"}
-                    </button>
-                    <button
-                      onClick={() => testConnector(p.connector_id)}
-                      disabled={testing[p.connector_id]}
-                      className="text-xs px-2.5 py-1 bg-purple-100 text-purple-700 border border-purple-200 rounded-lg hover:bg-purple-200 disabled:opacity-50"
-                    >
-                      {testing[p.connector_id] ? "Testing..." : "Test Connector"}
-                    </button>
-                    {testResults[p.connector_id] && (
-                      <span className={`text-xs font-medium ${testResults[p.connector_id].success ? "text-green-600" : "text-red-600"}`}>
-                        {testResults[p.connector_id].success ? "PASSED" : "FAILED"}
-                        {testResults[p.connector_id].error && ` - ${testResults[p.connector_id].error}`}
-                      </span>
-                    )}
-                  </div>
-                  {expandedCode[p.proposal_id] && connectorCode[p.connector_id] && (
-                    <pre className="mt-2 bg-stone-900 text-green-300 text-xs p-3 rounded-lg overflow-x-auto max-h-80 overflow-y-auto font-mono leading-relaxed">
-                      {connectorCode[p.connector_id]}
-                    </pre>
-                  )}
-                </div>
-              )}
-              <div className="flex items-center gap-2 mt-3">
-                <input
-                  value={note[p.proposal_id] || ""}
-                  onChange={(e) => setNote((n) => ({ ...n, [p.proposal_id]: e.target.value }))}
-                  placeholder="Optional note..."
-                  className="flex-1 text-xs px-3 py-1.5 border border-stone-300 rounded-lg bg-stone-100 text-stone-600 outline-none"
-                />
-                <button
-                  onClick={() => resolve(p.proposal_id, "approve")}
-                  className="text-xs px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700"
-                >
-                  Approve
-                </button>
-                <button
-                  onClick={() => resolve(p.proposal_id, "reject")}
-                  className="text-xs px-3 py-1.5 bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100"
-                >
-                  Reject
-                </button>
-              </div>
-            </div>
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <h1 className="text-lg font-semibold text-stone-800">Approvals</h1>
+          {filteredPending.length > 0 && (
+            <span className="text-xs px-2.5 py-1 bg-amber-100 text-amber-700 rounded-full font-medium">
+              {filteredPending.length} pending
+            </span>
+          )}
+          {breakingCount > 0 && (
+            <span className="text-xs px-2.5 py-1 bg-red-100 text-red-700 rounded-full font-medium">
+              {breakingCount} breaking
+            </span>
+          )}
+        </div>
+        <button
+          onClick={() => setShowResolved(!showResolved)}
+          className={`text-xs px-3 py-1 rounded-lg font-medium transition-colors ${
+            showResolved ? "bg-stone-800 text-white" : "bg-stone-100 text-stone-500 hover:bg-stone-200"
+          }`}
+        >
+          {showResolved ? "Hide" : "Show"} Resolved ({filteredResolved.length})
+        </button>
+      </div>
+
+      {/* Pending */}
+      {filteredPending.length > 0 ? (
+        <div className="space-y-3 mb-6">
+          {filteredPending.map((p) => (
+            <ApprovalCard key={p.proposal_id} p={p} isPending={true} onResolve={handleResolve} {...sharedProps} />
           ))}
+        </div>
+      ) : (
+        <div className="text-sm text-stone-400 py-8 text-center mb-6 bg-green-50 border border-green-200 rounded-xl">
+          No pending approvals — all structural changes reviewed.
         </div>
       )}
-      <div>
-        <div className="text-sm font-medium text-stone-400 mb-3">Resolved</div>
-        <div className="space-y-2">
-          {resolved.map((p) => (
-            <div key={p.proposal_id} className="bg-white border border-stone-200 rounded-xl px-4 py-3 opacity-60">
-              <div className="flex items-center gap-2">
-                <Pill label={p.change_type} color="gray" />
-                <span className="text-xs text-stone-400">{p.resolved_at?.slice(0, 16)}</span>
-                <Pill label={p.status} color={p.status === "applied" ? "green" : "red"} />
-                <span className="text-xs text-stone-400">{p.resolved_by}</span>
-              </div>
-            </div>
-          ))}
-          {resolved.length === 0 && <div className="text-xs text-stone-300">No resolved proposals yet.</div>}
+
+      {/* Resolved */}
+      {showResolved && (
+        <div>
+          <div className="text-sm font-medium text-stone-400 mb-3">Resolved</div>
+          <div className="space-y-2">
+            {filteredResolved.map((p) => (
+              <ApprovalCard key={p.proposal_id} p={p} isPending={false} onResolve={handleResolve} {...sharedProps} />
+            ))}
+            {filteredResolved.length === 0 && <div className="text-xs text-stone-300 text-center py-4">No resolved proposals yet.</div>}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -1631,11 +2256,11 @@ function ApprovalsView() {
 // 7. Lineage & DAG View (consolidated from Build 19 + Lineage)
 // ---------------------------------------------------------------------------
 
-function DAGView() {
+function DAGView({ searchQuery }) {
   const [dag, setDag] = useState(null);
   const [selected, setSelected] = useState(null);
   const [lineageDetail, setLineageDetail] = useState(null);
-  const [search, setSearch] = useState("");
+  const search = searchQuery || "";
   const [loading, setLoading] = useState(true);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -1785,23 +2410,6 @@ function DAGView() {
     <div className="px-6 py-4">
       <div className="flex items-center justify-between mb-1">
         <h1 className="text-lg font-semibold text-stone-800">Lineage</h1>
-        <div className="relative">
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search pipelines..."
-            className="w-64 text-xs border border-stone-300 rounded-lg px-3 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400 font-mono"
-          />
-          {search && (
-            <button
-              onClick={() => setSearch("")}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-600 text-xs"
-            >
-              x
-            </button>
-          )}
-        </div>
       </div>
       <div className="text-xs text-stone-400 mb-4">
         {dag.total_pipelines} pipeline(s), {dag.total_edges} dependency edge(s)
@@ -2244,57 +2852,232 @@ function ConnectorsView() {
 // 9. Alerts View
 // ---------------------------------------------------------------------------
 
-function AlertsView({ tierFilter }) {
+function AlertCard({ a, onAck }) {
+  const [expanded, setExpanded] = useState(false);
+  const sevColor = (s) => ({ critical: "red", warning: "amber", info: "blue" }[s] || "gray");
+  const detail = a.detail || {};
+  const hasDetail = Object.keys(detail).length > 0;
+
+  // Determine alert category from summary/detail
+  const isFreshness = a.summary?.toLowerCase().includes("freshness") || detail.staleness_minutes != null;
+  const isDrift = a.summary?.toLowerCase().includes("schema") || detail.added_columns || detail.removed_columns;
+  const isContract = a.summary?.toLowerCase().includes("contract") || detail.contract_id;
+
+  const timeSince = (iso) => {
+    if (!iso) return "";
+    const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+    if (mins < 60) return `${mins}m ago`;
+    if (mins < 1440) return `${Math.round(mins / 60)}h ago`;
+    return `${Math.round(mins / 1440)}d ago`;
+  };
+
+  return (
+    <div className={`border rounded-xl overflow-hidden transition-colors ${
+      a.severity === "critical" && !a.acknowledged ? "border-red-300 bg-red-50/70" :
+      a.severity === "warning" && !a.acknowledged ? "border-amber-200 bg-amber-50/30" :
+      "border-stone-200 bg-white"
+    } ${a.acknowledged ? "opacity-60" : ""}`}>
+      <div
+        className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-white/50"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <StatusDot status={a.severity} />
+        <TierBadge tier={a.tier} />
+        <span className="font-mono text-sm flex-1 text-stone-700">{a.pipeline_name}</span>
+        <Pill label={a.severity} color={sevColor(a.severity)} />
+        {isFreshness && <Pill label="freshness" color="blue" />}
+        {isDrift && <Pill label="schema" color="purple" />}
+        {isContract && <Pill label="contract" color="amber" />}
+        <span className="text-xs text-stone-400">{timeSince(a.created_at)}</span>
+        {!a.acknowledged && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onAck(a.alert_id); }}
+            className="text-xs px-2.5 py-1 border border-stone-300 text-stone-500 rounded-lg hover:bg-stone-100 font-medium"
+          >
+            Ack
+          </button>
+        )}
+        {a.acknowledged && <span className="text-xs text-green-600 font-medium">acked</span>}
+        <span className="text-stone-300 text-xs">{expanded ? "\u25B2" : "\u25BC"}</span>
+      </div>
+
+      {/* Summary always visible below header */}
+      <div className="px-4 pb-2 -mt-1">
+        <p className="text-xs text-stone-500 ml-8">{a.summary}</p>
+      </div>
+
+      {expanded && (
+        <div className="px-4 pb-4 pt-1 border-t border-stone-100 space-y-3">
+          {/* Freshness detail */}
+          {isFreshness && detail.staleness_minutes != null && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Freshness Detail</div>
+              <div className="grid grid-cols-3 gap-3 text-xs">
+                <div>
+                  <span className="text-stone-400 block">Staleness</span>
+                  <span className="font-mono text-red-600 font-medium">{detail.staleness_minutes?.toFixed(0)}m</span>
+                </div>
+                <div>
+                  <span className="text-stone-400 block">Warn SLA</span>
+                  <span className="font-mono text-stone-700">{detail.sla_warn_minutes}m</span>
+                </div>
+                <div>
+                  <span className="text-stone-400 block">Critical SLA</span>
+                  <span className="font-mono text-stone-700">{detail.sla_critical_minutes}m</span>
+                </div>
+              </div>
+              {detail.staleness_minutes > 0 && detail.sla_warn_minutes > 0 && (
+                <div className="mt-2">
+                  <ProgressBar
+                    pct={Math.min(100, (detail.staleness_minutes / (detail.sla_critical_minutes || detail.sla_warn_minutes * 3)) * 100)}
+                    color={detail.staleness_minutes > (detail.sla_critical_minutes || 999) ? "red" : "amber"}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Schema drift detail */}
+          {isDrift && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Schema Drift Detail</div>
+              {detail.added_columns && detail.added_columns.length > 0 && (
+                <div className="mb-1">
+                  <span className="text-xs text-green-600 font-medium">Added: </span>
+                  <span className="text-xs font-mono text-stone-600">{detail.added_columns.join(", ")}</span>
+                </div>
+              )}
+              {detail.removed_columns && detail.removed_columns.length > 0 && (
+                <div className="mb-1">
+                  <span className="text-xs text-red-600 font-medium">Removed: </span>
+                  <span className="text-xs font-mono text-stone-600">{detail.removed_columns.join(", ")}</span>
+                </div>
+              )}
+              {detail.type_changes && detail.type_changes.length > 0 && (
+                <div className="mb-1">
+                  <span className="text-xs text-amber-600 font-medium">Type changes: </span>
+                  <span className="text-xs font-mono text-stone-600">{detail.type_changes.map((c) => typeof c === "string" ? c : `${c.column}: ${c.from} → ${c.to}`).join(", ")}</span>
+                </div>
+              )}
+              {!detail.added_columns && !detail.removed_columns && !detail.type_changes && (
+                <pre className="text-xs font-mono text-stone-500 overflow-x-auto">{JSON.stringify(detail, null, 2)}</pre>
+              )}
+            </div>
+          )}
+
+          {/* Contract violation detail */}
+          {isContract && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Contract Violation</div>
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                {detail.contract_id && (
+                  <div>
+                    <span className="text-stone-400 block">Contract</span>
+                    <span className="font-mono text-stone-700">{detail.contract_id.slice(0, 12)}</span>
+                  </div>
+                )}
+                {detail.consumer && (
+                  <div>
+                    <span className="text-stone-400 block">Consumer</span>
+                    <span className="font-mono text-stone-700">{detail.consumer}</span>
+                  </div>
+                )}
+                {detail.violation_type && (
+                  <div>
+                    <span className="text-stone-400 block">Violation</span>
+                    <Pill label={detail.violation_type} color="red" />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Generic detail fallback */}
+          {hasDetail && !isFreshness && !isDrift && !isContract && (
+            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-1">Detail</div>
+              <pre className="text-xs font-mono text-stone-500 overflow-x-auto">{JSON.stringify(detail, null, 2)}</pre>
+            </div>
+          )}
+
+          {/* Ack info */}
+          {a.acknowledged && (
+            <div className="text-xs text-stone-400">
+              Acknowledged{a.acknowledged_by ? ` by ${a.acknowledged_by}` : ""}{a.acknowledged_at ? ` at ${a.acknowledged_at.replace("T", " ").slice(0, 19)}` : ""}
+            </div>
+          )}
+
+          {/* Metadata */}
+          <div className="text-[10px] font-mono text-stone-400">
+            Alert: {a.alert_id?.slice(0, 12)} &middot; Pipeline: {a.pipeline_id?.slice(0, 12)} &middot; {a.created_at?.replace("T", " ").slice(0, 19)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AlertsView({ tierFilter, searchQuery }) {
   const [alerts, setAlerts] = useState([]);
+  const [sevFilter, setSevFilter] = useState("all");
+  const [ackFilter, setAckFilter] = useState("unacked");
   useEffect(() => {
     const tierParam = tierFilter !== "All" ? `&tier=${tierFilter[1]}` : "";
-    api("GET", `/api/observability/alerts?hours=48${tierParam}`).then(setAlerts).catch(console.error);
+    api("GET", `/api/observability/alerts?hours=168${tierParam}`).then(setAlerts).catch(console.error);
   }, [tierFilter]);
 
   async function ack(id) {
     await api("POST", `/api/observability/alerts/${id}/acknowledge`);
-    setAlerts((a) => a.map((x) => (x.alert_id === id ? { ...x, acknowledged: true } : x)));
+    setAlerts((a) => a.map((x) => (x.alert_id === id ? { ...x, acknowledged: true, acknowledged_at: new Date().toISOString() } : x)));
   }
 
-  const sevColor = (s) => ({ critical: "red", warning: "amber", info: "blue" }[s] || "gray");
+  const searched = searchQuery
+    ? alerts.filter((a) => a.pipeline_name?.toLowerCase().includes(searchQuery) || (a.summary || "").toLowerCase().includes(searchQuery))
+    : alerts;
+  const sevFiltered = sevFilter === "all" ? searched : searched.filter((a) => a.severity === sevFilter);
+  const filtered = ackFilter === "all" ? sevFiltered
+    : ackFilter === "unacked" ? sevFiltered.filter((a) => !a.acknowledged)
+    : sevFiltered.filter((a) => a.acknowledged);
+
+  const critCount = alerts.filter((a) => a.severity === "critical" && !a.acknowledged).length;
+  const warnCount = alerts.filter((a) => a.severity === "warning" && !a.acknowledged).length;
 
   return (
     <div className="px-6 py-4">
-      <h1 className="text-lg font-semibold mb-4 text-stone-800">
-        Alerts
-        <span className="ml-2 text-sm font-normal text-stone-400">
-          ({alerts.filter((a) => !a.acknowledged).length} unacknowledged)
-        </span>
-      </h1>
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <h1 className="text-lg font-semibold text-stone-800">Alerts</h1>
+          {critCount > 0 && (
+            <span className="text-xs px-2.5 py-1 bg-red-100 text-red-700 rounded-full font-medium">{critCount} critical</span>
+          )}
+          {warnCount > 0 && (
+            <span className="text-xs px-2.5 py-1 bg-amber-100 text-amber-700 rounded-full font-medium">{warnCount} warning</span>
+          )}
+        </div>
+        <div className="flex gap-1">
+          {[["all", "All"], ["critical", "Critical"], ["warning", "Warning"], ["info", "Info"]].map(([val, label]) => (
+            <button key={val} onClick={() => setSevFilter(val)}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                sevFilter === val ? "bg-stone-800 text-white" : "bg-stone-100 text-stone-500 hover:bg-stone-200"
+              }`}
+            >{label}</button>
+          ))}
+          <span className="w-px bg-stone-200 mx-1" />
+          {[["unacked", "Open"], ["acked", "Acked"], ["all", "All"]].map(([val, label]) => (
+            <button key={val} onClick={() => setAckFilter(val)}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                ackFilter === val ? "bg-stone-800 text-white" : "bg-stone-100 text-stone-500 hover:bg-stone-200"
+              }`}
+            >{label}</button>
+          ))}
+        </div>
+      </div>
       <div className="space-y-2">
-        {alerts.map((a) => (
-          <div
-            key={a.alert_id}
-            className={`bg-white border rounded-xl px-4 py-3 ${
-              a.severity === "critical" && !a.acknowledged ? "border-red-200 bg-red-50" : "border-stone-200"
-            }`}
-          >
-            <div className="flex items-center gap-3">
-              <StatusDot status={a.severity} />
-              <TierBadge tier={a.tier} />
-              <span className="font-mono text-sm flex-1 text-stone-700">{a.pipeline_name}</span>
-              <Pill label={a.severity} color={sevColor(a.severity)} />
-              <span className="text-xs text-stone-400">{a.created_at?.slice(0, 16)}</span>
-              {!a.acknowledged && (
-                <button
-                  onClick={() => ack(a.alert_id)}
-                  className="text-xs px-2 py-1 border border-stone-300 text-stone-500 rounded hover:bg-stone-100"
-                >
-                  Ack
-                </button>
-              )}
-              {a.acknowledged && <span className="text-xs text-green-600">acked</span>}
-            </div>
-            <p className="text-xs text-stone-500 mt-1 ml-8">{a.summary}</p>
+        {filtered.map((a) => <AlertCard key={a.alert_id} a={a} onAck={ack} />)}
+        {filtered.length === 0 && (
+          <div className="text-sm text-stone-400 py-8 text-center bg-green-50 border border-green-200 rounded-xl">
+            {alerts.length === 0 ? "No alerts in the last 7 days." : "No alerts match the current filters."}
           </div>
-        ))}
-        {alerts.length === 0 && (
-          <div className="text-sm text-stone-400 py-8 text-center">No alerts in the last 48 hours.</div>
         )}
       </div>
     </div>
@@ -2389,12 +3172,179 @@ function CostsView() {
 }
 
 // ---------------------------------------------------------------------------
+// Docs View
+// ---------------------------------------------------------------------------
+
+function simpleMarkdown(md) {
+  // Minimal markdown to HTML: headings, bold, italic, code, links, lists, tables, hr
+  let html = md
+    // Code blocks (``` ... ```)
+    .replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) =>
+      `<pre class="bg-stone-900 text-green-300 p-4 rounded-lg overflow-x-auto text-xs font-mono my-3"><code>${code.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</code></pre>`)
+    // Inline code
+    .replace(/`([^`]+)`/g, '<code class="bg-stone-100 text-stone-700 px-1.5 py-0.5 rounded text-xs font-mono">$1</code>')
+    // Headers
+    .replace(/^#### (.+)$/gm, '<h4 class="text-sm font-semibold text-stone-800 mt-5 mb-2">$1</h4>')
+    .replace(/^### (.+)$/gm, '<h3 class="text-base font-semibold text-stone-800 mt-6 mb-2">$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2 class="text-lg font-semibold text-stone-900 mt-8 mb-3 pb-2 border-b border-stone-200">$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1 class="text-2xl font-bold text-stone-900 mb-4">$1</h1>')
+    // Bold and italic
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    // Links
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a class="text-blue-600 hover:underline cursor-pointer" data-doc-link="$2">$1</a>')
+    // HR
+    .replace(/^---$/gm, '<hr class="my-6 border-stone-200" />')
+    // Tables
+    .replace(/^\|(.+)\|$/gm, (match) => {
+      const cells = match.split("|").filter(c => c.trim()).map(c => c.trim());
+      if (cells.every(c => /^[-:]+$/.test(c))) return "<!--table-sep-->";
+      return "<tr>" + cells.map(c => `<td class="px-3 py-2 text-xs border border-stone-200">${c}</td>`).join("") + "</tr>";
+    });
+  // Wrap table rows
+  html = html.replace(/((<tr>.*<\/tr>\n?)+)/g, (block) => {
+    const cleaned = block.replace(/<!--table-sep-->\n?/g, "");
+    return `<table class="w-full border-collapse my-4 text-sm">${cleaned}</table>`;
+  });
+  // Unordered lists
+  html = html.replace(/^- (.+)$/gm, '<li class="ml-4 text-sm text-stone-600 list-disc">$1</li>');
+  html = html.replace(/((<li.*<\/li>\n?)+)/g, '<ul class="my-2 space-y-1">$1</ul>');
+  // Paragraphs (lines that aren't already HTML)
+  html = html.replace(/^(?!<[a-z/!]|<!--)(.+)$/gm, '<p class="text-sm text-stone-600 my-2 leading-relaxed">$1</p>');
+  return html;
+}
+
+function DocsView() {
+  const [docList, setDocList] = useState([]);
+  const [currentDoc, setCurrentDoc] = useState(null);
+  const [content, setContent] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [history, setHistory] = useState([]);
+
+  useEffect(() => {
+    api("GET", "/api/docs").then(d => {
+      setDocList(d.docs || []);
+      setLoading(false);
+      // Auto-load index
+      loadDoc("index.md");
+    }).catch(() => setLoading(false));
+  }, []);
+
+  function loadDoc(path) {
+    if (currentDoc) {
+      setHistory(h => [...h, currentDoc]);
+    }
+    setCurrentDoc(path);
+    setContent("");
+    api("GET", `/api/docs/${path}`).then(d => {
+      setContent(d.content || "");
+    }).catch(e => setContent(`Error loading ${path}: ${e.message}`));
+  }
+
+  function goBack() {
+    if (history.length > 0) {
+      const prev = history[history.length - 1];
+      setHistory(h => h.slice(0, -1));
+      setCurrentDoc(prev);
+      api("GET", `/api/docs/${prev}`).then(d => {
+        setContent(d.content || "");
+      }).catch(() => {});
+    }
+  }
+
+  // Handle internal doc link clicks
+  function handleContentClick(e) {
+    const link = e.target.closest("[data-doc-link]");
+    if (link) {
+      e.preventDefault();
+      let docPath = link.getAttribute("data-doc-link");
+      // Resolve relative paths
+      if (!docPath.startsWith("http")) {
+        if (currentDoc && currentDoc.includes("/")) {
+          const dir = currentDoc.substring(0, currentDoc.lastIndexOf("/"));
+          docPath = dir + "/" + docPath;
+        }
+        if (!docPath.endsWith(".md")) docPath += ".md";
+        loadDoc(docPath);
+      }
+    }
+  }
+
+  // Group docs by section
+  const sections = {};
+  docList.forEach(d => {
+    const s = d.section || "root";
+    if (!sections[s]) sections[s] = [];
+    sections[s].push(d);
+  });
+
+  const sectionLabels = {
+    root: "Getting Started",
+    concepts: "Concepts",
+    agent: "Agent Intelligence",
+    advanced: "Advanced",
+    contributing: "Contributing",
+  };
+
+  return (
+    <div className="flex h-full">
+      <div className="w-56 border-r border-stone-200 overflow-y-auto bg-stone-50 p-3">
+        <div className="text-xs font-semibold text-stone-500 uppercase tracking-wider mb-3">Documentation</div>
+        {Object.entries(sections).map(([section, docs]) => (
+          <div key={section} className="mb-4">
+            <div className="text-xs font-semibold text-stone-400 uppercase tracking-wider mb-1.5 px-2">
+              {sectionLabels[section] || section}
+            </div>
+            {docs.map(d => (
+              <button
+                key={d.path}
+                onClick={() => loadDoc(d.path)}
+                className={`w-full text-left text-xs px-2 py-1.5 rounded transition-colors ${
+                  currentDoc === d.path
+                    ? "bg-blue-50 text-blue-700 font-medium"
+                    : "text-stone-600 hover:bg-stone-100 hover:text-stone-800"
+                }`}
+              >
+                {d.title}
+              </button>
+            ))}
+          </div>
+        ))}
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto px-8 py-6">
+          {history.length > 0 && (
+            <button
+              onClick={goBack}
+              className="text-xs text-blue-600 hover:text-blue-800 mb-4 flex items-center gap-1"
+            >
+              &larr; Back
+            </button>
+          )}
+          {loading ? (
+            <div className="text-sm text-stone-400">Loading docs...</div>
+          ) : content ? (
+            <div
+              onClick={handleContentClick}
+              dangerouslySetInnerHTML={{ __html: simpleMarkdown(content) }}
+            />
+          ) : (
+            <div className="text-sm text-stone-400">Select a document from the sidebar.</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // App Shell
 // ---------------------------------------------------------------------------
 
 function App() {
-  const [view, setView] = useState("command");
-  const [tierFilter, setTierFilter] = useState("All");
+  const [view, setView] = useState(() => sessionStorage.getItem("pa_view") || "command");
+  const [tierFilter, setTierFilter] = useState(() => sessionStorage.getItem("pa_tier") || "All");
+  const [searchQuery, setSearchQuery] = useState("");
   const [authState, setAuthState] = useState(() => {
     const token = getToken();
     const userStr = localStorage.getItem("pa_user");
@@ -2408,6 +3358,18 @@ function App() {
     return { loggedIn: false, user: null };
   });
   const [authEnabled, setAuthEnabled] = useState(null);
+  const [guideStep, setGuideStep] = useState(null);
+
+  // Show onboarding for users who haven't completed it
+  useEffect(() => {
+    if (authState.loggedIn && !localStorage.getItem("pa_onboarding_done")) {
+      setGuideStep(0);
+    }
+  }, [authState.loggedIn]);
+
+  // Persist view and tier to sessionStorage
+  useEffect(() => { sessionStorage.setItem("pa_view", view); }, [view]);
+  useEffect(() => { sessionStorage.setItem("pa_tier", tierFilter); }, [tierFilter]);
 
   useEffect(() => {
     fetch(API + "/health")
@@ -2416,6 +3378,9 @@ function App() {
         setAuthEnabled(data.auth_enabled === true);
         if (!data.auth_enabled) {
           setAuthState({ loggedIn: true, user: { user_id: "anonymous", username: "anonymous", role: "admin" } });
+          if (!localStorage.getItem("pa_onboarding_done")) {
+            setGuideStep(0);
+          }
         }
       })
       .catch(() => setAuthEnabled(false));
@@ -2423,6 +3388,19 @@ function App() {
 
   function handleLogin(data) {
     setAuthState({ loggedIn: true, user: { user_id: data.user_id, username: data.username, role: data.role } });
+    if (!localStorage.getItem("pa_onboarding_done")) {
+      setGuideStep(0);
+    }
+  }
+
+  function handleGuideNav(navId) {
+    const idx = GUIDE_ORDER.indexOf(navId);
+    if (idx >= 0) setGuideStep(idx);
+  }
+
+  function handleGuideFinish() {
+    localStorage.setItem("pa_onboarding_done", "1");
+    setGuideStep(null);
   }
 
   function handleLogout() {
@@ -2442,27 +3420,41 @@ function App() {
 
   // CommandView is always mounted so chat history survives tab switches.
   // Other views render on demand.
+  const sq = searchQuery.toLowerCase();
   const otherViews = {
-    pipelines: <PipelinesView tierFilter={tierFilter} />,
-    activity: <ActivityView />,
-    freshness: <FreshnessView tierFilter={tierFilter} />,
-    quality: <QualityView tierFilter={tierFilter} />,
-    approvals: <ApprovalsView />,
-    dag: <DAGView />,
+    pipelines: <PipelinesView tierFilter={tierFilter} searchQuery={sq} />,
+    activity: <ActivityView searchQuery={sq} />,
+    freshness: <FreshnessView tierFilter={tierFilter} searchQuery={sq} />,
+    quality: <QualityView tierFilter={tierFilter} searchQuery={sq} />,
+    approvals: <ApprovalsView searchQuery={sq} />,
+    dag: <DAGView searchQuery={sq} />,
     connectors: <ConnectorsView />,
-    alerts: <AlertsView tierFilter={tierFilter} />,
+    alerts: <AlertsView tierFilter={tierFilter} searchQuery={sq} />,
     costs: <CostsView />,
+    docs: <DocsView />,
   };
 
   return (
     <div className="flex h-screen overflow-hidden">
+      {guideStep !== null && (
+        <GuideTooltip
+          guideStep={guideStep}
+          setView={setView}
+          onGuideNav={handleGuideNav}
+          onGuideFinish={handleGuideFinish}
+        />
+      )}
       <Sidebar
         view={view}
         setView={setView}
         tierFilter={tierFilter}
         setTierFilter={setTierFilter}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
         user={authState.user}
         onLogout={handleLogout}
+        guideStep={guideStep}
+        onGuideNav={handleGuideNav}
       />
       <main className="flex-1 overflow-y-auto">
         <div style={{ display: view === "command" ? "flex" : "none", flexDirection: "column", height: "100%" }}>
