@@ -15,12 +15,51 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 16 | Data contracts between pipelines | **Done** | Formalize producer/consumer relationships, cleanup policies, retention |
 | 17 | SQL-native intra-DB steps | Pending | Skip CSV extract for same-database pipelines (INSERT INTO...SELECT) |
 | 18 | Composable step DAG | Pending | Replace fixed extract→load→promote flow with configurable step graph (ingestion-focused, transforms deferred) |
-| 19 | DAG visualization UI | Pending | Visual pipeline dependency graph with execution status |
-| 20 | Agent topology reasoning | Pending | Agent designs multi-pipeline architectures from natural language |
+| 19 | DAG visualization UI | **Done** | Visual pipeline dependency graph with execution status |
+| 20 | Agent topology reasoning | **Done** | Agent designs multi-pipeline architectures from natural language |
 
 ---
 
 ## [Unreleased]
+
+### Builds 19-20 - 2026-03-21 (Claude Opus 4.6)
+
+**Build 19: DAG Visualization UI**
+
+#### Added
+- **`GET /api/dag`** — Returns full pipeline dependency graph with nodes (pipeline summary + last run + contract info) and edges (dependencies with type). Powers the DAG view.
+- **DAGView component** — New SVG-based pipeline dependency graph in the React SPA. Features:
+  - Topological sort into layers (roots at top, leaves at bottom)
+  - Nodes colored by status (green=active, gray=paused, red=failed)
+  - Tier badges (T1/T2/T3) on each node
+  - Source→target labels on each node
+  - Last run row count
+  - Contract violation count badges
+  - Dependency arrows (solid) vs data contract edges (purple dashed)
+  - Click-to-select detail panel showing pipeline info, contracts, and violations
+  - Legend for all visual indicators
+- **"DAG" nav item** — Added to sidebar between Lineage and Connectors
+
+**Build 20: Agent Topology Reasoning**
+
+#### Added
+- **`AgentCore.design_topology()`** — Claude-powered method that takes a natural language description of a business problem and designs a multi-pipeline architecture. Returns structured JSON with:
+  - Proposed pipelines (name, source, target, schedule, tier, merge keys, hooks)
+  - Dependencies between pipelines (with trigger type)
+  - Data contracts (with freshness SLA and cleanup ownership)
+  - Pattern identification (fan-in, consume-and-merge, cascading aggregation, etc.)
+  - Detailed reasoning for design decisions
+- **`POST /api/topology/design`** — REST endpoint for topology design. Rate-limited to 10/min. Admin/operator only.
+- **Chat routing** — Keywords "design", "architect", "topology", "multi-pipeline", "data architecture", "pipeline architecture" route to the topology designer. Response is formatted with pipeline list, dependencies, contracts, and reasoning.
+- **`design_topology` action** in both Claude-routed and keyword-routed command parsing.
+- **5 curl tests** — DAG structure, node fields, contract fields, topology design endpoint, chat topology routing.
+
+#### Key Use Cases Unlocked
+- **Visual dependency monitoring**: Operators can see the entire pipeline graph at a glance, with status colors and contract violation badges highlighting problems.
+- **Architecture-as-conversation**: User describes "I need orders from MySQL and customers from MongoDB merged into PostgreSQL" → agent designs 3 pipelines with dependencies, contracts, and schedules.
+- **Two-tier autonomy for topology**: Agent proposes, human approves. The topology response is a proposal, not automatic creation.
+
+---
 
 ### Build 16 - 2026-03-21 (Claude Opus 4.6)
 

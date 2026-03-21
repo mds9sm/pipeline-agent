@@ -85,7 +85,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `sandbox.py` | AST validation + restricted builtins + import whitelist |
 | `auth.py` | JWT auth with 3 roles (admin, operator, viewer) |
 | `crypto.py` | Fernet encryption for credentials at rest |
-| `ui/App.jsx` | React 18 SPA (CDN, no build) - 9 views including Chat |
+| `ui/App.jsx` | React 18 SPA (CDN, no build) - 11 views including Chat, DAG |
 
 ## Critical Design Constraints
 
@@ -148,7 +148,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 **Test script**: `./test-pipeline-agent.sh`
 
 ```bash
-./test-pipeline-agent.sh              # Full suite (~160 tests, ~20 min)
+./test-pipeline-agent.sh              # Full suite (~165 tests, ~20 min)
 ./test-pipeline-agent.sh --api        # REST API endpoints only (~36 tests, fast)
 ./test-pipeline-agent.sh --sources    # Source connector requests + generation
 ./test-pipeline-agent.sh --targets    # Target connector requests + generation
@@ -174,6 +174,8 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Change audit | 4 | PATCH with audit reason, contract_update in timeline, YAML auto-persistence, credential masking (Build 10) |
 | Approval workflow | 2 | list pending, approve |
 | Data contracts | 11 | create, list, get, validate, update, violations, pipeline detail, auto-dep, duplicate/self rejection, delete (Build 16) |
+| DAG visualization | 3 | graph endpoint, node structure, contract fields (Build 19) |
+| Topology reasoning | 2 | design endpoint, chat routing (Build 20) |
 
 ### Adding New Tests
 

@@ -731,6 +731,47 @@ def create_app(
                     "fallback_text": f"{len(alerts)} alert(s)." if alerts else "No alerts. All systems healthy.",
                 }
 
+            elif action == "design_topology":
+                desc = params.get("description", req.text)
+                # Gather existing state for context
+                existing_p = await store.list_pipelines()
+                existing_c = await store.list_connectors(status="active")
+                topology = await agent.design_topology(
+                    desc,
+                    existing_pipelines=[_pipeline_summary(p) for p in existing_p],
+                    existing_connectors=[
+                        {"connector_name": c.connector_name, "connector_type": c.connector_type.value, "source_target_type": c.source_target_type}
+                        for c in existing_c
+                    ],
+                )
+                # Format for display
+                lines = []
+                if topology.get("summary"):
+                    lines.append(f"**Architecture:** {topology['summary']}")
+                if topology.get("pattern"):
+                    lines.append(f"**Pattern:** {topology['pattern']}")
+                if topology.get("pipelines"):
+                    lines.append(f"\n**Proposed Pipelines ({len(topology['pipelines'])}):**")
+                    for i, pp in enumerate(topology["pipelines"], 1):
+                        lines.append(f"  {i}. **{pp.get('name', 'unnamed')}** — {pp.get('description', '')}")
+                        lines.append(f"     {pp.get('source_type', '?')}.{pp.get('source_detail', '?')} -> {pp.get('target_type', '?')}.{pp.get('target_detail', '?')}")
+                        lines.append(f"     Schedule: {pp.get('schedule_cron', '?')} | {pp.get('refresh_type', '?')} | T{pp.get('tier', 2)}")
+                if topology.get("dependencies"):
+                    lines.append(f"\n**Dependencies ({len(topology['dependencies'])}):**")
+                    for dep in topology["dependencies"]:
+                        lines.append(f"  {dep.get('from', '?')} -> {dep.get('to', '?')} ({dep.get('type', '?')})")
+                if topology.get("contracts"):
+                    lines.append(f"\n**Data Contracts ({len(topology['contracts'])}):**")
+                    for ct in topology["contracts"]:
+                        lines.append(f"  {ct.get('producer', '?')} -> {ct.get('consumer', '?')} (SLA: {ct.get('freshness_sla_minutes', '?')}m)")
+                if topology.get("reasoning"):
+                    lines.append(f"\n**Reasoning:** {topology['reasoning']}")
+
+                result_data = {
+                    "topology": topology,
+                    "fallback_text": "\n".join(lines) if lines else "Could not generate topology.",
+                }
+
             elif action == "explain":
                 # explain is inherently conversational — pass through
                 result_data = {
@@ -2340,6 +2381,102 @@ def create_app(
             raise HTTPException(404, "Data contract not found")
         await store.resolve_contract_violation(violation_id)
         return {"status": "resolved"}
+
+    # -----------------------------------------------------------------------
+    # Topology reasoning (Build 20)
+    # -----------------------------------------------------------------------
+
+    class TopologyDesignRequest(BaseModel):
+        description: str
+
+    @app.post("/api/topology/design")
+    @limiter.limit("10/minute")
+    async def design_topology_endpoint(
+        request: Request,
+        req: TopologyDesignRequest = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        existing_p = await store.list_pipelines()
+        existing_c = await store.list_connectors(status="active")
+        topology = await agent.design_topology(
+            req.description,
+            existing_pipelines=[_pipeline_summary(p) for p in existing_p],
+            existing_connectors=[
+                {"connector_name": c.connector_name, "connector_type": c.connector_type.value, "source_target_type": c.source_target_type}
+                for c in existing_c
+            ],
+        )
+        return topology
+
+    # -----------------------------------------------------------------------
+    # DAG visualization (Build 19)
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/dag")
+    @limiter.limit("60/minute")
+    async def get_dag(
+        request: Request,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Return full pipeline dependency graph for DAG visualization."""
+        pipelines = await store.list_pipelines()
+        nodes = []
+        edges = []
+        seen_edges = set()
+
+        for p in pipelines:
+            # Last run info
+            last_run = await store.get_last_successful_run(p.pipeline_id)
+            last_run_info = None
+            if last_run:
+                last_run_info = {
+                    "run_id": last_run.run_id,
+                    "status": last_run.status.value if hasattr(last_run.status, "value") else last_run.status,
+                    "completed_at": last_run.completed_at,
+                    "rows_loaded": last_run.rows_loaded,
+                }
+
+            # Data contracts summary
+            produced = await store.list_data_contracts(producer_id=p.pipeline_id)
+            consumed = await store.list_data_contracts(consumer_id=p.pipeline_id)
+            contract_violations = sum(c.violation_count for c in produced + consumed)
+
+            nodes.append({
+                "id": p.pipeline_id,
+                "name": p.pipeline_name,
+                "status": p.status.value if hasattr(p.status, "value") else p.status,
+                "tier": p.tier,
+                "owner": p.owner,
+                "schedule_cron": p.schedule_cron,
+                "refresh_type": p.refresh_type.value if hasattr(p.refresh_type, "value") else p.refresh_type,
+                "source": f"{p.source_schema}.{p.source_table}",
+                "target": f"{p.target_schema}.{p.target_table}",
+                "last_run": last_run_info,
+                "contracts_as_producer": len(produced),
+                "contracts_as_consumer": len(consumed),
+                "contract_violations": contract_violations,
+            })
+
+            # Gather edges from dependencies
+            deps = await store.list_dependencies(p.pipeline_id)
+            for dep in deps:
+                edge_key = f"{dep.depends_on_id}->{p.pipeline_id}"
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "from": dep.depends_on_id,
+                        "to": p.pipeline_id,
+                        "type": dep.dependency_type.value if hasattr(dep.dependency_type, "value") else dep.dependency_type,
+                        "notes": dep.notes,
+                    })
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "total_pipelines": len(nodes),
+            "total_edges": len(edges),
+        }
 
     # -----------------------------------------------------------------------
     # Pipeline metadata (Build 11 - XCom-style)

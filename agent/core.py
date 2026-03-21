@@ -282,6 +282,118 @@ Respond with a JSON object containing exactly these keys:
         }
 
     # ------------------------------------------------------------------
+    # design_topology (Build 20)
+    # ------------------------------------------------------------------
+
+    async def design_topology(
+        self,
+        description: str,
+        existing_pipelines: Optional[list[dict]] = None,
+        existing_connectors: Optional[list[dict]] = None,
+    ) -> dict:
+        """Design a multi-pipeline architecture from a natural language description.
+
+        Returns a structured topology proposal with pipelines, dependencies,
+        data contracts, and scheduling recommendations.
+        """
+        if not self.has_api:
+            return {
+                "error": "Topology reasoning requires an API key.",
+                "pipelines": [],
+                "dependencies": [],
+                "contracts": [],
+            }
+
+        existing_text = ""
+        if existing_pipelines:
+            lines = [f"  - {p.get('pipeline_name', 'unknown')}: {p.get('source', '?')} -> {p.get('target', '?')} ({p.get('status', '?')})" for p in existing_pipelines[:20]]
+            existing_text += "\n\nExisting pipelines:\n" + "\n".join(lines)
+        if existing_connectors:
+            lines = [f"  - {c.get('connector_name', 'unknown')} ({c.get('connector_type', '?')}, {c.get('source_target_type', '?')})" for c in existing_connectors[:20]]
+            existing_text += "\n\nAvailable connectors:\n" + "\n".join(lines)
+
+        user_prompt = f"""
+You are designing a multi-pipeline data architecture for DAPOS (an agentic data platform).
+The user has described what they need. Design the optimal pipeline topology.
+
+User request: "{description}"
+{existing_text}
+
+Supported patterns:
+- Consume & merge: Stage -> upsert -> cleanup consumed rows
+- Fan-in: Multiple sources -> unified table
+- Fan-out: One source -> multiple targets
+- SCD Type 2: Historical change tracking
+- Quarantine: Bad rows -> error table, good rows -> production
+- Cascading aggregation: Raw -> daily -> monthly -> dashboard
+- Conditional routing: Branch on quality/volume thresholds
+- Replay/reprocess: Re-run a time window idempotently
+
+Design the topology and respond with JSON:
+{{
+  "summary": "One paragraph explaining the architecture",
+  "pattern": "primary pattern name (e.g., fan-in, consume-and-merge)",
+  "pipelines": [
+    {{
+      "name": "pipeline-name",
+      "description": "what this pipeline does",
+      "source_type": "source connector type (e.g., mysql, stripe, s3)",
+      "source_detail": "database.schema.table or API resource",
+      "target_type": "target connector type (e.g., postgresql, snowflake)",
+      "target_detail": "schema.table",
+      "refresh_type": "full or incremental",
+      "load_type": "append or merge",
+      "schedule_cron": "cron expression",
+      "tier": 1-3,
+      "merge_keys": ["key1"] or [],
+      "incremental_column": "column_name or null",
+      "hooks": ["optional post-promotion SQL descriptions"]
+    }}
+  ],
+  "dependencies": [
+    {{
+      "from": "upstream-pipeline-name",
+      "to": "downstream-pipeline-name",
+      "type": "data_triggered or scheduled",
+      "notes": "why this dependency exists"
+    }}
+  ],
+  "contracts": [
+    {{
+      "producer": "producer-pipeline-name",
+      "consumer": "consumer-pipeline-name",
+      "freshness_sla_minutes": 60,
+      "required_columns": ["col1", "col2"],
+      "cleanup_ownership": "consumer_acknowledges or producer_ttl or none"
+    }}
+  ],
+  "reasoning": "Detailed explanation of design decisions"
+}}
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                operation="design_topology",
+                temperature=0.3,
+            )
+            result = self._extract_json(text)
+            result.setdefault("pipelines", [])
+            result.setdefault("dependencies", [])
+            result.setdefault("contracts", [])
+            result.setdefault("summary", "")
+            result.setdefault("pattern", "custom")
+            return result
+        except Exception as e:
+            log.warning("Claude API error in design_topology: %s", e)
+            return {
+                "error": str(e),
+                "pipelines": [],
+                "dependencies": [],
+                "contracts": [],
+                "summary": "Failed to generate topology. Please try again.",
+            }
+
+    # ------------------------------------------------------------------
     # analyze_drift
     # ------------------------------------------------------------------
 
@@ -848,6 +960,7 @@ Available actions:
 - reject_proposal: Reject a pending proposal (params: proposal_id, note)
 - pause_pipeline: Pause a pipeline (params: pipeline_id)
 - resume_pipeline: Resume a paused pipeline (params: pipeline_id)
+- design_topology: Design a multi-pipeline architecture from a description (params: description of what the user needs)
 - explain: Explain something about the system (params: topic)
 - unknown: Could not determine intent
 
@@ -988,6 +1101,18 @@ Respond with JSON:
                 "action": "resume_pipeline",
                 "params": {"query": user_text},
                 "response_text": "Resuming pipeline...",
+            }
+
+        # Design topology (Build 20)
+        if any(kw in text_lower for kw in (
+            "design", "architect", "topology", "multi-pipeline",
+            "set up pipelines for", "build pipelines for",
+            "data architecture", "pipeline architecture",
+        )):
+            return {
+                "action": "design_topology",
+                "params": {"description": user_text},
+                "response_text": "Designing pipeline topology...",
             }
 
         # Explain / help

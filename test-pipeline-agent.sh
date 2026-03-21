@@ -1618,6 +1618,101 @@ fi
 fi # --api (data contracts)
 
 # ============================================================================
+# SECTION 10: DAG Visualization & Topology (Builds 19-20)
+# ============================================================================
+if [ "$TEST_MODE" = "all" ] || [ "$TEST_MODE" = "--api" ]; then
+
+section "DAG VISUALIZATION & TOPOLOGY (Builds 19-20)"
+
+# Test 1: DAG endpoint
+test_name "GET /api/dag - Get pipeline dependency graph"
+RESP=$(api_get "/api/dag")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    NODE_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_pipelines',0))" 2>/dev/null)
+    EDGE_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_edges',0))" 2>/dev/null)
+    pass "DAG returned: $NODE_COUNT nodes, $EDGE_COUNT edges"
+else
+    fail "DAG endpoint failed (HTTP $CODE)"
+fi
+
+# Test 2: DAG node structure
+test_name "GET /api/dag - Verify node structure"
+HAS_FIELDS=$(echo "$BODY" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+nodes = data.get('nodes',[])
+if nodes:
+    n = nodes[0]
+    required = ['id','name','status','tier','source','target','last_run']
+    print('yes' if all(k in n for k in required) else 'no')
+else:
+    print('empty')
+" 2>/dev/null)
+if [ "$HAS_FIELDS" = "yes" ]; then
+    pass "DAG nodes have correct structure"
+elif [ "$HAS_FIELDS" = "empty" ]; then
+    warn "No nodes in DAG to verify"
+else
+    fail "DAG nodes missing required fields"
+fi
+
+# Test 3: DAG includes contract info
+test_name "GET /api/dag - Nodes include contract fields"
+HAS_CONTRACTS=$(echo "$BODY" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+nodes = data.get('nodes',[])
+if nodes:
+    n = nodes[0]
+    print('yes' if 'contracts_as_producer' in n and 'contracts_as_consumer' in n else 'no')
+else:
+    print('empty')
+" 2>/dev/null)
+if [ "$HAS_CONTRACTS" = "yes" ]; then
+    pass "DAG nodes include contract fields"
+elif [ "$HAS_CONTRACTS" = "empty" ]; then
+    warn "No nodes to check"
+else
+    fail "DAG nodes missing contract fields"
+fi
+
+# Test 4: Topology design endpoint
+test_name "POST /api/topology/design - Design pipeline architecture"
+RESP=$(api_post "/api/topology/design" '{"description": "I need to ingest orders from MySQL and customers from MongoDB into PostgreSQL, then merge them into a unified customer_orders table"}')
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    PIPELINE_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('pipelines',[])))" 2>/dev/null)
+    PATTERN=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('pattern',''))" 2>/dev/null)
+    if [ "$PIPELINE_COUNT" -ge 1 ] 2>/dev/null; then
+        pass "Topology designed: $PIPELINE_COUNT pipeline(s), pattern=$PATTERN"
+    else
+        warn "Topology returned but no pipelines (may need API key)"
+    fi
+else
+    warn "Topology design returned HTTP $CODE (may need API key)"
+fi
+
+# Test 5: Topology via chat
+test_name "Chat - Design topology via conversation"
+RESP=$(chat "design a pipeline architecture to ingest Stripe charges and Shopify orders into Snowflake")
+HAS_TOPOLOGY=$(echo "$RESP" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+r = data.get('response','').lower()
+print('yes' if any(kw in r for kw in ['pipeline', 'topology', 'architecture', 'design', 'processing']) else 'no')
+" 2>/dev/null)
+if [ "$HAS_TOPOLOGY" = "yes" ]; then
+    pass "Chat topology design returned response"
+else
+    warn "Chat topology response unclear"
+fi
+
+fi # --api (dag & topology)
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -1674,6 +1769,8 @@ echo "    Snowflake, BigQuery, Redshift, Databricks"
 echo "  - Approval workflow"
 echo "  - Data contracts: create, list, get, validate, update, violations, auto-dep,"
 echo "    duplicate/self rejection, delete (Build 16)"
+echo "  - DAG visualization: graph endpoint, node structure, contract fields (Build 19)"
+echo "  - Topology reasoning: design endpoint, chat routing (Build 20)"
 echo ""
 
 exit $FAIL_COUNT

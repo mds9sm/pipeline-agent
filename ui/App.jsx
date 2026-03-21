@@ -178,6 +178,7 @@ const NAV = [
   { id: "quality", label: "Quality", icon: "+" },
   { id: "approvals", label: "Approvals", icon: "?" },
   { id: "lineage", label: "Lineage", icon: "/" },
+  { id: "dag", label: "DAG", icon: "%" },
   { id: "connectors", label: "Connectors", icon: "@" },
   { id: "alerts", label: "Alerts", icon: "!" },
   { id: "costs", label: "Costs", icon: "$" },
@@ -1610,7 +1611,303 @@ function LineageView() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Connectors View (with migration info)
+// 8. DAG Visualization (Build 19)
+// ---------------------------------------------------------------------------
+
+function DAGView() {
+  const [dag, setDag] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const svgRef = useRef(null);
+
+  useEffect(() => {
+    setLoading(true);
+    api("GET", "/api/dag")
+      .then(setDag)
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="px-6 py-4">
+        <h1 className="text-lg font-semibold mb-4 text-stone-800">Pipeline DAG</h1>
+        <div className="text-sm text-stone-400">Loading graph...</div>
+      </div>
+    );
+  }
+
+  if (!dag || dag.nodes.length === 0) {
+    return (
+      <div className="px-6 py-4">
+        <h1 className="text-lg font-semibold mb-4 text-stone-800">Pipeline DAG</h1>
+        <div className="text-sm text-stone-400">No pipelines found.</div>
+      </div>
+    );
+  }
+
+  // Topological sort into layers
+  const nodeMap = {};
+  dag.nodes.forEach((n) => { nodeMap[n.id] = n; });
+  const inDegree = {};
+  const children = {};
+  dag.nodes.forEach((n) => { inDegree[n.id] = 0; children[n.id] = []; });
+  dag.edges.forEach((e) => {
+    inDegree[e.to] = (inDegree[e.to] || 0) + 1;
+    if (!children[e.from]) children[e.from] = [];
+    children[e.from].push(e.to);
+  });
+
+  // BFS layering
+  const layers = [];
+  const visited = new Set();
+  let queue = dag.nodes.filter((n) => (inDegree[n.id] || 0) === 0).map((n) => n.id);
+  if (queue.length === 0) queue = [dag.nodes[0].id]; // fallback for cycles
+
+  while (queue.length > 0) {
+    const layer = [];
+    const nextQueue = [];
+    queue.forEach((id) => {
+      if (!visited.has(id)) {
+        visited.add(id);
+        layer.push(id);
+        (children[id] || []).forEach((cid) => {
+          inDegree[cid]--;
+          if (inDegree[cid] <= 0 && !visited.has(cid)) {
+            nextQueue.push(cid);
+          }
+        });
+      }
+    });
+    if (layer.length > 0) layers.push(layer);
+    queue = nextQueue;
+  }
+  // Add any unvisited nodes (disconnected)
+  const remaining = dag.nodes.filter((n) => !visited.has(n.id)).map((n) => n.id);
+  if (remaining.length > 0) layers.push(remaining);
+
+  // Layout constants
+  const nodeW = 200;
+  const nodeH = 72;
+  const layerGap = 120;
+  const nodeGap = 30;
+  const padX = 40;
+  const padY = 40;
+
+  // Compute positions
+  const positions = {};
+  let maxLayerWidth = 0;
+  layers.forEach((layer) => {
+    maxLayerWidth = Math.max(maxLayerWidth, layer.length);
+  });
+  const svgWidth = Math.max(800, maxLayerWidth * (nodeW + nodeGap) + padX * 2);
+
+  layers.forEach((layer, li) => {
+    const totalW = layer.length * nodeW + (layer.length - 1) * nodeGap;
+    const startX = (svgWidth - totalW) / 2;
+    layer.forEach((id, ni) => {
+      positions[id] = {
+        x: startX + ni * (nodeW + nodeGap),
+        y: padY + li * (nodeH + layerGap),
+      };
+    });
+  });
+
+  const svgHeight = padY * 2 + layers.length * (nodeH + layerGap);
+
+  const statusColor = (s) => ({
+    active: "#4ade80", complete: "#4ade80",
+    paused: "#9ca3af",
+    failed: "#f87171", halted: "#f87171",
+    archived: "#6b7280",
+  }[s] || "#9ca3af");
+
+  const tierColor = (t) => ({
+    1: "#ef4444", 2: "#f59e0b", 3: "#3b82f6",
+  }[t] || "#6b7280");
+
+  const selectedNode = selected ? nodeMap[selected] : null;
+
+  return (
+    <div className="px-6 py-4">
+      <h1 className="text-lg font-semibold mb-1 text-stone-800">Pipeline DAG</h1>
+      <div className="text-xs text-stone-400 mb-4">
+        {dag.total_pipelines} pipeline(s), {dag.total_edges} dependency edge(s)
+      </div>
+      <div className="flex gap-4">
+        <div className="flex-1 bg-white border border-stone-200 rounded-xl overflow-auto" style={{ maxHeight: "75vh" }}>
+          <svg ref={svgRef} width={svgWidth} height={svgHeight} className="w-full" style={{ minWidth: svgWidth }}>
+            <defs>
+              <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+                <path d="M0,0 L8,3 L0,6 Z" fill="#94a3b8" />
+              </marker>
+              <marker id="arrow-contract" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+                <path d="M0,0 L8,3 L0,6 Z" fill="#8b5cf6" />
+              </marker>
+            </defs>
+
+            {/* Edges */}
+            {dag.edges.map((e, i) => {
+              const from = positions[e.from];
+              const to = positions[e.to];
+              if (!from || !to) return null;
+              const x1 = from.x + nodeW / 2;
+              const y1 = from.y + nodeH;
+              const x2 = to.x + nodeW / 2;
+              const y2 = to.y;
+              const midY = (y1 + y2) / 2;
+              const isContract = e.notes && e.notes.includes("data contract");
+              return (
+                <path
+                  key={i}
+                  d={`M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`}
+                  fill="none"
+                  stroke={isContract ? "#8b5cf6" : "#cbd5e1"}
+                  strokeWidth={isContract ? 2 : 1.5}
+                  strokeDasharray={isContract ? "6,3" : "none"}
+                  markerEnd={isContract ? "url(#arrow-contract)" : "url(#arrow)"}
+                />
+              );
+            })}
+
+            {/* Nodes */}
+            {dag.nodes.map((node) => {
+              const pos = positions[node.id];
+              if (!pos) return null;
+              const isSelected = selected === node.id;
+              return (
+                <g
+                  key={node.id}
+                  transform={`translate(${pos.x},${pos.y})`}
+                  onClick={() => setSelected(isSelected ? null : node.id)}
+                  style={{ cursor: "pointer" }}
+                >
+                  <rect
+                    width={nodeW}
+                    height={nodeH}
+                    rx={10}
+                    fill={isSelected ? "#eff6ff" : "#fff"}
+                    stroke={isSelected ? "#3b82f6" : "#e2e8f0"}
+                    strokeWidth={isSelected ? 2 : 1}
+                  />
+                  {/* Status indicator bar */}
+                  <rect x={0} y={0} width={4} height={nodeH} rx={2} fill={statusColor(node.status)} />
+                  {/* Tier badge */}
+                  <rect x={nodeW - 30} y={6} width={22} height={16} rx={4} fill={tierColor(node.tier)} opacity={0.15} />
+                  <text x={nodeW - 19} y={18} textAnchor="middle" fontSize={9} fontFamily="monospace" fontWeight="600" fill={tierColor(node.tier)}>
+                    T{node.tier}
+                  </text>
+                  {/* Pipeline name */}
+                  <text x={14} y={22} fontSize={11} fontFamily="monospace" fontWeight="600" fill="#1e293b">
+                    {node.name.length > 22 ? node.name.slice(0, 20) + ".." : node.name}
+                  </text>
+                  {/* Source -> Target */}
+                  <text x={14} y={38} fontSize={9} fontFamily="monospace" fill="#94a3b8">
+                    {node.source.length > 14 ? node.source.slice(0, 12) + ".." : node.source}
+                    {" -> "}
+                    {node.target.length > 14 ? node.target.slice(0, 12) + ".." : node.target}
+                  </text>
+                  {/* Last run info */}
+                  <text x={14} y={54} fontSize={9} fontFamily="sans-serif" fill="#94a3b8">
+                    {node.last_run
+                      ? `Last run: ${node.last_run.rows_loaded} rows`
+                      : "No runs yet"}
+                  </text>
+                  {/* Contract violation indicator */}
+                  {node.contract_violations > 0 && (
+                    <g>
+                      <circle cx={nodeW - 12} cy={nodeH - 12} r={8} fill="#fef2f2" stroke="#fca5a5" />
+                      <text x={nodeW - 12} y={nodeH - 8} textAnchor="middle" fontSize={8} fontWeight="700" fill="#dc2626">
+                        {node.contract_violations}
+                      </text>
+                    </g>
+                  )}
+                  {/* Contract badges */}
+                  {(node.contracts_as_producer > 0 || node.contracts_as_consumer > 0) && (
+                    <circle cx={nodeW - 12} cy={36} r={4} fill="#8b5cf6" opacity={0.6} />
+                  )}
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+
+        {/* Detail panel */}
+        {selectedNode && (
+          <div className="w-72 bg-white border border-stone-200 rounded-xl p-4 space-y-3 max-h-[75vh] overflow-y-auto">
+            <div>
+              <div className="text-xs text-stone-400">Pipeline</div>
+              <div className="text-sm font-mono font-semibold text-stone-800">{selectedNode.name}</div>
+            </div>
+            <div className="flex gap-2">
+              <span className="flex items-center gap-1 text-xs">
+                <StatusDot status={selectedNode.status} />
+                {selectedNode.status}
+              </span>
+              <TierBadge tier={selectedNode.tier} />
+              <Pill label={selectedNode.refresh_type} color="blue" />
+            </div>
+            <div className="text-xs text-stone-500 space-y-1">
+              <div><span className="text-stone-400">Source:</span> {selectedNode.source}</div>
+              <div><span className="text-stone-400">Target:</span> {selectedNode.target}</div>
+              <div><span className="text-stone-400">Schedule:</span> {selectedNode.schedule_cron}</div>
+              {selectedNode.owner && <div><span className="text-stone-400">Owner:</span> {selectedNode.owner}</div>}
+            </div>
+            {selectedNode.last_run && (
+              <div className="border-t border-stone-200 pt-2">
+                <div className="text-xs text-stone-400 mb-1">Last Successful Run</div>
+                <div className="text-xs text-stone-500 space-y-0.5">
+                  <div>{selectedNode.last_run.rows_loaded} rows loaded</div>
+                  <div>{selectedNode.last_run.completed_at}</div>
+                </div>
+              </div>
+            )}
+            {(selectedNode.contracts_as_producer > 0 || selectedNode.contracts_as_consumer > 0) && (
+              <div className="border-t border-stone-200 pt-2">
+                <div className="text-xs text-stone-400 mb-1">Data Contracts</div>
+                <div className="text-xs text-stone-500 space-y-0.5">
+                  {selectedNode.contracts_as_producer > 0 && <div>Producer in {selectedNode.contracts_as_producer} contract(s)</div>}
+                  {selectedNode.contracts_as_consumer > 0 && <div>Consumer in {selectedNode.contracts_as_consumer} contract(s)</div>}
+                  {selectedNode.contract_violations > 0 && (
+                    <div className="text-red-600 font-medium">{selectedNode.contract_violations} violation(s)</div>
+                  )}
+                </div>
+              </div>
+            )}
+            <div className="border-t border-stone-200 pt-2">
+              <div className="text-xs font-mono text-stone-400 break-all">{selectedNode.id}</div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Legend */}
+      <div className="flex gap-6 mt-4 text-xs text-stone-400">
+        <div className="flex items-center gap-1.5">
+          <span className="inline-block w-3 h-3 rounded bg-green-400" /> Active
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="inline-block w-3 h-3 rounded bg-gray-400" /> Paused
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="inline-block w-3 h-3 rounded bg-red-400" /> Failed/Halted
+        </div>
+        <div className="flex items-center gap-1.5">
+          <svg width="24" height="8"><line x1="0" y1="4" x2="24" y2="4" stroke="#cbd5e1" strokeWidth="1.5" /></svg> Dependency
+        </div>
+        <div className="flex items-center gap-1.5">
+          <svg width="24" height="8"><line x1="0" y1="4" x2="24" y2="4" stroke="#8b5cf6" strokeWidth="2" strokeDasharray="6,3" /></svg> Data Contract
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="inline-block w-3 h-3 rounded-full bg-purple-500 opacity-60" /> Has Contract
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Connectors View (with migration info)
 // ---------------------------------------------------------------------------
 
 function ConnectorsView() {
@@ -1964,6 +2261,7 @@ function App() {
     quality: <QualityView tierFilter={tierFilter} />,
     approvals: <ApprovalsView />,
     lineage: <LineageView />,
+    dag: <DAGView />,
     connectors: <ConnectorsView />,
     alerts: <AlertsView tierFilter={tierFilter} />,
     costs: <CostsView />,
