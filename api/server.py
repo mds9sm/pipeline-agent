@@ -655,7 +655,14 @@ def create_app(
                     connector_id = connector_id or await _resolve_connector(_reg.connector_id, "", role="source")
                     cp = _reg.connection_params
                     database = database or cp.get("database", "")
-                    schema_name = schema_name if schema_name != "main" else cp.get("schema", schema_name)
+                    # For MySQL/MariaDB, schema = database name
+                    if schema_name == "main":
+                        _cached_schema = None
+                        if _reg.schema_cache and "schemas" in _reg.schema_cache:
+                            schemas = _reg.schema_cache["schemas"]
+                            if schemas:
+                                _cached_schema = schemas[0].get("schema_name")
+                        schema_name = cp.get("schema") or _cached_schema or database or schema_name
                     for k in ("host", "port", "user", "password"):
                         if k not in params or not params[k]:
                             params[k] = cp.get(k, "")
@@ -697,7 +704,13 @@ def create_app(
                     connector_id = connector_id or await _resolve_connector(_reg.connector_id, "", role="source")
                     cp = _reg.connection_params
                     database = database or cp.get("database", "")
-                    schema_name = schema_name if schema_name != "main" else cp.get("schema", schema_name)
+                    if schema_name == "main":
+                        _cached_schema = None
+                        if _reg.schema_cache and "schemas" in _reg.schema_cache:
+                            schemas = _reg.schema_cache["schemas"]
+                            if schemas:
+                                _cached_schema = schemas[0].get("schema_name")
+                        schema_name = cp.get("schema") or _cached_schema or database or schema_name
                     for k in ("host", "port", "user", "password"):
                         if k not in params or not params[k]:
                             params[k] = cp.get(k, "")
@@ -759,6 +772,14 @@ def create_app(
                     cp = _reg_src.connection_params
                     if not src_database:
                         src_database = cp.get("database", "")
+                    # Resolve schema from cache or database name
+                    if src_schema == "main":
+                        _cached_schema = None
+                        if _reg_src.schema_cache and "schemas" in _reg_src.schema_cache:
+                            _schemas = _reg_src.schema_cache["schemas"]
+                            if _schemas:
+                                _cached_schema = _schemas[0].get("schema_name")
+                        src_schema = cp.get("schema") or _cached_schema or src_database or src_schema
                     if not params.get("source_host"):
                         params["source_host"] = cp.get("host", "localhost")
                     if not params.get("source_port"):
