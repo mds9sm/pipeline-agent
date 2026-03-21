@@ -74,14 +74,21 @@ DEMO_PIPELINES = [
     },
 ]
 
-# Target config -- all demo pipelines land in the local PostgreSQL
+# Target config -- all demo pipelines land in the app's own PostgreSQL
 TARGET_CONNECTOR_NAME = "postgres-target-v1"
-TARGET_HOST = "localhost"
-TARGET_PORT = 5432
-TARGET_DATABASE = "pipeline_agent"
-TARGET_USER = "pipeline_agent"
-TARGET_PASSWORD = "pipeline_agent"
 TARGET_SCHEMA = "raw"
+
+def _target_config():
+    """Read target connection from Config so Railway/cloud DATABASE_URL works."""
+    from config import Config
+    cfg = Config()
+    return {
+        "host": cfg.pg_host,
+        "port": cfg.pg_port,
+        "database": cfg.pg_database,
+        "user": cfg.pg_user,
+        "password": cfg.pg_password,
+    }
 
 
 async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegistry, runner=None) -> None:
@@ -95,6 +102,8 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
     if existing:
         log.info("Pipelines already exist (%d), skipping demo bootstrap.", len(existing))
         return
+
+    _tgt = _target_config()
 
     # Resolve connector IDs by name
     connectors = await store.list_connectors(status="active")
@@ -148,11 +157,11 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
             source_password=cfg.get("source_password", ""),
             # Target
             target_connector_id=target_id,
-            target_host=TARGET_HOST,
-            target_port=TARGET_PORT,
-            target_database=TARGET_DATABASE,
-            target_user=TARGET_USER,
-            target_password=TARGET_PASSWORD,
+            target_host=_tgt["host"],
+            target_port=_tgt["port"],
+            target_database=_tgt["database"],
+            target_user=_tgt["user"],
+            target_password=_tgt["password"],
             target_schema=TARGET_SCHEMA,
             target_table=cfg["target_table"],
             # Schema
