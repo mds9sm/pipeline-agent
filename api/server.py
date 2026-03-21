@@ -2550,8 +2550,9 @@ def create_app(
             }
 
         # Column-level lineage
-        column_lineage = await store.list_column_lineage(pipeline_id)
-        downstream_columns = await store.get_downstream_columns(pipeline_id)
+        all_column_lineage = await store.list_column_lineage(pipeline_id)
+        column_lineage = [cl for cl in all_column_lineage if cl.source_pipeline_id == pipeline_id]
+        downstream_columns = [cl for cl in all_column_lineage if cl.target_pipeline_id == pipeline_id and cl.source_pipeline_id != pipeline_id]
 
         upstream_enriched = []
         for d in upstream:
@@ -2568,17 +2569,17 @@ def create_app(
             "downstream": downstream_enriched,
             "column_lineage": [
                 {
-                    "lineage_id": cl.lineage_id,
+                    "lineage_id": cl.id,
                     "source_column": cl.source_column,
                     "target_column": cl.target_column,
-                    "transform_logic": cl.transform_logic,
+                    "transform_logic": cl.transformation,
                 }
                 for cl in column_lineage
             ] if column_lineage else [],
             "downstream_columns": [
                 {
-                    "lineage_id": dc.lineage_id,
-                    "pipeline_id": dc.pipeline_id,
+                    "lineage_id": dc.id,
+                    "pipeline_id": dc.source_pipeline_id,
                     "source_column": dc.source_column,
                     "target_column": dc.target_column,
                 }
@@ -3550,13 +3551,19 @@ def create_app(
 
         @app.get("/")
         async def serve_ui():
-            return FileResponse(os.path.join(_ui_dir, "index.html"))
+            return FileResponse(
+                os.path.join(_ui_dir, "index.html"),
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+            )
 
         @app.get("/{full_path:path}")
         async def catch_all(full_path: str):
             if full_path.startswith("api/") or full_path in ("health", "metrics"):
                 raise HTTPException(404)
-            return FileResponse(os.path.join(_ui_dir, "index.html"))
+            return FileResponse(
+                os.path.join(_ui_dir, "index.html"),
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+            )
 
     return app
 

@@ -1496,7 +1496,13 @@ function DAGView() {
   const [lineageDetail, setLineageDetail] = useState(null);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [didDrag, setDidDrag] = useState(false);
   const svgRef = useRef(null);
+  const containerRef = useRef(null);
 
   useEffect(() => {
     setLoading(true);
@@ -1661,8 +1667,41 @@ function DAGView() {
         {hasSearch && ` — ${matchedIds.size} match(es)`}
       </div>
       <div className="flex gap-4">
-        <div className="flex-1 bg-white border border-stone-200 rounded-xl overflow-auto" style={{ maxHeight: "75vh" }}>
-          <svg ref={svgRef} width={svgWidth} height={svgHeight} className="w-full" style={{ minWidth: svgWidth }}>
+        <div className="flex-1 bg-white border border-stone-200 rounded-xl overflow-hidden relative" style={{ maxHeight: "75vh" }}>
+          {/* Zoom controls */}
+          <div className="absolute top-3 left-3 z-10 flex flex-col gap-1">
+            <button onClick={() => setZoom((z) => Math.min(3, z * 1.25))} className="w-7 h-7 bg-white border border-stone-300 rounded-lg text-stone-600 hover:bg-stone-50 text-sm font-bold shadow-sm">+</button>
+            <button onClick={() => setZoom((z) => Math.max(0.15, z / 1.25))} className="w-7 h-7 bg-white border border-stone-300 rounded-lg text-stone-600 hover:bg-stone-50 text-sm font-bold shadow-sm">-</button>
+            <button onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }} className="w-7 h-7 bg-white border border-stone-300 rounded-lg text-stone-500 hover:bg-stone-50 text-[9px] font-semibold shadow-sm">fit</button>
+          </div>
+          <div className="absolute top-3 right-3 z-10 text-[10px] text-stone-400 bg-white/80 px-2 py-0.5 rounded">{Math.round(zoom * 100)}%</div>
+          <svg
+            ref={svgRef}
+            width="100%"
+            height="100%"
+            viewBox={`${-pan.x / zoom} ${-pan.y / zoom} ${svgWidth / zoom} ${svgHeight / zoom}`}
+            style={{ minHeight: Math.min(svgHeight * zoom, 600), cursor: dragging ? "grabbing" : "grab" }}
+            onWheel={(e) => {
+              e.preventDefault();
+              const factor = e.deltaY < 0 ? 1.1 : 0.9;
+              setZoom((z) => Math.min(3, Math.max(0.15, z * factor)));
+            }}
+            onMouseDown={(e) => {
+              if (e.button === 0) {
+                setDragging(true);
+                setDidDrag(false);
+                setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
+              }
+            }}
+            onMouseMove={(e) => {
+              if (dragging) {
+                setDidDrag(true);
+                setPan({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+              }
+            }}
+            onMouseUp={() => setDragging(false)}
+            onMouseLeave={() => setDragging(false)}
+          >
             <defs>
               <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
                 <path d="M0,0 L8,3 L0,6 Z" fill="#94a3b8" />
@@ -1709,7 +1748,7 @@ function DAGView() {
                 <g
                   key={node.id}
                   transform={`translate(${pos.x},${pos.y})`}
-                  onClick={() => setSelected(isSelected ? null : node.id)}
+                  onClick={() => { if (!didDrag) setSelected(isSelected ? null : node.id); }}
                   style={{ cursor: "pointer" }}
                   opacity={dimmed ? 0.15 : 1}
                 >
