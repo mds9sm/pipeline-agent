@@ -100,6 +100,99 @@ function ProgressBar({ pct, color = "blue" }) {
   );
 }
 
+function RunRow({ r }) {
+  const [showQuality, setShowQuality] = useState(false);
+  const duration = r.started_at && r.completed_at
+    ? Math.round((new Date(r.completed_at) - new Date(r.started_at)) / 1000)
+    : null;
+  const fmtDuration = duration != null
+    ? duration >= 60 ? `${Math.floor(duration / 60)}m ${duration % 60}s` : `${duration}s`
+    : null;
+  const fmtBytes = (b) => {
+    if (!b) return null;
+    if (b > 1048576) return `${(b / 1048576).toFixed(1)} MB`;
+    if (b > 1024) return `${(b / 1024).toFixed(1)} KB`;
+    return `${b} B`;
+  };
+  const checks = r.quality_results
+    ? (Array.isArray(r.quality_results.checks) ? r.quality_results.checks : [])
+    : [];
+  return (
+    <div className="border border-stone-200 rounded-lg px-3 py-2">
+      <div className="flex items-center gap-2 text-xs flex-wrap">
+        <StatusDot status={r.status} />
+        <span className="font-mono text-stone-400">{r.started_at?.slice(0, 16)}</span>
+        {fmtDuration && <span className="text-stone-400">{fmtDuration}</span>}
+        <Pill label={r.run_mode || "scheduled"} color="blue" />
+        {r.triggered_by_pipeline_id && (
+          <span className="text-[10px] text-stone-400 italic">from {r.triggered_by_pipeline_id?.slice(0, 8)}</span>
+        )}
+        <span className="text-stone-500">{r.rows_extracted?.toLocaleString()} extracted</span>
+        {r.rows_loaded > 0 && <span className="text-stone-500">{r.rows_loaded?.toLocaleString()} loaded</span>}
+        {fmtBytes(r.staging_size_bytes) && <span className="text-stone-400">{fmtBytes(r.staging_size_bytes)}</span>}
+        <Pill
+          label={r.gate_decision || r.status}
+          color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
+        />
+      </div>
+      {(r.watermark_before || r.watermark_after) && (
+        <div className="text-xs text-stone-400 mt-1 font-mono">
+          watermark: {r.watermark_before || "null"} &rarr; {r.watermark_after || "null"}
+        </div>
+      )}
+      {checks.length > 0 && (
+        <div className="mt-1">
+          <button
+            onClick={() => setShowQuality(!showQuality)}
+            className="text-xs text-blue-500 hover:text-blue-700"
+          >
+            {showQuality ? "Hide" : "Show"} quality checks ({checks.length})
+          </button>
+          {showQuality && (
+            <div className="mt-1 bg-stone-50 rounded p-2 space-y-0.5">
+              {checks.map((c, i) => (
+                <div key={i} className="flex items-center gap-2 text-xs">
+                  <span className={`w-2 h-2 rounded-full ${
+                    c.status === "pass" ? "bg-green-400" :
+                    c.status === "warn" ? "bg-amber-400" : "bg-red-400"
+                  }`} />
+                  <span className="font-medium text-stone-600">{c.name}</span>
+                  {c.detail && <span className="text-stone-400 truncate">{c.detail}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      {r.error && <div className="text-xs text-red-500 mt-1 truncate">{r.error}</div>}
+    </div>
+  );
+}
+
+function ErrorBudgetCard({ eb }) {
+  const utilizationPct = eb.utilization_pct != null
+    ? eb.utilization_pct
+    : (eb.budget_remaining != null
+      ? Math.max(0, Math.min(100, (1 - (eb.success_rate || 0)) / (1 - (eb.budget_threshold || 0.9)) * 100))
+      : 0);
+  const color = !eb ? "gray" : utilizationPct > 80 ? "red" : utilizationPct > 50 ? "amber" : "green";
+  return (
+    <div className="bg-stone-50 border border-stone-300 rounded-lg px-4 py-3">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs font-semibold text-stone-500">Error Budget</span>
+        <Pill
+          label={eb.escalated ? "EXHAUSTED" : `${utilizationPct.toFixed(1)}% used`}
+          color={color}
+        />
+      </div>
+      <ProgressBar pct={utilizationPct} color={color} />
+      <div className="text-xs text-stone-400 mt-1">
+        {eb.successful_runs}/{eb.total_runs} runs successful ({eb.window_days}d window) — threshold {((eb.budget_threshold || 0.9) * 100).toFixed(0)}%
+      </div>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Login component
 // ---------------------------------------------------------------------------
@@ -177,8 +270,7 @@ const NAV = [
   { id: "freshness", label: "Freshness", icon: "~" },
   { id: "quality", label: "Quality", icon: "+" },
   { id: "approvals", label: "Approvals", icon: "?" },
-  { id: "lineage", label: "Lineage", icon: "/" },
-  { id: "dag", label: "DAG", icon: "%" },
+  { id: "dag", label: "Lineage", icon: "%" },
   { id: "connectors", label: "Connectors", icon: "@" },
   { id: "alerts", label: "Alerts", icon: "!" },
   { id: "costs", label: "Costs", icon: "$" },
@@ -564,14 +656,6 @@ function PipelinesView({ tierFilter }) {
     } catch (e) { window.alert("Failed: " + (e.message || e)); }
   }
 
-  function budgetColor(eb) {
-    if (!eb) return "gray";
-    const pct = eb.utilization_pct ?? (eb.budget_remaining != null ? Math.max(0, (1 - (eb.success_rate || 0)) / (1 - (eb.budget_threshold || 0.9))) * 100 : 0);
-    if (pct < 50) return "green";
-    if (pct < 80) return "amber";
-    return "red";
-  }
-
   return (
     <div className="px-6 py-4">
       <h1 className="text-lg font-semibold mb-4 text-stone-800">Pipelines</h1>
@@ -613,28 +697,7 @@ function PipelinesView({ tierFilter }) {
                   </div>
                 </div>
 
-                {detail.error_budget && (() => {
-                  const eb = detail.error_budget;
-                  const utilizationPct = eb.utilization_pct ?? (eb.budget_remaining != null ? Math.max(0, Math.min(100, (1 - (eb.success_rate || 0)) / (1 - (eb.budget_threshold || 0.9)) * 100)) : 0);
-                  return (
-                  <div className="bg-stone-50 border border-stone-300 rounded-lg px-4 py-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-xs font-semibold text-stone-500">Error Budget</span>
-                      <Pill
-                        label={eb.escalated ? "EXHAUSTED" : `${utilizationPct.toFixed(1)}% used`}
-                        color={budgetColor(eb)}
-                      />
-                    </div>
-                    <ProgressBar
-                      pct={utilizationPct}
-                      color={budgetColor(eb)}
-                    />
-                    <div className="text-xs text-stone-400 mt-1">
-                      {eb.successful_runs}/{eb.total_runs} runs successful ({eb.window_days}d window) — threshold {((eb.budget_threshold || 0.9) * 100).toFixed(0)}%
-                    </div>
-                  </div>
-                  );
-                })()}
+                {detail.error_budget && <ErrorBudgetCard eb={detail.error_budget} />}
 
                 {detail.agent_reasoning?.refresh_type_reason && (
                   <div className="bg-green-50 border border-green-200 rounded-lg px-4 py-3">
@@ -675,71 +738,7 @@ function PipelinesView({ tierFilter }) {
                 <div>
                   <div className="text-xs font-semibold text-stone-500 mb-2">Recent Runs</div>
                   <div className="space-y-1.5">
-                    {runs.map((r) => {
-                      const duration = r.started_at && r.completed_at
-                        ? Math.round((new Date(r.completed_at) - new Date(r.started_at)) / 1000)
-                        : null;
-                      const fmtDuration = duration != null
-                        ? duration >= 60 ? `${Math.floor(duration / 60)}m ${duration % 60}s` : `${duration}s`
-                        : null;
-                      const fmtBytes = (b) => {
-                        if (!b) return null;
-                        if (b > 1048576) return `${(b / 1048576).toFixed(1)} MB`;
-                        if (b > 1024) return `${(b / 1024).toFixed(1)} KB`;
-                        return `${b} B`;
-                      };
-                      const [showQuality, setShowQuality] = React.useState(false);
-                      return (
-                        <div key={r.run_id} className="border border-stone-200 rounded-lg px-3 py-2">
-                          <div className="flex items-center gap-2 text-xs flex-wrap">
-                            <StatusDot status={r.status} />
-                            <span className="font-mono text-stone-400">{r.started_at?.slice(0, 16)}</span>
-                            {fmtDuration && <span className="text-stone-400">{fmtDuration}</span>}
-                            <Pill label={r.run_mode || "scheduled"} color="blue" />
-                            {r.triggered_by_pipeline_id && (
-                              <span className="text-[10px] text-stone-400 italic">from {r.triggered_by_pipeline_id?.slice(0, 8)}</span>
-                            )}
-                            <span className="text-stone-500">{r.rows_extracted?.toLocaleString()} extracted</span>
-                            {r.rows_loaded > 0 && <span className="text-stone-500">{r.rows_loaded?.toLocaleString()} loaded</span>}
-                            {fmtBytes(r.staging_size_bytes) && <span className="text-stone-400">{fmtBytes(r.staging_size_bytes)}</span>}
-                            <Pill
-                              label={r.gate_decision || r.status}
-                              color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
-                            />
-                          </div>
-                          {(r.watermark_before || r.watermark_after) && (
-                            <div className="text-xs text-stone-400 mt-1 font-mono">
-                              watermark: {r.watermark_before || "null"} → {r.watermark_after || "null"}
-                            </div>
-                          )}
-                          {r.quality_results && (
-                            <div className="mt-1">
-                              <button
-                                onClick={() => setShowQuality(!showQuality)}
-                                className="text-xs text-blue-500 hover:text-blue-700"
-                              >
-                                {showQuality ? "Hide" : "Show"} quality checks ({Object.keys(r.quality_results).length})
-                              </button>
-                              {showQuality && (
-                                <div className="mt-1 bg-stone-50 rounded p-2 space-y-0.5">
-                                  {Object.entries(r.quality_results).map(([check, result]) => (
-                                    <div key={check} className="flex items-center gap-2 text-xs">
-                                      <span className={`w-2 h-2 rounded-full ${
-                                        result.status === "pass" ? "bg-green-400" :
-                                        result.status === "warn" ? "bg-amber-400" : "bg-red-400"
-                                      }`} />
-                                      <span className="font-medium text-stone-600">{check}</span>
-                                      {result.detail && <span className="text-stone-400 truncate">{typeof result.detail === 'string' ? result.detail : JSON.stringify(result.detail)}</span>}
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-                          )}
-                          {r.error && <div className="text-xs text-red-500 mt-1 truncate">{r.error}</div>}
-                        </div>
-                      );
-                    })}
+                    {runs.map((r) => <RunRow key={r.run_id} r={r} />)}
                     {runs.length === 0 && <div className="text-xs text-stone-300">No runs yet</div>}
                   </div>
                 </div>
@@ -1488,161 +1487,14 @@ function ApprovalsView() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Lineage View (with column-level lineage)
-// ---------------------------------------------------------------------------
-
-function LineageView() {
-  const [pipelines, setPipelines] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [graph, setGraph] = useState(null);
-
-  useEffect(() => {
-    api("GET", "/api/pipelines").then(setPipelines).catch(console.error);
-  }, []);
-
-  async function select(p) {
-    setSelected(p.pipeline_id);
-    const g = await api("GET", `/api/lineage/${p.pipeline_id}`);
-    setGraph(g);
-  }
-
-  const statusColor = (s) => ({ active: "#4ade80", failed: "#f87171", paused: "#6b7280" }[s] || "#6b7280");
-
-  return (
-    <div className="px-6 py-4">
-      <h1 className="text-lg font-semibold mb-4 text-stone-800">Lineage</h1>
-      <div className="flex gap-4">
-        <div className="w-56 space-y-1 max-h-[70vh] overflow-y-auto">
-          {pipelines.map((p) => (
-            <button
-              key={p.pipeline_id}
-              onClick={() => select(p)}
-              className={`w-full text-left px-3 py-2 rounded-lg text-xs font-mono transition-colors ${
-                selected === p.pipeline_id
-                  ? "bg-blue-50 text-blue-700 border border-blue-200"
-                  : "text-stone-500 hover:bg-stone-100 hover:text-stone-700"
-              }`}
-            >
-              {p.pipeline_name}
-            </button>
-          ))}
-        </div>
-        {graph ? (
-          <div className="flex-1 bg-white border border-stone-200 rounded-xl p-6">
-            <div className="flex flex-col items-center gap-6">
-              {graph.upstream.length > 0 && (
-                <div>
-                  <div className="text-xs text-stone-400 mb-2 text-center">Upstream</div>
-                  <div className="flex gap-3 flex-wrap justify-center">
-                    {graph.upstream.map((u) => (
-                      <div
-                        key={u.pipeline_id}
-                        className="bg-stone-100 rounded-lg px-3 py-2 text-center border-2"
-                        style={{ borderColor: statusColor(u.status) }}
-                      >
-                        <div className="text-xs font-mono text-stone-700">{u.pipeline_name}</div>
-                        <TierBadge tier={u.tier} />
-                      </div>
-                    ))}
-                  </div>
-                  <div className="text-center text-stone-300 text-xl my-2">|</div>
-                </div>
-              )}
-              <div className="bg-blue-50 rounded-lg px-4 py-3 border-2 border-blue-500 text-center">
-                <div className="font-mono font-semibold text-sm text-blue-700">{graph.pipeline_name}</div>
-              </div>
-              {graph.downstream.length > 0 && (
-                <div>
-                  <div className="text-center text-stone-300 text-xl mb-2">|</div>
-                  <div className="text-xs text-stone-400 mb-2 text-center">Downstream</div>
-                  <div className="flex gap-3 flex-wrap justify-center">
-                    {graph.downstream.map((d) => (
-                      <div
-                        key={d.pipeline_id}
-                        className="bg-stone-100 rounded-lg px-3 py-2 text-center border-2"
-                        style={{ borderColor: statusColor(d.status) }}
-                      >
-                        <div className="text-xs font-mono text-stone-700">{d.pipeline_name}</div>
-                        <TierBadge tier={d.tier} />
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {graph.upstream.length === 0 && graph.downstream.length === 0 && (
-                <div className="text-sm text-stone-400">No dependencies declared for this pipeline.</div>
-              )}
-            </div>
-
-            {graph.column_lineage && graph.column_lineage.length > 0 && (
-              <div className="mt-8 border-t border-stone-200 pt-4">
-                <div className="text-xs font-semibold text-stone-500 mb-3">Column-Level Lineage</div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="text-stone-400 border-b border-stone-200">
-                        <th className="text-left py-2 px-2">Source Column</th>
-                        <th className="text-left py-2 px-2">Target Column</th>
-                        <th className="text-left py-2 px-2">Transform</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {graph.column_lineage.map((cl) => (
-                        <tr key={cl.lineage_id} className="border-b border-stone-200/50">
-                          <td className="py-1.5 px-2 font-mono text-stone-600">{cl.source_column}</td>
-                          <td className="py-1.5 px-2 font-mono text-stone-600">{cl.target_column}</td>
-                          <td className="py-1.5 px-2 text-stone-400">{cl.transform_logic || "direct"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-
-            {graph.downstream_columns && graph.downstream_columns.length > 0 && (
-              <div className="mt-4 border-t border-stone-200 pt-4">
-                <div className="text-xs font-semibold text-stone-500 mb-3">Downstream Column Dependencies</div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="text-stone-400 border-b border-stone-200">
-                        <th className="text-left py-2 px-2">Pipeline</th>
-                        <th className="text-left py-2 px-2">Source Column</th>
-                        <th className="text-left py-2 px-2">Target Column</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {graph.downstream_columns.map((dc) => (
-                        <tr key={dc.lineage_id} className="border-b border-stone-200/50">
-                          <td className="py-1.5 px-2 font-mono text-stone-600">{dc.pipeline_id?.slice(0, 8)}...</td>
-                          <td className="py-1.5 px-2 font-mono text-stone-600">{dc.source_column}</td>
-                          <td className="py-1.5 px-2 font-mono text-stone-600">{dc.target_column}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="flex-1 flex items-center justify-center text-sm text-stone-400">
-            Select a pipeline to view its lineage
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// 8. DAG Visualization (Build 19)
+// 7. Lineage & DAG View (consolidated from Build 19 + Lineage)
 // ---------------------------------------------------------------------------
 
 function DAGView() {
   const [dag, setDag] = useState(null);
   const [selected, setSelected] = useState(null);
+  const [lineageDetail, setLineageDetail] = useState(null);
+  const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const svgRef = useRef(null);
 
@@ -1654,10 +1506,18 @@ function DAGView() {
       .finally(() => setLoading(false));
   }, []);
 
+  // Fetch column-level lineage when a node is selected
+  useEffect(() => {
+    if (!selected) { setLineageDetail(null); return; }
+    api("GET", `/api/lineage/${selected}`)
+      .then(setLineageDetail)
+      .catch(() => setLineageDetail(null));
+  }, [selected]);
+
   if (loading) {
     return (
       <div className="px-6 py-4">
-        <h1 className="text-lg font-semibold mb-4 text-stone-800">Pipeline DAG</h1>
+        <h1 className="text-lg font-semibold mb-4 text-stone-800">Lineage</h1>
         <div className="text-sm text-stone-400">Loading graph...</div>
       </div>
     );
@@ -1666,11 +1526,34 @@ function DAGView() {
   if (!dag || dag.nodes.length === 0) {
     return (
       <div className="px-6 py-4">
-        <h1 className="text-lg font-semibold mb-4 text-stone-800">Pipeline DAG</h1>
+        <h1 className="text-lg font-semibold mb-4 text-stone-800">Lineage</h1>
         <div className="text-sm text-stone-400">No pipelines found.</div>
       </div>
     );
   }
+
+  // Search: determine which nodes match and their connected neighbors
+  const searchLower = search.toLowerCase().trim();
+  const matchedIds = new Set();
+  const connectedIds = new Set();
+  if (searchLower) {
+    dag.nodes.forEach((n) => {
+      if (n.name.toLowerCase().includes(searchLower) ||
+          n.source.toLowerCase().includes(searchLower) ||
+          n.target.toLowerCase().includes(searchLower) ||
+          (n.owner || "").toLowerCase().includes(searchLower)) {
+        matchedIds.add(n.id);
+      }
+    });
+    // Include direct neighbors of matched nodes
+    dag.edges.forEach((e) => {
+      if (matchedIds.has(e.from)) connectedIds.add(e.to);
+      if (matchedIds.has(e.to)) connectedIds.add(e.from);
+    });
+  }
+  const hasSearch = searchLower.length > 0;
+  const isVisible = (id) => !hasSearch || matchedIds.has(id) || connectedIds.has(id);
+  const isMatch = (id) => matchedIds.has(id);
 
   // Topological sort into layers
   const nodeMap = {};
@@ -1684,11 +1567,10 @@ function DAGView() {
     children[e.from].push(e.to);
   });
 
-  // BFS layering
   const layers = [];
   const visited = new Set();
   let queue = dag.nodes.filter((n) => (inDegree[n.id] || 0) === 0).map((n) => n.id);
-  if (queue.length === 0) queue = [dag.nodes[0].id]; // fallback for cycles
+  if (queue.length === 0) queue = [dag.nodes[0].id];
 
   while (queue.length > 0) {
     const layer = [];
@@ -1708,7 +1590,6 @@ function DAGView() {
     if (layer.length > 0) layers.push(layer);
     queue = nextQueue;
   }
-  // Add any unvisited nodes (disconnected)
   const remaining = dag.nodes.filter((n) => !visited.has(n.id)).map((n) => n.id);
   if (remaining.length > 0) layers.push(remaining);
 
@@ -1720,7 +1601,6 @@ function DAGView() {
   const padX = 40;
   const padY = 40;
 
-  // Compute positions
   const positions = {};
   let maxLayerWidth = 0;
   layers.forEach((layer) => {
@@ -1756,9 +1636,29 @@ function DAGView() {
 
   return (
     <div className="px-6 py-4">
-      <h1 className="text-lg font-semibold mb-1 text-stone-800">Pipeline DAG</h1>
+      <div className="flex items-center justify-between mb-1">
+        <h1 className="text-lg font-semibold text-stone-800">Lineage</h1>
+        <div className="relative">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search pipelines..."
+            className="w-64 text-xs border border-stone-300 rounded-lg px-3 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400 font-mono"
+          />
+          {search && (
+            <button
+              onClick={() => setSearch("")}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-600 text-xs"
+            >
+              x
+            </button>
+          )}
+        </div>
+      </div>
       <div className="text-xs text-stone-400 mb-4">
         {dag.total_pipelines} pipeline(s), {dag.total_edges} dependency edge(s)
+        {hasSearch && ` — ${matchedIds.size} match(es)`}
       </div>
       <div className="flex gap-4">
         <div className="flex-1 bg-white border border-stone-200 rounded-xl overflow-auto" style={{ maxHeight: "75vh" }}>
@@ -1777,6 +1677,7 @@ function DAGView() {
               const from = positions[e.from];
               const to = positions[e.to];
               if (!from || !to) return null;
+              const edgeVisible = isVisible(e.from) && isVisible(e.to);
               const x1 = from.x + nodeW / 2;
               const y1 = from.y + nodeH;
               const x2 = to.x + nodeW / 2;
@@ -1792,6 +1693,7 @@ function DAGView() {
                   strokeWidth={isContract ? 2 : 1.5}
                   strokeDasharray={isContract ? "6,3" : "none"}
                   markerEnd={isContract ? "url(#arrow-contract)" : "url(#arrow)"}
+                  opacity={hasSearch && !edgeVisible ? 0.1 : 1}
                 />
               );
             })}
@@ -1801,45 +1703,42 @@ function DAGView() {
               const pos = positions[node.id];
               if (!pos) return null;
               const isSelected = selected === node.id;
+              const dimmed = hasSearch && !isVisible(node.id);
+              const highlighted = hasSearch && isMatch(node.id);
               return (
                 <g
                   key={node.id}
                   transform={`translate(${pos.x},${pos.y})`}
                   onClick={() => setSelected(isSelected ? null : node.id)}
                   style={{ cursor: "pointer" }}
+                  opacity={dimmed ? 0.15 : 1}
                 >
                   <rect
                     width={nodeW}
                     height={nodeH}
                     rx={10}
-                    fill={isSelected ? "#eff6ff" : "#fff"}
-                    stroke={isSelected ? "#3b82f6" : "#e2e8f0"}
-                    strokeWidth={isSelected ? 2 : 1}
+                    fill={isSelected ? "#eff6ff" : highlighted ? "#fefce8" : "#fff"}
+                    stroke={isSelected ? "#3b82f6" : highlighted ? "#eab308" : "#e2e8f0"}
+                    strokeWidth={isSelected ? 2 : highlighted ? 2 : 1}
                   />
-                  {/* Status indicator bar */}
                   <rect x={0} y={0} width={4} height={nodeH} rx={2} fill={statusColor(node.status)} />
-                  {/* Tier badge */}
                   <rect x={nodeW - 30} y={6} width={22} height={16} rx={4} fill={tierColor(node.tier)} opacity={0.15} />
                   <text x={nodeW - 19} y={18} textAnchor="middle" fontSize={9} fontFamily="monospace" fontWeight="600" fill={tierColor(node.tier)}>
                     T{node.tier}
                   </text>
-                  {/* Pipeline name */}
                   <text x={14} y={22} fontSize={11} fontFamily="monospace" fontWeight="600" fill="#1e293b">
                     {node.name.length > 22 ? node.name.slice(0, 20) + ".." : node.name}
                   </text>
-                  {/* Source -> Target */}
                   <text x={14} y={38} fontSize={9} fontFamily="monospace" fill="#94a3b8">
                     {node.source.length > 14 ? node.source.slice(0, 12) + ".." : node.source}
                     {" -> "}
                     {node.target.length > 14 ? node.target.slice(0, 12) + ".." : node.target}
                   </text>
-                  {/* Last run info */}
                   <text x={14} y={54} fontSize={9} fontFamily="sans-serif" fill="#94a3b8">
                     {node.last_run
                       ? `Last run: ${node.last_run.rows_loaded} rows`
                       : "No runs yet"}
                   </text>
-                  {/* Contract violation indicator */}
                   {node.contract_violations > 0 && (
                     <g>
                       <circle cx={nodeW - 12} cy={nodeH - 12} r={8} fill="#fef2f2" stroke="#fca5a5" />
@@ -1848,7 +1747,6 @@ function DAGView() {
                       </text>
                     </g>
                   )}
-                  {/* Contract badges */}
                   {(node.contracts_as_producer > 0 || node.contracts_as_consumer > 0) && (
                     <circle cx={nodeW - 12} cy={36} r={4} fill="#8b5cf6" opacity={0.6} />
                   )}
@@ -1858,14 +1756,14 @@ function DAGView() {
           </svg>
         </div>
 
-        {/* Detail panel */}
+        {/* Detail panel with column-level lineage */}
         {selectedNode && (
-          <div className="w-72 bg-white border border-stone-200 rounded-xl p-4 space-y-3 max-h-[75vh] overflow-y-auto">
+          <div className="w-80 bg-white border border-stone-200 rounded-xl p-4 space-y-3 max-h-[75vh] overflow-y-auto">
             <div>
               <div className="text-xs text-stone-400">Pipeline</div>
               <div className="text-sm font-mono font-semibold text-stone-800">{selectedNode.name}</div>
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap">
               <span className="flex items-center gap-1 text-xs">
                 <StatusDot status={selectedNode.status} />
                 {selectedNode.status}
@@ -1900,6 +1798,90 @@ function DAGView() {
                 </div>
               </div>
             )}
+
+            {/* Upstream / Downstream from lineage API */}
+            {lineageDetail && (lineageDetail.upstream.length > 0 || lineageDetail.downstream.length > 0) && (
+              <div className="border-t border-stone-200 pt-2">
+                <div className="text-xs text-stone-400 mb-1">Dependencies</div>
+                {lineageDetail.upstream.length > 0 && (
+                  <div className="mb-1">
+                    <span className="text-[10px] text-stone-400 uppercase">Upstream</span>
+                    {lineageDetail.upstream.map((u) => (
+                      <div key={u.pipeline_id} className="text-xs font-mono text-stone-600 ml-2">
+                        {u.pipeline_name}
+                        <span className="text-stone-400 ml-1">({u.dependency_type})</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {lineageDetail.downstream.length > 0 && (
+                  <div>
+                    <span className="text-[10px] text-stone-400 uppercase">Downstream</span>
+                    {lineageDetail.downstream.map((d) => (
+                      <div key={d.pipeline_id} className="text-xs font-mono text-stone-600 ml-2">
+                        {d.pipeline_name}
+                        <span className="text-stone-400 ml-1">({d.dependency_type})</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Column-level lineage */}
+            {lineageDetail && lineageDetail.column_lineage && lineageDetail.column_lineage.length > 0 && (
+              <div className="border-t border-stone-200 pt-2">
+                <div className="text-xs text-stone-400 mb-1">Column Lineage</div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[10px]">
+                    <thead>
+                      <tr className="text-stone-400 border-b border-stone-200">
+                        <th className="text-left py-1 px-1">Source</th>
+                        <th className="text-left py-1 px-1">Target</th>
+                        <th className="text-left py-1 px-1">Transform</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lineageDetail.column_lineage.map((cl) => (
+                        <tr key={cl.lineage_id} className="border-b border-stone-200/50">
+                          <td className="py-1 px-1 font-mono text-stone-600">{cl.source_column}</td>
+                          <td className="py-1 px-1 font-mono text-stone-600">{cl.target_column}</td>
+                          <td className="py-1 px-1 text-stone-400">{cl.transform_logic || "direct"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Downstream column dependencies */}
+            {lineageDetail && lineageDetail.downstream_columns && lineageDetail.downstream_columns.length > 0 && (
+              <div className="border-t border-stone-200 pt-2">
+                <div className="text-xs text-stone-400 mb-1">Downstream Column Deps</div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[10px]">
+                    <thead>
+                      <tr className="text-stone-400 border-b border-stone-200">
+                        <th className="text-left py-1 px-1">Pipeline</th>
+                        <th className="text-left py-1 px-1">Source Col</th>
+                        <th className="text-left py-1 px-1">Target Col</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lineageDetail.downstream_columns.map((dc) => (
+                        <tr key={dc.lineage_id} className="border-b border-stone-200/50">
+                          <td className="py-1 px-1 font-mono text-stone-600">{dc.pipeline_id?.slice(0, 8)}</td>
+                          <td className="py-1 px-1 font-mono text-stone-600">{dc.source_column}</td>
+                          <td className="py-1 px-1 font-mono text-stone-600">{dc.target_column}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
             <div className="border-t border-stone-200 pt-2">
               <div className="text-xs font-mono text-stone-400 break-all">{selectedNode.id}</div>
             </div>
@@ -1908,7 +1890,7 @@ function DAGView() {
       </div>
 
       {/* Legend */}
-      <div className="flex gap-6 mt-4 text-xs text-stone-400">
+      <div className="flex gap-6 mt-4 text-xs text-stone-400 flex-wrap">
         <div className="flex items-center gap-1.5">
           <span className="inline-block w-3 h-3 rounded bg-green-400" /> Active
         </div>
@@ -1925,7 +1907,7 @@ function DAGView() {
           <svg width="24" height="8"><line x1="0" y1="4" x2="24" y2="4" stroke="#8b5cf6" strokeWidth="2" strokeDasharray="6,3" /></svg> Data Contract
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="inline-block w-3 h-3 rounded-full bg-purple-500 opacity-60" /> Has Contract
+          <span className="inline-block w-3 h-3 rounded border-2 border-yellow-400 bg-yellow-50" /> Search match
         </div>
       </div>
     </div>
@@ -2286,7 +2268,6 @@ function App() {
     freshness: <FreshnessView tierFilter={tierFilter} />,
     quality: <QualityView tierFilter={tierFilter} />,
     approvals: <ApprovalsView />,
-    lineage: <LineageView />,
     dag: <DAGView />,
     connectors: <ConnectorsView />,
     alerts: <AlertsView tierFilter={tierFilter} />,
