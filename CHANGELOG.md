@@ -17,10 +17,56 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 18 | Composable step DAG | Deferred | Needs user experience to inform design. Discussed, deferred until real usage patterns emerge |
 | 19 | DAG visualization UI | **Done** | Visual pipeline dependency graph with execution status |
 | 20 | Agent topology reasoning | **Done** | Agent designs multi-pipeline architectures from natural language |
+| 21 | Analyst experience layer | **Done** | Source registry, guided conversation, schedule parser, pipeline changelog, interaction audit |
 
 ---
 
 ## [Unreleased]
+
+### Build 21: Analyst Experience — Source Registry, Guided Conversation, Audit Trail - 2026-03-21 (Claude Opus 4.6)
+
+**Source Registry, Guided Conversation Flow, Schedule Parser, Pipeline Changelog, Interaction Logging**
+
+#### Added
+- **Source Registry** — Admin pre-registers named data sources ("E-commerce Database") with credentials. Analysts select by friendly name, never see connection strings.
+  - `RegisteredSource` dataclass with display_name, connector_id, connection_params, description, owner, tags, schema_cache
+  - 6 REST endpoints: `POST/GET /api/sources`, `GET/PATCH/DELETE /api/sources/{id}`, `POST /api/sources/{id}/discover`
+  - Store CRUD: `save_registered_source`, `get_registered_source`, `get_registered_source_by_name`, `list_registered_sources`, `delete_registered_source`, `update_source_schema_cache`
+  - Fuzzy matching: `_resolve_registered_source()` matches user text against registered display names across all action handlers (discover_tables, profile_table, propose_strategy, create_pipeline)
+
+- **Guided Conversation Flow** — Context-accumulator approach (not state machine). Agent gathers pipeline requirements conversationally:
+  - `AgentCore.guided_pipeline_response()` — analyst-friendly system prompt that avoids jargon, presents plain-language equivalents
+  - Guided mode enters when `create_pipeline` has missing info; accumulates context across turns
+  - Available registered sources injected into route context so agent can suggest by name
+  - Progressive disclosure: business questions first, technical details inferred
+
+- **Plain-Language Schedule Parser** — `AgentCore.parse_schedule(text)`:
+  - Rule-based map of ~30 natural language phrases → cron expressions ("every morning" → `0 8 * * *`, "twice a day" → `0 8,20 * * *`)
+  - Regex patterns for "every N hours/minutes" constructs
+  - Claude LLM fallback for ambiguous or complex expressions
+  - Auto-applied in `create_pipeline` when schedule doesn't match cron syntax
+
+- **Pipeline Changelog** — Structured audit trail for every pipeline mutation:
+  - `PipelineChangeLog` dataclass with 16 change types (CREATED, UPDATED, TRIGGERED, PAUSED, RESUMED, DELETED, BACKFILLED, etc.)
+  - Tracks who, when, what changed (old/new field values), source (api/chat), reason
+  - `_log_pipeline_change()` helper wired into create, update, trigger, pause, resume, backfill endpoints
+  - `GET /api/pipelines/{id}/changelog` — per-pipeline audit trail
+  - `GET /api/changelog` — global changelog (admin only)
+  - `recent_changes` (last 10 entries) included in pipeline detail response
+
+- **Chat Interaction Audit Log** — Every chat exchange persisted for auditing and training:
+  - `ChatInteraction` dataclass with session_id, user_id, username, input/output tokens, latency, model, routing
+  - Token accumulator on AgentCore (`_req_input_tokens`/`_req_output_tokens`) tracks tokens across all Claude calls per request
+  - `GET /api/interactions` — paginated interaction browse (admin only)
+  - `GET /api/interactions/export` — JSONL export for training data (admin only)
+
+#### Key Design Decisions
+- **Context accumulator over state machine** — Preserves agentic experience. Claude decides what to ask next based on what's missing, not a predefined flow. User explicitly requested this to avoid "taking away the agentic experience."
+- **Rule-based schedule parsing first** — 30 common phrases handled without LLM call. Claude only invoked as fallback for ambiguous schedules, keeping latency low.
+- **Source registry is admin-managed** — Credentials stored once by admins. Analysts reference by display name. Enforces separation of concerns.
+- **Token accumulator pattern** — Per-request counters on AgentCore, reset at start of `route_command`, accumulated across all `_call_claude` calls. Captures total token usage even when multiple Claude calls happen per request.
+
+---
 
 ### Stale Run Recovery & Timeout Enforcement - 2026-03-21 (Claude Opus 4.6)
 

@@ -1229,3 +1229,161 @@ Use • for lists if needed. End with a specific question.
         except Exception as e:
             log.warning("conversational_response error: %s", e)
             return result_data.get("fallback_text", "Done.")
+
+    # ------------------------------------------------------------------
+    # parse_schedule — plain English → cron
+    # ------------------------------------------------------------------
+
+    _SCHEDULE_MAP = {
+        "every minute": "* * * * *",
+        "every 5 minutes": "*/5 * * * *",
+        "every 10 minutes": "*/10 * * * *",
+        "every 15 minutes": "*/15 * * * *",
+        "every 30 minutes": "*/30 * * * *",
+        "every half hour": "*/30 * * * *",
+        "hourly": "0 * * * *",
+        "every hour": "0 * * * *",
+        "every 2 hours": "0 */2 * * *",
+        "every 3 hours": "0 */3 * * *",
+        "every 4 hours": "0 */4 * * *",
+        "every 6 hours": "0 */6 * * *",
+        "every morning": "0 8 * * *",
+        "every evening": "0 18 * * *",
+        "every night": "0 22 * * *",
+        "daily": "0 0 * * *",
+        "once a day": "0 8 * * *",
+        "twice a day": "0 8,20 * * *",
+        "three times a day": "0 8,14,20 * * *",
+        "every weekday": "0 8 * * 1-5",
+        "every weekday morning": "0 8 * * 1-5",
+        "weekly": "0 0 * * 1",
+        "every monday": "0 8 * * 1",
+        "every sunday": "0 8 * * 0",
+        "monthly": "0 0 1 * *",
+        "real-time": "*/5 * * * *",
+        "near real-time": "*/5 * * * *",
+        "as fresh as possible": "*/5 * * * *",
+    }
+
+    async def parse_schedule(self, text: str) -> dict:
+        """Convert natural language schedule to cron expression.
+
+        Returns {cron, description, parsed_from}.
+        """
+        import re
+        text_clean = text.lower().strip().rstrip(".")
+
+        # Direct cron expression pass-through
+        if re.match(r"^[\d\*/,-]+ [\d\*/,-]+ [\d\*/,-]+ [\d\*/,-]+ [\d\*/,-]+$", text_clean):
+            return {"cron": text_clean, "description": text_clean, "parsed_from": "passthrough"}
+
+        # Rule-based matching
+        for phrase, cron in self._SCHEDULE_MAP.items():
+            if phrase in text_clean:
+                return {"cron": cron, "description": phrase, "parsed_from": "rule"}
+
+        # "every N minutes/hours" pattern
+        m = re.search(r"every\s+(\d+)\s+minute", text_clean)
+        if m:
+            n = int(m.group(1))
+            return {"cron": f"*/{n} * * * *", "description": f"every {n} minutes", "parsed_from": "rule"}
+        m = re.search(r"every\s+(\d+)\s+hour", text_clean)
+        if m:
+            n = int(m.group(1))
+            return {"cron": f"0 */{n} * * *", "description": f"every {n} hours", "parsed_from": "rule"}
+
+        # Claude fallback for complex expressions
+        if self.has_api:
+            try:
+                resp = await self._call_claude(
+                    "You convert schedule descriptions to cron expressions. "
+                    "Respond with ONLY valid JSON: {\"cron\": \"...\", \"description\": \"...\"}",
+                    f"Convert this schedule to a cron expression: \"{text}\"",
+                    operation="parse_schedule",
+                    temperature=0.0,
+                )
+                result = self._extract_json(resp)
+                result["parsed_from"] = "llm"
+                return result
+            except Exception as e:
+                log.warning("Schedule parse LLM fallback failed: %s", e)
+
+        # Default: hourly
+        return {"cron": "0 * * * *", "description": "hourly (default)", "parsed_from": "default"}
+
+    # ------------------------------------------------------------------
+    # guided_pipeline_response — analyst-friendly conversational guidance
+    # ------------------------------------------------------------------
+
+    async def guided_pipeline_response(
+        self,
+        user_text: str,
+        guided_context: dict,
+        result_data: dict,
+        available_sources: list[dict] = None,
+        history: Optional[list[dict]] = None,
+    ) -> str:
+        """Generate an analyst-friendly response for guided pipeline creation.
+
+        Uses a different system prompt that avoids jargon and provides
+        proactive recommendations.
+        """
+        if not self.has_api:
+            return result_data.get("fallback_text", "")
+
+        ctx_summary = json.dumps(guided_context, indent=2, default=str)
+        sources_text = ""
+        if available_sources:
+            lines = []
+            for s in available_sources:
+                lines.append(f"  • {s['display_name']} ({s['source_type']}) — {s.get('description', '')}")
+            sources_text = f"\n\nAvailable data sources:\n" + "\n".join(lines)
+
+        history_text = ""
+        if history:
+            history_lines = []
+            for msg in history[-10:]:
+                role = msg.get("role", "user")
+                text = msg.get("text", "")
+                history_lines.append(f"  {role}: {text}")
+            history_text = "\n\nConversation so far:\n" + "\n".join(history_lines)
+
+        system = f"""You are a friendly data assistant helping a user set up a data pipeline.
+You speak in plain, non-technical language. Never use jargon like "cron", "merge keys",
+"incremental extraction", "watermark", or "DDL" unless the user clearly has technical expertise.
+
+Instead of technical terms, use plain equivalents:
+- "refresh type: incremental" → "We'll only sync new and updated rows"
+- "merge keys" → "unique identifier to match records"
+- "cron schedule" → just describe the timing naturally ("every morning at 8am")
+- "quality gate" → "data quality checks"
+- "tier" → "priority level"
+
+Current pipeline creation progress:
+{ctx_summary}
+{sources_text}
+{history_text}
+
+Based on what we know so far, guide the user to the next step. Be proactive:
+- If we have enough info, PROPOSE a complete setup and ask for confirmation
+- If something is missing, ask ONE clear question at a time
+- When showing options, present them as a numbered list
+- Recommend the best option and explain briefly WHY
+- Skip steps when you can infer the answer from context
+- Keep responses under 8 lines
+"""
+        user_prompt = f"""User said: "{user_text}"
+
+Data gathered so far: {json.dumps(result_data, indent=2, default=str)}
+
+Respond naturally. Guide toward the next step or propose the final pipeline if ready."""
+
+        try:
+            return await self._call_claude(
+                system, user_prompt,
+                operation="guided_pipeline_response",
+                temperature=0.3,
+            )
+        except Exception as e:
+            log.warning("guided_pipeline_response error: %s", e)
+            return result_data.get("fallback_text", "Let me help you set up that pipeline.")

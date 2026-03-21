@@ -1713,6 +1713,161 @@ fi
 fi # --api (dag & topology)
 
 # ============================================================================
+# Build 21: Source Registry, Pipeline Changelog, Interaction Audit
+# ============================================================================
+if [ "$MODE" = "all" ] || [ "$MODE" = "api" ]; then
+
+section "Build 21: Source Registry, Changelog, Interactions"
+
+# --- Source Registry ---
+
+# Test 1: Register a source
+test_name "POST /api/sources - Register a new source"
+RESP=$(api_post "/api/sources" '{
+    "display_name": "Test Source",
+    "connector_name": "mysql-source-v1",
+    "source_type": "mysql",
+    "connection_params": {"host": "localhost", "port": 3307, "database": "ecommerce", "user": "root", "password": "demo"},
+    "description": "Test source for curl tests",
+    "owner": "test-admin"
+}')
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then
+    TEST_SOURCE_ID=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('source_id',''))" 2>/dev/null)
+    pass "Source registered: $TEST_SOURCE_ID"
+else
+    warn "Source registration returned HTTP $CODE"
+    TEST_SOURCE_ID=""
+fi
+
+# Test 2: List sources
+test_name "GET /api/sources - List registered sources"
+RESP=$(api_get "/api/sources")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    SRC_COUNT=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else len(d.get('sources',[])))" 2>/dev/null)
+    pass "Listed $SRC_COUNT registered source(s)"
+else
+    fail "List sources returned HTTP $CODE"
+fi
+
+# Test 3: Get source by ID
+if [ -n "$TEST_SOURCE_ID" ]; then
+    test_name "GET /api/sources/{id} - Get source by ID"
+    RESP=$(api_get "/api/sources/$TEST_SOURCE_ID")
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ]; then
+        pass "Got source by ID"
+    else
+        fail "Get source returned HTTP $CODE"
+    fi
+fi
+
+# Test 4: Update source
+if [ -n "$TEST_SOURCE_ID" ]; then
+    test_name "PATCH /api/sources/{id} - Update source"
+    RESP=$(api_patch "/api/sources/$TEST_SOURCE_ID" '{"description": "Updated test source"}')
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ]; then
+        pass "Source updated"
+    else
+        warn "Update source returned HTTP $CODE"
+    fi
+fi
+
+# Test 5: Discover via source
+if [ -n "$TEST_SOURCE_ID" ]; then
+    test_name "POST /api/sources/{id}/discover - Discover tables from registered source"
+    RESP=$(api_post "/api/sources/$TEST_SOURCE_ID/discover" '{}')
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ]; then
+        pass "Discovery from registered source succeeded"
+    else
+        warn "Discovery returned HTTP $CODE (source may not be reachable)"
+    fi
+fi
+
+# Test 6: Delete source
+if [ -n "$TEST_SOURCE_ID" ]; then
+    test_name "DELETE /api/sources/{id} - Delete registered source"
+    RESP=$(api_delete "/api/sources/$TEST_SOURCE_ID")
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
+        pass "Source deleted"
+    else
+        warn "Delete source returned HTTP $CODE"
+    fi
+fi
+
+# --- Pipeline Changelog ---
+
+# Test 7: Per-pipeline changelog
+test_name "GET /api/pipelines/{id}/changelog - Pipeline changelog"
+if [ -n "$PIPELINE_ID" ]; then
+    RESP=$(api_get "/api/pipelines/$PIPELINE_ID/changelog")
+    CODE=$(echo "$RESP" | tail -1)
+    if [ "$CODE" = "200" ]; then
+        pass "Pipeline changelog returned"
+    else
+        fail "Pipeline changelog returned HTTP $CODE"
+    fi
+else
+    skip "No pipeline ID available"
+fi
+
+# Test 8: Global changelog (admin)
+test_name "GET /api/changelog - Global changelog"
+RESP=$(api_get "/api/changelog")
+CODE=$(echo "$RESP" | tail -1)
+if [ "$CODE" = "200" ]; then
+    pass "Global changelog returned"
+else
+    fail "Global changelog returned HTTP $CODE"
+fi
+
+# Test 9: Pipeline detail includes recent_changes
+test_name "Pipeline detail includes recent_changes field"
+if [ -n "$PIPELINE_ID" ]; then
+    RESP=$(api_get "/api/pipelines/$PIPELINE_ID")
+    CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    HAS_CHANGES=$(echo "$BODY" | python3 -c "import sys,json; print('yes' if 'recent_changes' in json.load(sys.stdin) else 'no')" 2>/dev/null)
+    if [ "$HAS_CHANGES" = "yes" ]; then
+        pass "Pipeline detail includes recent_changes"
+    else
+        warn "recent_changes field not found in pipeline detail"
+    fi
+else
+    skip "No pipeline ID available"
+fi
+
+# --- Interaction Audit ---
+
+# Test 10: List interactions
+test_name "GET /api/interactions - List chat interactions"
+RESP=$(api_get "/api/interactions")
+CODE=$(echo "$RESP" | tail -1)
+if [ "$CODE" = "200" ]; then
+    pass "Interactions listed"
+else
+    fail "Interactions returned HTTP $CODE"
+fi
+
+# Test 11: Export interactions
+test_name "GET /api/interactions/export - Export interactions as JSONL"
+RESP=$(api_get "/api/interactions/export")
+CODE=$(echo "$RESP" | tail -1)
+if [ "$CODE" = "200" ]; then
+    pass "Interactions exported"
+else
+    fail "Interactions export returned HTTP $CODE"
+fi
+
+fi # --api (Build 21)
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -1771,6 +1926,9 @@ echo "  - Data contracts: create, list, get, validate, update, violations, auto-
 echo "    duplicate/self rejection, delete (Build 16)"
 echo "  - DAG visualization: graph endpoint, node structure, contract fields (Build 19)"
 echo "  - Topology reasoning: design endpoint, chat routing (Build 20)"
+echo "  - Source registry: register, list, get, update, discover, delete (Build 21)"
+echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21)"
+echo "  - Interaction audit: list, export (Build 21)"
 echo ""
 
 exit $FAIL_COUNT

@@ -18,7 +18,7 @@ from contracts.models import (
     ErrorBudget, ColumnLineage, AgentCostLog, ConnectorMigration, User,
     PipelineMetadata, SchemaChangePolicy, PostPromotionHook,
     DataContract, ContractViolation, ChatInteraction, PipelineChangeLog,
-    PipelineChangeType,
+    PipelineChangeType, RegisteredSource,
     ColumnMapping, QualityConfig, CheckResult,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
@@ -1265,6 +1265,76 @@ class ContractStore:
         """, limit, offset)
         return [_row_to_pipeline_change(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # Registered Sources
+    # ------------------------------------------------------------------
+
+    async def save_registered_source(self, s: RegisteredSource) -> None:
+        await self.pool.execute("""
+            INSERT INTO registered_sources (
+                source_id, display_name, connector_id, connector_name, source_type,
+                connection_params, description, owner, tags,
+                schema_cache, schema_cache_updated_at,
+                created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ON CONFLICT (source_id) DO UPDATE SET
+                display_name=EXCLUDED.display_name,
+                connector_id=EXCLUDED.connector_id,
+                connector_name=EXCLUDED.connector_name,
+                source_type=EXCLUDED.source_type,
+                connection_params=EXCLUDED.connection_params,
+                description=EXCLUDED.description,
+                owner=EXCLUDED.owner,
+                tags=EXCLUDED.tags,
+                schema_cache=EXCLUDED.schema_cache,
+                schema_cache_updated_at=EXCLUDED.schema_cache_updated_at,
+                updated_at=EXCLUDED.updated_at
+        """,
+            s.source_id, s.display_name, s.connector_id, s.connector_name,
+            s.source_type, json.dumps(s.connection_params),
+            s.description, s.owner, json.dumps(s.tags),
+            json.dumps(s.schema_cache), s.schema_cache_updated_at,
+            s.created_at, s.updated_at,
+        )
+
+    async def get_registered_source(self, source_id: str) -> Optional[RegisteredSource]:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM registered_sources WHERE source_id = $1", source_id
+        )
+        return _row_to_registered_source(row) if row else None
+
+    async def get_registered_source_by_name(self, name: str) -> Optional[RegisteredSource]:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM registered_sources WHERE LOWER(display_name) = LOWER($1)", name
+        )
+        return _row_to_registered_source(row) if row else None
+
+    async def list_registered_sources(self, source_type: Optional[str] = None) -> list[RegisteredSource]:
+        if source_type:
+            rows = await self.pool.fetch(
+                "SELECT * FROM registered_sources WHERE source_type = $1 ORDER BY display_name",
+                source_type.lower(),
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT * FROM registered_sources ORDER BY display_name"
+            )
+        return [_row_to_registered_source(r) for r in rows]
+
+    async def delete_registered_source(self, source_id: str) -> None:
+        await self.pool.execute(
+            "DELETE FROM registered_sources WHERE source_id = $1", source_id
+        )
+
+    async def update_source_schema_cache(
+        self, source_id: str, cache: dict
+    ) -> None:
+        await self.pool.execute("""
+            UPDATE registered_sources
+            SET schema_cache = $2, schema_cache_updated_at = $3, updated_at = $3
+            WHERE source_id = $1
+        """, source_id, json.dumps(cache), now_iso())
+
 
 # ======================================================================
 # Row-to-model helpers (module-level, stateless)
@@ -1619,6 +1689,24 @@ def _row_to_chat_interaction(row: asyncpg.Record) -> ChatInteraction:
         model=row["model"],
         error=row["error"],
         created_at=row["created_at"],
+    )
+
+
+def _row_to_registered_source(row: asyncpg.Record) -> RegisteredSource:
+    return RegisteredSource(
+        source_id=row["source_id"],
+        display_name=row["display_name"],
+        connector_id=row["connector_id"],
+        connector_name=row["connector_name"],
+        source_type=row["source_type"],
+        connection_params=json.loads(row["connection_params"]) if row["connection_params"] else {},
+        description=row["description"],
+        owner=row["owner"],
+        tags=json.loads(row["tags"]) if row["tags"] else {},
+        schema_cache=json.loads(row["schema_cache"]) if row["schema_cache"] else {},
+        schema_cache_updated_at=row["schema_cache_updated_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
@@ -1977,6 +2065,22 @@ CREATE TABLE IF NOT EXISTS chat_interactions (
     model TEXT NOT NULL DEFAULT '',
     error TEXT,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS registered_sources (
+    source_id TEXT PRIMARY KEY,
+    display_name TEXT UNIQUE NOT NULL,
+    connector_id TEXT NOT NULL,
+    connector_name TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT '',
+    connection_params JSONB NOT NULL DEFAULT '{}',
+    description TEXT NOT NULL DEFAULT '',
+    owner TEXT NOT NULL DEFAULT '',
+    tags JSONB NOT NULL DEFAULT '{}',
+    schema_cache JSONB NOT NULL DEFAULT '{}',
+    schema_cache_updated_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_changelog (

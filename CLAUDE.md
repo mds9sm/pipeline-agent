@@ -68,7 +68,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `main.py` | Entry point - wires 4 async loops + dependency injection |
 | `config.py` | Environment variable loading with defaults |
 | `api/server.py` | FastAPI with 40+ endpoints, JWT auth, rate limiting |
-| `agent/core.py` | Claude API calls: route_command, propose_strategy, generate_connector, reason_about_quality |
+| `agent/core.py` | Claude API calls: route_command, propose_strategy, generate_connector, reason_about_quality, parse_schedule, guided_pipeline_response |
 | `agent/conversation.py` | Multi-turn onboarding/discovery flow |
 | `agent/autonomous.py` | Pipeline execution state machine (PENDING -> COMPLETE/HALTED) |
 | `contracts/models.py` | All dataclasses + enums (PipelineContract, ConnectorRecord, RunRecord, etc.) |
@@ -176,6 +176,9 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Data contracts | 11 | create, list, get, validate, update, violations, pipeline detail, auto-dep, duplicate/self rejection, delete (Build 16) |
 | DAG visualization | 3 | graph endpoint, node structure, contract fields (Build 19) |
 | Topology reasoning | 2 | design endpoint, chat routing (Build 20) |
+| Source registry | 6 | register, list, get, update, delete, discover (Build 21) |
+| Pipeline changelog | 3 | per-pipeline, global, included in detail (Build 21) |
+| Interaction audit | 2 | list, export (Build 21) |
 
 ### Adding New Tests
 

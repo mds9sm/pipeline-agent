@@ -31,7 +31,7 @@ from contracts.models import (
     SchemaChangePolicy, SCHEMA_POLICY_TIER_DEFAULTS, PostPromotionHook,
     DataContract, ContractViolation,
     DataContractStatus, CleanupOwnership, ContractViolationType,
-    PipelineChangeLog, PipelineChangeType,
+    PipelineChangeLog, PipelineChangeType, RegisteredSource,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -103,6 +103,22 @@ class ProfileRequest(BaseModel):
     params: dict
     schema_name: str
     tables: Optional[list[str]] = None
+
+
+class RegisterSourceRequest(BaseModel):
+    display_name: str
+    connector_id: str
+    connection_params: dict = {}
+    description: str = ""
+    owner: str = ""
+    tags: dict = {}
+
+class UpdateSourceRequest(BaseModel):
+    display_name: Optional[str] = None
+    connection_params: Optional[dict] = None
+    description: Optional[str] = None
+    owner: Optional[str] = None
+    tags: Optional[dict] = None
 
 
 class ProposeRequest(BaseModel):
@@ -431,8 +447,9 @@ def create_app(
     # Command (agent-routed)
     # -----------------------------------------------------------------------
 
-    # In-memory conversation history per session
+    # In-memory conversation history + guided context per session
     _chat_sessions: dict[str, list[dict]] = {}
+    _guided_contexts: dict[str, dict] = {}
 
     @app.post("/api/command")
     @limiter.limit("100/minute")
@@ -450,7 +467,21 @@ def create_app(
                 _chat_sessions[session_id] = []
             history = _chat_sessions[session_id]
 
-            routed = await agent.route_command(req.text, req.context, history=history)
+            # Inject guided context + available sources into routing context
+            guided_ctx = _guided_contexts.get(session_id, {})
+            route_context = dict(req.context or {})
+            if guided_ctx:
+                route_context["guided_pipeline"] = guided_ctx
+
+            # Load registered sources for agent awareness
+            reg_sources = await store.list_registered_sources()
+            if reg_sources:
+                route_context["available_sources"] = [
+                    {"name": s.display_name, "type": s.source_type, "id": s.source_id}
+                    for s in reg_sources
+                ]
+
+            routed = await agent.route_command(req.text, route_context, history=history)
             action = routed.get("action", "unknown")
             params = routed.get("params", {})
             response_text = routed.get("response_text", "")
@@ -469,6 +500,30 @@ def create_app(
                     if ctype and (ctype in c.source_target_type.lower() or ctype in c.connector_name.lower()):
                         return c.connector_id
                 return ""
+
+            # ----------------------------------------------------------
+            # Helper: resolve registered source from user text or params
+            # ----------------------------------------------------------
+            async def _resolve_registered_source() -> Optional[RegisteredSource]:
+                """Try to find a registered source from params or user text."""
+                # Check explicit source_name param
+                sn = params.get("source_name", "")
+                if sn:
+                    rs = await store.get_registered_source_by_name(sn)
+                    if rs:
+                        return rs
+                # Fuzzy match user text against registered source display names
+                _text_lower = req.text.lower()
+                for rs in reg_sources:
+                    if rs.display_name.lower() in _text_lower:
+                        return rs
+                # Match source_type from params
+                _st = params.get("connector_type", "").lower()
+                if _st:
+                    for rs in reg_sources:
+                        if rs.source_type == _st:
+                            return rs
+                return None
 
             # ----------------------------------------------------------
             # Execute action → collect result_data → let Claude respond
@@ -530,13 +585,34 @@ def create_app(
                 )
                 database = params.get("database", "")
 
+                # Try resolving from registered sources
+                _reg = await _resolve_registered_source()
+                if _reg:
+                    connector_id = connector_id or await _resolve_connector(_reg.connector_id, "", role="source")
+                    cp = _reg.connection_params
+                    database = database or cp.get("database", "")
+                    for k in ("host", "port", "user", "password"):
+                        if k not in params or not params[k]:
+                            params[k] = cp.get(k, "")
+
                 if not connector_id:
-                    src_conns = await store.list_connectors(connector_type="source", status="active")
-                    result_data = {
-                        "status": "need_connector",
-                        "available_sources": [{"name": c.connector_name, "type": c.source_target_type} for c in src_conns],
-                        "fallback_text": "Which source database type would you like to connect to?",
-                    }
+                    # Show registered sources instead of raw connectors
+                    if reg_sources:
+                        result_data = {
+                            "status": "need_connector",
+                            "available_sources": [
+                                {"name": s.display_name, "type": s.source_type, "description": s.description}
+                                for s in reg_sources
+                            ],
+                            "fallback_text": "Which data source would you like to explore?",
+                        }
+                    else:
+                        src_conns = await store.list_connectors(connector_type="source", status="active")
+                        result_data = {
+                            "status": "need_connector",
+                            "available_sources": [{"name": c.connector_name, "type": c.source_target_type} for c in src_conns],
+                            "fallback_text": "Which source database type would you like to connect to?",
+                        }
                 elif not database and not params.get("host"):
                     conn_rec = await store.get_connector(connector_id)
                     src_type = conn_rec.source_target_type if conn_rec else "database"
@@ -558,6 +634,9 @@ def create_app(
                             "database": database,
                             "fallback_text": f"Found {sum(s['table_count'] for s in schemas)} table(s).",
                         }
+                        # Cache discovery on the registered source
+                        if _reg:
+                            await store.update_source_schema_cache(_reg.source_id, {"schemas": schemas})
                     except Exception as e:
                         result_data = {"status": "error", "error": str(e), "fallback_text": f"Discovery failed: {e}"}
 
@@ -569,6 +648,17 @@ def create_app(
                 database = params.get("database", "")
                 schema_name = params.get("schema", "main")
                 table_name = params.get("table", "")
+
+                # Resolve from registered sources
+                _reg = await _resolve_registered_source()
+                if _reg:
+                    connector_id = connector_id or await _resolve_connector(_reg.connector_id, "", role="source")
+                    cp = _reg.connection_params
+                    database = database or cp.get("database", "")
+                    schema_name = schema_name if schema_name != "main" else cp.get("schema", schema_name)
+                    for k in ("host", "port", "user", "password"):
+                        if k not in params or not params[k]:
+                            params[k] = cp.get(k, "")
 
                 if not connector_id:
                     result_data = {"status": "need_connector", "fallback_text": "Which source database type?"}
@@ -600,6 +690,17 @@ def create_app(
                 database = params.get("database", "")
                 schema_name = params.get("schema", "main")
                 table_name = params.get("table", "")
+
+                # Resolve from registered sources
+                _reg = await _resolve_registered_source()
+                if _reg:
+                    connector_id = connector_id or await _resolve_connector(_reg.connector_id, "", role="source")
+                    cp = _reg.connection_params
+                    database = database or cp.get("database", "")
+                    schema_name = schema_name if schema_name != "main" else cp.get("schema", schema_name)
+                    for k in ("host", "port", "user", "password"):
+                        if k not in params or not params[k]:
+                            params[k] = cp.get(k, "")
 
                 if not connector_id or not table_name:
                     result_data = {"status": "need_info", "fallback_text": "I need the connector and table name."}
@@ -633,6 +734,40 @@ def create_app(
                 tgt_schema = params.get("target_schema", "raw")
                 schedule = params.get("schedule_cron", "0 * * * *")
 
+                # Parse natural language schedule
+                import re as _re
+                if schedule and not _re.match(r"^[\d\*/,-]+ [\d\*/,-]+ [\d\*/,-]+ [\d\*/,-]+ [\d\*/,-]+$", schedule):
+                    parsed = await agent.parse_schedule(schedule)
+                    schedule = parsed["cron"]
+
+                # Try resolving from registered source if params mention one
+                _source_name = params.get("source_name", "")
+                _reg_src = None
+                if _source_name:
+                    _reg_src = await store.get_registered_source_by_name(_source_name)
+                if not _reg_src and guided_ctx.get("source_id"):
+                    _reg_src = await store.get_registered_source(guided_ctx["source_id"])
+                if not _reg_src:
+                    _reg_src_fuzzy = await _resolve_registered_source()
+                    if _reg_src_fuzzy:
+                        _reg_src = _reg_src_fuzzy
+                        _source_name = _source_name or _reg_src.display_name
+
+                # If we have a registered source, populate connection details
+                if _reg_src:
+                    src_connector_type = src_connector_type or _reg_src.source_type
+                    cp = _reg_src.connection_params
+                    if not src_database:
+                        src_database = cp.get("database", "")
+                    if not params.get("source_host"):
+                        params["source_host"] = cp.get("host", "localhost")
+                    if not params.get("source_port"):
+                        params["source_port"] = cp.get("port", 0)
+                    if not params.get("source_user"):
+                        params["source_user"] = cp.get("user", "")
+                    if not params.get("source_password"):
+                        params["source_password"] = cp.get("password", "")
+
                 src_connector_id = await _resolve_connector(
                     params.get("source_connector_id", ""), src_connector_type, role="source"
                 )
@@ -640,14 +775,51 @@ def create_app(
                     params.get("target_connector_id", ""), tgt_connector_type, role="target"
                 )
 
+                # Guided mode: when info is missing, accumulate context
+                # instead of generic error messages
+                _missing = []
                 if not src_connector_id:
-                    result_data = {"status": "need_source", "fallback_text": "What type of source database? (sqlite, mysql, etc.)"}
-                elif not tgt_connector_id:
-                    result_data = {"status": "need_target", "fallback_text": "What type of target database? (postgres, redshift, etc.)"}
-                elif not src_table:
-                    result_data = {"status": "need_table", "fallback_text": "Which table would you like to create a pipeline for?"}
-                elif not tgt_database:
-                    result_data = {"status": "need_target_db", "fallback_text": "What's the target database name?"}
+                    _missing.append("source")
+                if not src_table:
+                    _missing.append("table")
+                if not tgt_connector_id:
+                    # Auto-default to postgres-target-v1 (local PG)
+                    tgt_connector_id = await _resolve_connector("", "postgres", role="target")
+                if not tgt_database:
+                    tgt_database = "pipeline_agent"  # local default
+
+                if _missing:
+                    # Enter/update guided context
+                    _guided_contexts[session_id] = {
+                        "mode": "pipeline_creation",
+                        "missing": _missing,
+                        "gathered": {
+                            k: v for k, v in {
+                                "source_type": src_connector_type,
+                                "source_name": _source_name,
+                                "source_id": _reg_src.source_id if _reg_src else "",
+                                "database": src_database,
+                                "schema": src_schema,
+                                "table": src_table,
+                                "schedule": schedule,
+                            }.items() if v
+                        },
+                    }
+                    # Build guided response with available sources
+                    _src_list = [
+                        {"display_name": s.display_name, "source_type": s.source_type, "description": s.description}
+                        for s in reg_sources
+                    ]
+                    result_data = {
+                        "status": "guided",
+                        "missing": _missing,
+                        "gathered": _guided_contexts[session_id]["gathered"],
+                        "available_sources": _src_list,
+                        "fallback_text": "Let me help you set up that pipeline. Which data source would you like to use?"
+                            if "source" in _missing else
+                            f"Great, using {_source_name or src_connector_type}. Which table do you need?",
+                    }
+                    use_conversational = True  # Let agent craft guided response
                 else:
                     try:
                         src_params = {"database": src_database}
@@ -836,14 +1008,30 @@ def create_app(
             # ----------------------------------------------------------
             # Generate conversational response via Claude
             # ----------------------------------------------------------
+            _is_guided = result_data.get("status") == "guided"
             if use_conversational and result_data:
                 try:
-                    response_text = await agent.conversational_response(
-                        req.text, action, result_data, history=history,
-                    )
+                    if _is_guided:
+                        # Use guided response for analyst-friendly language
+                        _src_info = [
+                            {"display_name": s.display_name, "source_type": s.source_type, "description": s.description}
+                            for s in reg_sources
+                        ]
+                        response_text = await agent.guided_pipeline_response(
+                            req.text, _guided_contexts.get(session_id, {}),
+                            result_data, available_sources=_src_info, history=history,
+                        )
+                    else:
+                        response_text = await agent.conversational_response(
+                            req.text, action, result_data, history=history,
+                        )
                 except Exception as e:
                     log.warning("Conversational response failed, using fallback: %s", e)
                     response_text = result_data.get("fallback_text", response_text)
+
+            # Clear guided context when pipeline is created or user exits
+            if result_data.get("status") == "created" and session_id in _guided_contexts:
+                del _guided_contexts[session_id]
 
             # Save to conversation history
             history.append({"role": "user", "text": req.text})
@@ -969,6 +1157,169 @@ def create_app(
             "\n".join(lines) + "\n" if lines else "",
             media_type="application/jsonl",
         )
+
+    # -----------------------------------------------------------------------
+    # Source Registry (admin-registered named connections)
+    # -----------------------------------------------------------------------
+
+    @app.post("/api/sources")
+    @limiter.limit("100/minute")
+    async def register_source(
+        request: Request,
+        req: RegisterSourceRequest = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Register a named data source. Admin only."""
+        require_role(caller, "admin")
+        # Validate connector exists
+        connector = await store.get_connector(req.connector_id)
+        if not connector:
+            raise HTTPException(404, f"Connector {req.connector_id} not found")
+        # Check duplicate name
+        existing = await store.get_registered_source_by_name(req.display_name)
+        if existing:
+            raise HTTPException(409, f"Source '{req.display_name}' already exists")
+
+        src = RegisteredSource(
+            display_name=req.display_name,
+            connector_id=req.connector_id,
+            connector_name=connector.connector_name,
+            source_type=connector.source_target_type.lower(),
+            connection_params=req.connection_params,
+            description=req.description,
+            owner=req.owner,
+            tags=req.tags,
+        )
+        await store.save_registered_source(src)
+        return {
+            "source_id": src.source_id,
+            "display_name": src.display_name,
+            "source_type": src.source_type,
+            "connector_name": src.connector_name,
+            "description": src.description,
+        }
+
+    @app.get("/api/sources")
+    @limiter.limit("100/minute")
+    async def list_sources(
+        request: Request,
+        source_type: str = Query(default=None),
+        caller: dict = Depends(auth_dep),
+    ):
+        """List registered data sources. All roles. Credentials are masked."""
+        sources = await store.list_registered_sources(source_type=source_type)
+        return {
+            "sources": [
+                {
+                    "source_id": s.source_id,
+                    "display_name": s.display_name,
+                    "source_type": s.source_type,
+                    "connector_name": s.connector_name,
+                    "description": s.description,
+                    "owner": s.owner,
+                    "tags": s.tags,
+                    "has_credentials": bool(s.connection_params),
+                    "has_schema_cache": bool(s.schema_cache),
+                    "schema_cache_updated_at": s.schema_cache_updated_at,
+                    "created_at": s.created_at,
+                }
+                for s in sources
+            ],
+        }
+
+    @app.get("/api/sources/{source_id}")
+    @limiter.limit("100/minute")
+    async def get_source(
+        request: Request,
+        source_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get source details. Credentials masked for non-admin."""
+        src = await store.get_registered_source(source_id)
+        if not src:
+            raise HTTPException(404, "Source not found")
+        result = {
+            "source_id": src.source_id,
+            "display_name": src.display_name,
+            "source_type": src.source_type,
+            "connector_id": src.connector_id,
+            "connector_name": src.connector_name,
+            "description": src.description,
+            "owner": src.owner,
+            "tags": src.tags,
+            "has_credentials": bool(src.connection_params),
+            "schema_cache": src.schema_cache if src.schema_cache else None,
+            "schema_cache_updated_at": src.schema_cache_updated_at,
+            "created_at": src.created_at,
+        }
+        # Only admin sees connection params
+        if caller and caller.get("role") == "admin":
+            # Mask passwords in response
+            masked = dict(src.connection_params)
+            for k in ("password", "secret", "api_key", "token"):
+                if k in masked and masked[k]:
+                    masked[k] = "***"
+            result["connection_params"] = masked
+        return result
+
+    @app.patch("/api/sources/{source_id}")
+    @limiter.limit("100/minute")
+    async def update_source(
+        request: Request,
+        source_id: str,
+        req: UpdateSourceRequest = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Update a registered source. Admin only."""
+        require_role(caller, "admin")
+        src = await store.get_registered_source(source_id)
+        if not src:
+            raise HTTPException(404, "Source not found")
+        if req.display_name is not None:
+            src.display_name = req.display_name
+        if req.connection_params is not None:
+            src.connection_params = req.connection_params
+        if req.description is not None:
+            src.description = req.description
+        if req.owner is not None:
+            src.owner = req.owner
+        if req.tags is not None:
+            src.tags = req.tags
+        src.updated_at = now_iso()
+        await store.save_registered_source(src)
+        return {"status": "updated", "source_id": source_id}
+
+    @app.delete("/api/sources/{source_id}")
+    @limiter.limit("100/minute")
+    async def delete_source(
+        request: Request,
+        source_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Delete a registered source. Admin only."""
+        require_role(caller, "admin")
+        await store.delete_registered_source(source_id)
+        return {"status": "deleted"}
+
+    @app.post("/api/sources/{source_id}/discover")
+    @limiter.limit("30/minute")
+    async def discover_source(
+        request: Request,
+        source_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Discover schemas and tables from a registered source. Caches result."""
+        require_role(caller, "admin", "operator")
+        src = await store.get_registered_source(source_id)
+        if not src:
+            raise HTTPException(404, "Source not found")
+        try:
+            schemas = await conversation.list_schemas(src.connector_id, src.connection_params)
+            cache = {"schemas": schemas}
+            await store.update_source_schema_cache(source_id, cache)
+            return {"source_id": source_id, "schemas": schemas}
+        except Exception as e:
+            raise HTTPException(500, f"Discovery failed: {e}")
 
     # -----------------------------------------------------------------------
     # Connection & Discovery

@@ -779,6 +779,24 @@ class TableProfile:
     foreign_keys: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class RegisteredSource:
+    """Admin-registered named connection. Analysts pick by display_name, never see credentials."""
+    source_id: str = field(default_factory=new_id)
+    display_name: str = ""          # "Production MySQL", "Stripe Account"
+    connector_id: str = ""          # FK to connectors table
+    connector_name: str = ""        # denormalized for display
+    source_type: str = ""           # "mysql", "stripe", "mongodb", etc.
+    connection_params: dict = field(default_factory=dict)  # host, port, database, user, password
+    description: str = ""
+    owner: str = ""
+    tags: dict = field(default_factory=dict)
+    schema_cache: dict = field(default_factory=dict)  # cached discovery results
+    schema_cache_updated_at: Optional[str] = None
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
+
+
 class PipelineChangeType(str, Enum):
     CREATED = "created"
     UPDATED = "updated"
