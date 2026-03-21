@@ -232,7 +232,21 @@ class Scheduler:
                     pipeline.pipeline_id, pipeline.pipeline_name,
                     run_id=run.run_id, component="scheduler",
                 ):
-                    run = await self.runner.execute(pipeline, run)
+                    timeout = pipeline.timeout_seconds or 3600
+                    try:
+                        run = await asyncio.wait_for(
+                            self.runner.execute(pipeline, run),
+                            timeout=timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        log.error(
+                            "Pipeline %s timed out after %ds",
+                            pipeline.pipeline_name, timeout,
+                        )
+                        run.status = RunStatus.FAILED
+                        run.error = f"Run timed out after {timeout}s"
+                        run.completed_at = now_iso()
+                        await self.store.save_run(run)
 
                     # Handle retries on failure
                     if run.status == RunStatus.FAILED:

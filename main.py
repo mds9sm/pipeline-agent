@@ -27,7 +27,7 @@ import uvicorn
 
 from config import Config
 from contracts.store import Store
-from contracts.models import now_iso
+from contracts.models import now_iso, RunStatus
 from connectors.registry import ConnectorRegistry
 from staging.local import LocalStagingManager
 from agent.core import AgentCore
@@ -128,6 +128,27 @@ async def _log_quality_summary(store: Store):
         log.info("Quality summary -- all pipelines healthy.")
 
 
+async def _recover_stale_runs(store: Store):
+    """Mark runs stuck in non-terminal states as failed (crash recovery).
+
+    Any run that started before the current process boot and is still in a
+    non-terminal state (pending, extracting, etc.) was orphaned by a prior
+    crash. Mark these as failed so they don't block the pipeline.
+    """
+    boot_time = now_iso()
+    stale_runs = await store.list_stale_runs(boot_time)
+    if not stale_runs:
+        log.info("  No stale runs to recover.")
+        return
+    for run in stale_runs:
+        stuck_status = run.status.value if hasattr(run.status, "value") else run.status
+        run.status = RunStatus.FAILED
+        run.error = f"Recovered on startup: run was stuck in '{stuck_status}' state from prior process"
+        run.completed_at = boot_time
+        await store.save_run(run)
+    log.warning("  Recovered %d stale run(s) from prior crash.", len(stale_runs))
+
+
 async def main():
     # 1. Load config
     config = Config()
@@ -194,6 +215,9 @@ async def main():
         # 7b. Bootstrap demo pipelines (first startup only)
         from demo.bootstrap import bootstrap_demo_pipelines
         await bootstrap_demo_pipelines(store, registry, runner)
+
+        # 7c. Recover stale runs from prior crash
+        await _recover_stale_runs(store)
 
         pipelines = await store.list_pipelines(status="active")
         log.info("  Active pipelines: %d", len(pipelines))

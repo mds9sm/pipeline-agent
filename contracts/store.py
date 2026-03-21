@@ -308,6 +308,17 @@ class ContractStore:
         )
         return [_row_to_run(r) for r in rows]
 
+    async def list_stale_runs(self, stale_before: str) -> list[RunRecord]:
+        """Find runs stuck in non-terminal states started before the given time."""
+        rows = await self.pool.fetch("""
+            SELECT * FROM runs
+            WHERE status IN ('pending', 'extracting', 'staging', 'loading',
+                             'quality_gate', 'promoting', 'retrying')
+              AND started_at < $1
+            ORDER BY started_at ASC
+        """, stale_before)
+        return [_row_to_run(r) for r in rows]
+
     async def get_last_successful_run(self, pipeline_id: str) -> Optional[RunRecord]:
         row = await self.pool.fetchrow("""
             SELECT * FROM runs

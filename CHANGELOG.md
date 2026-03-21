@@ -13,14 +13,30 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 14 | Hook template variables | **Done** | `{{watermark_after}}`, `{{run_id}}` etc. — unblocks consume-and-merge pattern |
 | 15 | Run context propagation | **Done** | Upstream run context (watermarks, batch IDs) flows to downstream pipelines |
 | 16 | Data contracts between pipelines | **Done** | Formalize producer/consumer relationships, cleanup policies, retention |
-| 17 | SQL-native intra-DB steps | Pending | Skip CSV extract for same-database pipelines (INSERT INTO...SELECT) |
-| 18 | Composable step DAG | Pending | Replace fixed extract→load→promote flow with configurable step graph (ingestion-focused, transforms deferred) |
+| 17 | SQL-native intra-DB steps | **Skipped** | Agent handles per-pipeline via custom connectors/hooks — not a platform feature |
+| 18 | Composable step DAG | Deferred | Needs user experience to inform design. Discussed, deferred until real usage patterns emerge |
 | 19 | DAG visualization UI | **Done** | Visual pipeline dependency graph with execution status |
 | 20 | Agent topology reasoning | **Done** | Agent designs multi-pipeline architectures from natural language |
 
 ---
 
 ## [Unreleased]
+
+### Stale Run Recovery & Timeout Enforcement - 2026-03-21 (Claude Opus 4.6)
+
+**Crash Recovery & Run Timeouts**
+
+#### Added
+- **Stale run recovery on startup** — On process boot, any runs stuck in non-terminal states (pending, extracting, staging, loading, quality_gate, promoting, retrying) from a prior crash are automatically marked as failed with a descriptive error message. Prevents orphaned runs from blocking pipelines.
+- **`Store.list_stale_runs(stale_before)`** — New store method that finds runs in non-terminal states that started before the given timestamp.
+- **Run timeout enforcement** — `scheduler/manager.py` now wraps `runner.execute()` with `asyncio.wait_for(timeout=pipeline.timeout_seconds)`. Pipelines that exceed their configured timeout (default 3600s) are marked failed with a timeout error and proceed to retry logic.
+
+#### Key Design Decisions
+- **Fail-open on timeout** — Timed-out runs go through normal retry logic (`_maybe_retry`), so transient slowness gets retried before alerting.
+- **Boot-time boundary** — Uses process boot timestamp as the stale cutoff, so only runs from *prior* processes are recovered, not runs started by the current process.
+- **No Celery** — Confirmed asyncio + Semaphore is sufficient for current scale. Stale recovery + timeouts cover the crash-safety gap without adding broker infrastructure.
+
+---
 
 ### Builds 19-20 - 2026-03-21 (Claude Opus 4.6)
 
