@@ -566,7 +566,7 @@ function PipelinesView({ tierFilter }) {
 
   function budgetColor(eb) {
     if (!eb) return "gray";
-    const pct = eb.utilization_pct || 0;
+    const pct = eb.utilization_pct ?? (eb.budget_remaining != null ? Math.max(0, (1 - (eb.success_rate || 0)) / (1 - (eb.budget_threshold || 0.9))) * 100 : 0);
     if (pct < 50) return "green";
     if (pct < 80) return "amber";
     return "red";
@@ -613,25 +613,28 @@ function PipelinesView({ tierFilter }) {
                   </div>
                 </div>
 
-                {detail.error_budget && (
+                {detail.error_budget && (() => {
+                  const eb = detail.error_budget;
+                  const utilizationPct = eb.utilization_pct ?? (eb.budget_remaining != null ? Math.max(0, Math.min(100, (1 - (eb.success_rate || 0)) / (1 - (eb.budget_threshold || 0.9)) * 100)) : 0);
+                  return (
                   <div className="bg-stone-50 border border-stone-300 rounded-lg px-4 py-3">
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-xs font-semibold text-stone-500">Error Budget</span>
                       <Pill
-                        label={`${detail.error_budget.utilization_pct.toFixed(1)}% used`}
-                        color={budgetColor(detail.error_budget)}
+                        label={eb.escalated ? "EXHAUSTED" : `${utilizationPct.toFixed(1)}% used`}
+                        color={budgetColor(eb)}
                       />
                     </div>
                     <ProgressBar
-                      pct={detail.error_budget.utilization_pct}
-                      color={budgetColor(detail.error_budget)}
+                      pct={utilizationPct}
+                      color={budgetColor(eb)}
                     />
                     <div className="text-xs text-stone-400 mt-1">
-                      {detail.error_budget.remaining_minutes?.toFixed(0)}m remaining of{" "}
-                      {detail.error_budget.total_budget_minutes}m
+                      {eb.successful_runs}/{eb.total_runs} runs successful ({eb.window_days}d window) — threshold {((eb.budget_threshold || 0.9) * 100).toFixed(0)}%
                     </div>
                   </div>
-                )}
+                  );
+                })()}
 
                 {detail.agent_reasoning?.refresh_type_reason && (
                   <div className="bg-green-50 border border-green-200 rounded-lg px-4 py-3">
@@ -643,6 +646,29 @@ function PipelinesView({ tierFilter }) {
                           <span className="font-medium">{k.replace("_reason", "")}:</span> {v}
                         </div>
                       ))}
+                  </div>
+                )}
+
+                {detail.recent_changes?.length > 0 && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3">
+                    <div className="text-xs font-semibold text-amber-700 mb-2">Changelog</div>
+                    <div className="space-y-1">
+                      {detail.recent_changes.map((c, i) => (
+                        <div key={i} className="flex items-center gap-2 text-xs">
+                          <span className="font-mono text-amber-500">{c.created_at?.slice(0, 16)}</span>
+                          <Pill label={c.change_type} color={
+                            c.change_type === "created" ? "green" :
+                            c.change_type === "triggered" ? "blue" :
+                            c.change_type === "paused" ? "amber" :
+                            c.change_type === "resumed" ? "green" :
+                            "purple"
+                          } />
+                          <span className="text-stone-600">{c.changed_by || "system"}</span>
+                          <span className="text-stone-400">{c.source}</span>
+                          {c.reason && <span className="text-stone-400 italic truncate max-w-xs">— {c.reason}</span>}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
 
