@@ -17,7 +17,7 @@ from contracts.models import (
     AlertRecord, DecisionLog, AgentPreference, ConnectorRecord,
     ErrorBudget, ColumnLineage, AgentCostLog, ConnectorMigration, User,
     PipelineMetadata, SchemaChangePolicy, PostPromotionHook,
-    DataContract, ContractViolation,
+    DataContract, ContractViolation, ChatInteraction,
     ColumnMapping, QualityConfig, CheckResult,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
@@ -1142,6 +1142,78 @@ class ContractStore:
         )
 
 
+    # ------------------------------------------------------------------
+    # Chat Interactions (audit + training log)
+    # ------------------------------------------------------------------
+
+    async def save_chat_interaction(self, ci: ChatInteraction) -> None:
+        await self.pool.execute("""
+            INSERT INTO chat_interactions (
+                interaction_id, session_id, user_id, username,
+                user_input, routed_action, action_params,
+                agent_response, result_data,
+                input_tokens, output_tokens, latency_ms,
+                model, error, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        """,
+            ci.interaction_id, ci.session_id, ci.user_id, ci.username,
+            ci.user_input, ci.routed_action, json.dumps(ci.action_params),
+            ci.agent_response, json.dumps(ci.result_data),
+            ci.input_tokens, ci.output_tokens, ci.latency_ms,
+            ci.model, ci.error, ci.created_at,
+        )
+
+    async def list_chat_interactions(
+        self,
+        session_id: Optional[str] = None,
+        username: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[ChatInteraction]:
+        conditions = []
+        args = []
+        idx = 1
+        if session_id:
+            conditions.append(f"session_id = ${idx}")
+            args.append(session_id)
+            idx += 1
+        if username:
+            conditions.append(f"username = ${idx}")
+            args.append(username)
+            idx += 1
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        args.extend([limit, offset])
+        rows = await self.pool.fetch(f"""
+            SELECT * FROM chat_interactions
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ${idx} OFFSET ${idx + 1}
+        """, *args)
+        return [_row_to_chat_interaction(r) for r in rows]
+
+    async def count_chat_interactions(
+        self,
+        session_id: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> int:
+        conditions = []
+        args = []
+        idx = 1
+        if session_id:
+            conditions.append(f"session_id = ${idx}")
+            args.append(session_id)
+            idx += 1
+        if username:
+            conditions.append(f"username = ${idx}")
+            args.append(username)
+            idx += 1
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        row = await self.pool.fetchrow(f"""
+            SELECT COUNT(*) as cnt FROM chat_interactions {where}
+        """, *args)
+        return row["cnt"] if row else 0
+
+
 # ======================================================================
 # Row-to-model helpers (module-level, stateless)
 # ======================================================================
@@ -1478,6 +1550,26 @@ def _row_to_contract_violation(row: asyncpg.Record) -> ContractViolation:
     )
 
 
+def _row_to_chat_interaction(row: asyncpg.Record) -> ChatInteraction:
+    return ChatInteraction(
+        interaction_id=row["interaction_id"],
+        session_id=row["session_id"],
+        user_id=row["user_id"],
+        username=row["username"],
+        user_input=row["user_input"],
+        routed_action=row["routed_action"],
+        action_params=json.loads(row["action_params"]) if row["action_params"] else {},
+        agent_response=row["agent_response"],
+        result_data=json.loads(row["result_data"]) if row["result_data"] else {},
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        latency_ms=row["latency_ms"],
+        model=row["model"],
+        error=row["error"],
+        created_at=row["created_at"],
+    )
+
+
 # ======================================================================
 # DDL for create_tables() -- dev/test convenience
 # ======================================================================
@@ -1801,7 +1893,28 @@ CREATE TABLE IF NOT EXISTS contract_violations (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS chat_interactions (
+    interaction_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL DEFAULT 'default',
+    user_id TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    user_input TEXT NOT NULL DEFAULT '',
+    routed_action TEXT NOT NULL DEFAULT '',
+    action_params JSONB NOT NULL DEFAULT '{}',
+    agent_response TEXT NOT NULL DEFAULT '',
+    result_data JSONB NOT NULL DEFAULT '{}',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    error TEXT,
+    created_at TEXT NOT NULL
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_chat_interactions_session ON chat_interactions(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_interactions_username ON chat_interactions(username, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_interactions_created ON chat_interactions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON runs(pipeline_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_gates_run ON gates(run_id);

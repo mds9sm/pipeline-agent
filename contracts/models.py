@@ -780,6 +780,26 @@ class TableProfile:
 
 
 @dataclass
+class ChatInteraction:
+    """Persistent log of every chat interaction for auditing and training."""
+    interaction_id: str = field(default_factory=new_id)
+    session_id: str = "default"
+    user_id: str = ""
+    username: str = ""
+    user_input: str = ""
+    routed_action: str = ""
+    action_params: dict = field(default_factory=dict)
+    agent_response: str = ""
+    result_data: dict = field(default_factory=dict)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: int = 0
+    model: str = ""
+    error: Optional[str] = None
+    created_at: str = field(default_factory=now_iso)
+
+
+@dataclass
 class ExtractResult:
     rows_extracted: int
     max_watermark: Optional[str]

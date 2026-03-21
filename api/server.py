@@ -2,6 +2,7 @@
 FastAPI REST API server with JWT auth, rate limiting, and agent-routed commands.
 """
 import decimal
+import json
 import logging
 import os
 import time
@@ -406,6 +407,8 @@ def create_app(
         req: CommandRequest = Body(...),
         caller: dict = Depends(auth_dep),
     ):
+        import time as _time
+        _cmd_t0 = _time.monotonic()
         try:
             # Maintain conversation history per session
             session_id = req.session_id or "default"
@@ -804,10 +807,123 @@ def create_app(
             if len(history) > 20:
                 _chat_sessions[session_id] = history[-20:]
 
+            # Persist interaction for audit + training
+            _cmd_latency = int((_time.monotonic() - _cmd_t0) * 1000)
+            try:
+                from contracts.models import ChatInteraction
+                _user_id = caller.get("sub", "") if caller else ""
+                _username = ""
+                if _user_id and _user_id not in ("anonymous", "api_key_user"):
+                    _user_obj = await store.get_user(_user_id)
+                    _username = _user_obj.username if _user_obj else _user_id
+                else:
+                    _username = _user_id
+                ci = ChatInteraction(
+                    session_id=session_id,
+                    user_id=_user_id,
+                    username=_username,
+                    user_input=req.text,
+                    routed_action=action,
+                    action_params=params,
+                    agent_response=response_text,
+                    result_data=result_data,
+                    input_tokens=agent._req_input_tokens,
+                    output_tokens=agent._req_output_tokens,
+                    latency_ms=_cmd_latency,
+                    model=config.model if config.has_api_key else "rule-based",
+                )
+                await store.save_chat_interaction(ci)
+            except Exception as log_err:
+                log.warning("Failed to save chat interaction: %s", log_err)
+
             return {"response": response_text}
         except Exception as e:
             log.exception("Command routing error")
             raise HTTPException(500, f"Command failed: {str(e)}")
+
+    # -----------------------------------------------------------------------
+    # Chat Interaction Audit Log
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/interactions")
+    @limiter.limit("100/minute")
+    async def list_interactions(
+        request: Request,
+        session_id: str = Query(default=None),
+        username: str = Query(default=None),
+        limit: int = Query(default=50, le=500),
+        offset: int = Query(default=0),
+        caller: dict = Depends(auth_dep),
+    ):
+        """List chat interactions for auditing and training data export.
+        Admin only — returns full interaction logs with user input, agent response,
+        routed action, token usage, and latency."""
+        if caller and caller.get("role") != "admin":
+            raise HTTPException(403, "Admin access required")
+        interactions = await store.list_chat_interactions(
+            session_id=session_id, username=username,
+            limit=limit, offset=offset,
+        )
+        total = await store.count_chat_interactions(
+            session_id=session_id, username=username,
+        )
+        return {
+            "interactions": [
+                {
+                    "interaction_id": ci.interaction_id,
+                    "session_id": ci.session_id,
+                    "user_id": ci.user_id,
+                    "username": ci.username,
+                    "user_input": ci.user_input,
+                    "routed_action": ci.routed_action,
+                    "action_params": ci.action_params,
+                    "agent_response": ci.agent_response,
+                    "result_data": ci.result_data,
+                    "input_tokens": ci.input_tokens,
+                    "output_tokens": ci.output_tokens,
+                    "latency_ms": ci.latency_ms,
+                    "model": ci.model,
+                    "error": ci.error,
+                    "created_at": ci.created_at,
+                }
+                for ci in interactions
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/api/interactions/export")
+    @limiter.limit("10/minute")
+    async def export_interactions(
+        request: Request,
+        session_id: str = Query(default=None),
+        username: str = Query(default=None),
+        limit: int = Query(default=1000, le=10000),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Export interactions as JSONL for training data.
+        Each line is a JSON object with user_input and agent_response."""
+        if caller and caller.get("role") != "admin":
+            raise HTTPException(403, "Admin access required")
+        interactions = await store.list_chat_interactions(
+            session_id=session_id, username=username, limit=limit,
+        )
+        lines = []
+        for ci in interactions:
+            lines.append(json.dumps({
+                "user_input": ci.user_input,
+                "routed_action": ci.routed_action,
+                "action_params": ci.action_params,
+                "agent_response": ci.agent_response,
+                "model": ci.model,
+                "latency_ms": ci.latency_ms,
+                "created_at": ci.created_at,
+            }))
+        return PlainTextResponse(
+            "\n".join(lines) + "\n" if lines else "",
+            media_type="application/jsonl",
+        )
 
     # -----------------------------------------------------------------------
     # Connection & Discovery

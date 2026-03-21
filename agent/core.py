@@ -34,6 +34,9 @@ class AgentCore:
         self.config = config
         self.store = store
         self.has_api = config.has_api_key
+        # Per-request token accumulator (reset before each command)
+        self._req_input_tokens = 0
+        self._req_output_tokens = 0
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -89,6 +92,10 @@ class AgentCore:
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
         total_tokens = input_tokens + output_tokens
+
+        # Accumulate for per-request tracking
+        self._req_input_tokens += input_tokens
+        self._req_output_tokens += output_tokens
 
         # Log cost
         cost_log = AgentCostLog(
@@ -917,9 +924,13 @@ Keep it under 200 words.
     ) -> dict:
         """Route natural language commands to structured actions.
 
-        Returns dict with keys: action, params, response_text.
+        Returns dict with keys: action, params, response_text, input_tokens, output_tokens.
         Falls back to keyword extraction when no API key.
         """
+        # Reset per-request token accumulator
+        self._req_input_tokens = 0
+        self._req_output_tokens = 0
+
         if not self.has_api:
             return self._keyword_route(user_text, context)
 
@@ -992,10 +1003,15 @@ Respond with JSON:
             result.setdefault("action", "unknown")
             result.setdefault("params", {})
             result.setdefault("response_text", "")
+            result["input_tokens"] = self._req_input_tokens
+            result["output_tokens"] = self._req_output_tokens
             return result
         except Exception as e:
             log.warning("route_command Claude error: %s. Using keyword fallback.", e)
-            return self._keyword_route(user_text, context)
+            fallback = self._keyword_route(user_text, context)
+            fallback["input_tokens"] = self._req_input_tokens
+            fallback["output_tokens"] = self._req_output_tokens
+            return fallback
 
     def _keyword_route(self, user_text: str, context: Optional[dict] = None) -> dict:
         """Keyword-based command routing fallback."""
