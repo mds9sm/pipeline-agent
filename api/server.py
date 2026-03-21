@@ -31,6 +31,7 @@ from contracts.models import (
     SchemaChangePolicy, SCHEMA_POLICY_TIER_DEFAULTS, PostPromotionHook,
     DataContract, ContractViolation,
     DataContractStatus, CleanupOwnership, ContractViolationType,
+    PipelineChangeLog, PipelineChangeType,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -276,6 +277,39 @@ def create_app(
             request_id_var.reset(token)
 
     auth_dep = AuthDependency(config)
+
+    async def _log_pipeline_change(
+        pipeline_id: str,
+        pipeline_name: str,
+        change_type: PipelineChangeType,
+        caller: dict,
+        changed_fields: dict = None,
+        reason: str = "",
+        source: str = "api",
+        context: str = "",
+    ):
+        """Record a pipeline mutation in the changelog. Fail-safe."""
+        try:
+            _uid = caller.get("sub", "") if caller else ""
+            _uname = ""
+            if _uid and _uid not in ("anonymous", "api_key_user"):
+                _u = await store.get_user(_uid)
+                _uname = _u.username if _u else _uid
+            else:
+                _uname = _uid
+            await store.save_pipeline_change(PipelineChangeLog(
+                pipeline_id=pipeline_id,
+                pipeline_name=pipeline_name,
+                change_type=change_type,
+                changed_by=_uname,
+                changed_by_id=_uid,
+                source=source,
+                changed_fields=changed_fields or {},
+                reason=reason,
+                context=context,
+            ))
+        except Exception as e:
+            log.warning("Failed to save pipeline changelog: %s", e)
 
     # -----------------------------------------------------------------------
     # Auth endpoints (no auth required for login)
@@ -674,6 +708,17 @@ def create_app(
                                 },
                                 "fallback_text": f"Pipeline {pipeline.pipeline_name} created successfully!",
                             }
+                            await _log_pipeline_change(
+                                pipeline.pipeline_id, pipeline.pipeline_name,
+                                PipelineChangeType.CREATED, caller,
+                                source="chat",
+                                changed_fields={
+                                    "source": f"{pipeline.source_schema}.{pipeline.source_table}",
+                                    "target": f"{pipeline.target_schema}.{pipeline.target_table}",
+                                    "schedule": pipeline.schedule_cron,
+                                },
+                                context=f"Created via chat: {req.text}",
+                            )
                     except Exception as e:
                         log.exception("Pipeline creation error")
                         result_data = {"status": "error", "error": str(e), "fallback_text": f"Pipeline creation failed: {e}"}
@@ -1215,6 +1260,15 @@ def create_app(
             owner=req.owner,
             tags=req.tags,
         )
+        await _log_pipeline_change(
+            pipeline.pipeline_id, pipeline.pipeline_name,
+            PipelineChangeType.CREATED, caller,
+            changed_fields={
+                "source": f"{req.source_schema}.{req.source_table}",
+                "target": f"{req.target_schema}",
+                "schedule": req.schedule_cron,
+            },
+        )
         return _pipeline_summary(pipeline)
 
     @app.post("/api/pipelines/batch")
@@ -1364,7 +1418,7 @@ def create_app(
         p.updated_at = now_iso()
         await store.save_pipeline(p)
 
-        # Audit: save DecisionLog
+        # Audit: save DecisionLog (legacy)
         await store.save_decision(DecisionLog(
             pipeline_id=p.pipeline_id,
             decision_type="contract_update",
@@ -1372,6 +1426,22 @@ def create_app(
             reasoning=req.reason or "",
             created_at=now_iso(),
         ))
+
+        # Classify change type for changelog
+        _change_type = PipelineChangeType.UPDATED
+        _changed_keys = set(changes.keys())
+        if _changed_keys <= {"schedule_cron", "retry_max_attempts", "retry_backoff_seconds", "timeout_seconds"}:
+            _change_type = PipelineChangeType.SCHEDULE_CHANGED
+        elif _changed_keys <= {"refresh_type", "replication_method", "incremental_column", "load_type", "merge_keys", "last_watermark"}:
+            _change_type = PipelineChangeType.STRATEGY_CHANGED
+        elif _changed_keys <= {"quality_config"}:
+            _change_type = PipelineChangeType.QUALITY_CONFIG_CHANGED
+        elif _changed_keys <= {"post_promotion_hooks"}:
+            _change_type = PipelineChangeType.HOOK_CHANGED
+        await _log_pipeline_change(
+            p.pipeline_id, p.pipeline_name, _change_type, caller,
+            changed_fields=changes, reason=req.reason or "",
+        )
 
         # Persist contract YAML to disk
         _persist_contract_yaml(p, config)
@@ -1387,6 +1457,12 @@ def create_app(
     ):
         require_role(caller, "admin", "operator")
         run = await scheduler.trigger(pipeline_id)
+        p = await store.get_pipeline(pipeline_id)
+        await _log_pipeline_change(
+            pipeline_id, p.pipeline_name if p else "",
+            PipelineChangeType.TRIGGERED, caller,
+            changed_fields={"run_id": run.run_id},
+        )
         return {"run_id": run.run_id, "status": run.status.value}
 
     @app.post("/api/pipelines/{pipeline_id}/backfill")
@@ -1399,6 +1475,12 @@ def create_app(
     ):
         require_role(caller, "admin", "operator")
         run = await scheduler.trigger_backfill(pipeline_id, req.start, req.end)
+        p = await store.get_pipeline(pipeline_id)
+        await _log_pipeline_change(
+            pipeline_id, p.pipeline_name if p else "",
+            PipelineChangeType.BACKFILLED, caller,
+            changed_fields={"run_id": run.run_id, "start": req.start, "end": req.end},
+        )
         return {
             "run_id": run.run_id,
             "status": run.status.value,
@@ -1417,8 +1499,14 @@ def create_app(
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
+        old_status = p.status.value if hasattr(p.status, "value") else p.status
         p.status = PipelineStatus.PAUSED
         await store.save_pipeline(p)
+        await _log_pipeline_change(
+            pipeline_id, p.pipeline_name,
+            PipelineChangeType.PAUSED, caller,
+            changed_fields={"status": {"old": old_status, "new": "paused"}},
+        )
         return {"status": "paused"}
 
     @app.post("/api/pipelines/{pipeline_id}/resume")
@@ -1432,8 +1520,14 @@ def create_app(
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
+        old_status = p.status.value if hasattr(p.status, "value") else p.status
         p.status = PipelineStatus.ACTIVE
         await store.save_pipeline(p)
+        await _log_pipeline_change(
+            pipeline_id, p.pipeline_name,
+            PipelineChangeType.RESUMED, caller,
+            changed_fields={"status": {"old": old_status, "new": "active"}},
+        )
         return {"status": "active"}
 
     @app.get("/api/pipelines/{pipeline_id}/preview")
@@ -1450,6 +1544,67 @@ def create_app(
             return await conversation.preview_pipeline(pipeline_id)
         except Exception as e:
             raise HTTPException(500, str(e))
+
+    @app.get("/api/pipelines/{pipeline_id}/changelog")
+    @limiter.limit("100/minute")
+    async def get_pipeline_changelog(
+        request: Request,
+        pipeline_id: str,
+        change_type: str = Query(default=None),
+        limit: int = Query(default=50, le=200),
+        offset: int = Query(default=0),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get the changelog for a specific pipeline — who changed what, when, why."""
+        changes = await store.list_pipeline_changes(
+            pipeline_id, change_type=change_type, limit=limit, offset=offset,
+        )
+        return {
+            "pipeline_id": pipeline_id,
+            "changes": [
+                {
+                    "change_id": c.change_id,
+                    "change_type": c.change_type.value if hasattr(c.change_type, "value") else c.change_type,
+                    "changed_by": c.changed_by,
+                    "source": c.source,
+                    "changed_fields": c.changed_fields,
+                    "reason": c.reason,
+                    "context": c.context,
+                    "created_at": c.created_at,
+                }
+                for c in changes
+            ],
+        }
+
+    @app.get("/api/changelog")
+    @limiter.limit("100/minute")
+    async def get_global_changelog(
+        request: Request,
+        limit: int = Query(default=50, le=200),
+        offset: int = Query(default=0),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get the global changelog across all pipelines."""
+        if caller and caller.get("role") != "admin":
+            raise HTTPException(403, "Admin access required")
+        changes = await store.list_all_pipeline_changes(limit=limit, offset=offset)
+        return {
+            "changes": [
+                {
+                    "change_id": c.change_id,
+                    "pipeline_id": c.pipeline_id,
+                    "pipeline_name": c.pipeline_name,
+                    "change_type": c.change_type.value if hasattr(c.change_type, "value") else c.change_type,
+                    "changed_by": c.changed_by,
+                    "source": c.source,
+                    "changed_fields": c.changed_fields,
+                    "reason": c.reason,
+                    "context": c.context,
+                    "created_at": c.created_at,
+                }
+                for c in changes
+            ],
+        }
 
     @app.get("/api/pipelines/{pipeline_id}/runs")
     @limiter.limit("100/minute")
@@ -3252,6 +3407,19 @@ async def _pipeline_detail(p, store: Store) -> dict:
             for c in consumed
         ],
     }
+
+    # Recent changelog
+    recent_changes = await store.list_pipeline_changes(p.pipeline_id, limit=10)
+    d["recent_changes"] = [
+        {
+            "change_type": c.change_type.value if hasattr(c.change_type, "value") else c.change_type,
+            "changed_by": c.changed_by,
+            "source": c.source,
+            "reason": c.reason,
+            "created_at": c.created_at,
+        }
+        for c in recent_changes
+    ]
 
     return d
 

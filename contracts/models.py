@@ -779,6 +779,40 @@ class TableProfile:
     foreign_keys: list[dict] = field(default_factory=list)
 
 
+class PipelineChangeType(str, Enum):
+    CREATED = "created"
+    UPDATED = "updated"
+    TRIGGERED = "triggered"
+    PAUSED = "paused"
+    RESUMED = "resumed"
+    DELETED = "deleted"
+    BACKFILLED = "backfilled"
+    CONNECTOR_CHANGED = "connector_changed"
+    DEPENDENCY_ADDED = "dependency_added"
+    DEPENDENCY_REMOVED = "dependency_removed"
+    CONTRACT_ADDED = "contract_added"
+    HOOK_CHANGED = "hook_changed"
+    STRATEGY_CHANGED = "strategy_changed"
+    QUALITY_CONFIG_CHANGED = "quality_config_changed"
+    SCHEDULE_CHANGED = "schedule_changed"
+
+
+@dataclass
+class PipelineChangeLog:
+    """Structured audit trail for every pipeline mutation."""
+    change_id: str = field(default_factory=new_id)
+    pipeline_id: str = ""
+    pipeline_name: str = ""
+    change_type: PipelineChangeType = PipelineChangeType.UPDATED
+    changed_by: str = ""            # username
+    changed_by_id: str = ""         # user_id
+    source: str = "api"             # api, chat, scheduler, system, agent
+    changed_fields: dict = field(default_factory=dict)  # {field: {old, new}}
+    reason: str = ""
+    context: str = ""               # link to chat interaction or extra context
+    created_at: str = field(default_factory=now_iso)
+
+
 @dataclass
 class ChatInteraction:
     """Persistent log of every chat interaction for auditing and training."""

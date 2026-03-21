@@ -17,7 +17,8 @@ from contracts.models import (
     AlertRecord, DecisionLog, AgentPreference, ConnectorRecord,
     ErrorBudget, ColumnLineage, AgentCostLog, ConnectorMigration, User,
     PipelineMetadata, SchemaChangePolicy, PostPromotionHook,
-    DataContract, ContractViolation, ChatInteraction,
+    DataContract, ContractViolation, ChatInteraction, PipelineChangeLog,
+    PipelineChangeType,
     ColumnMapping, QualityConfig, CheckResult,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
@@ -1213,6 +1214,57 @@ class ContractStore:
         """, *args)
         return row["cnt"] if row else 0
 
+    # ------------------------------------------------------------------
+    # Pipeline Change Log
+    # ------------------------------------------------------------------
+
+    async def save_pipeline_change(self, cl: PipelineChangeLog) -> None:
+        await self.pool.execute("""
+            INSERT INTO pipeline_changelog (
+                change_id, pipeline_id, pipeline_name, change_type,
+                changed_by, changed_by_id, source,
+                changed_fields, reason, context, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        """,
+            cl.change_id, cl.pipeline_id, cl.pipeline_name,
+            cl.change_type.value if hasattr(cl.change_type, "value") else cl.change_type,
+            cl.changed_by, cl.changed_by_id, cl.source,
+            json.dumps(cl.changed_fields, default=str), cl.reason, cl.context,
+            cl.created_at,
+        )
+
+    async def list_pipeline_changes(
+        self,
+        pipeline_id: str,
+        change_type: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[PipelineChangeLog]:
+        if change_type:
+            rows = await self.pool.fetch("""
+                SELECT * FROM pipeline_changelog
+                WHERE pipeline_id = $1 AND change_type = $2
+                ORDER BY created_at DESC LIMIT $3 OFFSET $4
+            """, pipeline_id, change_type, limit, offset)
+        else:
+            rows = await self.pool.fetch("""
+                SELECT * FROM pipeline_changelog
+                WHERE pipeline_id = $1
+                ORDER BY created_at DESC LIMIT $2 OFFSET $3
+            """, pipeline_id, limit, offset)
+        return [_row_to_pipeline_change(r) for r in rows]
+
+    async def list_all_pipeline_changes(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[PipelineChangeLog]:
+        rows = await self.pool.fetch("""
+            SELECT * FROM pipeline_changelog
+            ORDER BY created_at DESC LIMIT $1 OFFSET $2
+        """, limit, offset)
+        return [_row_to_pipeline_change(r) for r in rows]
+
 
 # ======================================================================
 # Row-to-model helpers (module-level, stateless)
@@ -1570,6 +1622,22 @@ def _row_to_chat_interaction(row: asyncpg.Record) -> ChatInteraction:
     )
 
 
+def _row_to_pipeline_change(row: asyncpg.Record) -> PipelineChangeLog:
+    return PipelineChangeLog(
+        change_id=row["change_id"],
+        pipeline_id=row["pipeline_id"],
+        pipeline_name=row["pipeline_name"],
+        change_type=PipelineChangeType(row["change_type"]),
+        changed_by=row["changed_by"],
+        changed_by_id=row["changed_by_id"],
+        source=row["source"],
+        changed_fields=json.loads(row["changed_fields"]) if row["changed_fields"] else {},
+        reason=row["reason"],
+        context=row["context"],
+        created_at=row["created_at"],
+    )
+
+
 # ======================================================================
 # DDL for create_tables() -- dev/test convenience
 # ======================================================================
@@ -1911,10 +1979,27 @@ CREATE TABLE IF NOT EXISTS chat_interactions (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pipeline_changelog (
+    change_id TEXT PRIMARY KEY,
+    pipeline_id TEXT NOT NULL,
+    pipeline_name TEXT NOT NULL DEFAULT '',
+    change_type TEXT NOT NULL,
+    changed_by TEXT NOT NULL DEFAULT '',
+    changed_by_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'api',
+    changed_fields JSONB NOT NULL DEFAULT '{}',
+    reason TEXT NOT NULL DEFAULT '',
+    context TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_chat_interactions_session ON chat_interactions(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_interactions_username ON chat_interactions(username, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_interactions_created ON chat_interactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pipeline_changelog_pipeline ON pipeline_changelog(pipeline_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pipeline_changelog_user ON pipeline_changelog(changed_by, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pipeline_changelog_type ON pipeline_changelog(change_type, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON runs(pipeline_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_gates_run ON gates(run_id);
