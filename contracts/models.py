@@ -593,6 +593,7 @@ class AlertRecord:
     pipeline_name: str = ""
     summary: str = ""
     detail: dict = field(default_factory=dict)
+    narrative: str = ""  # Human-readable explanation with root cause and impact (Build 26)
     created_at: str = field(default_factory=now_iso)
     acknowledged: bool = False
     acknowledged_by: Optional[str] = None

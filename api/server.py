@@ -2598,6 +2598,7 @@ def create_app(
                 "pipeline_name": a.pipeline_name,
                 "summary": a.summary,
                 "detail": a.detail,
+                "narrative": a.narrative or "",
                 "created_at": a.created_at,
                 "acknowledged": a.acknowledged,
                 "acknowledged_by": getattr(a, "acknowledged_by", None),
@@ -2622,6 +2623,52 @@ def create_app(
         alert_obj.acknowledged_at = now_iso()
         await store.save_alert(alert_obj)
         return {"status": "acknowledged"}
+
+    @app.post("/api/observability/alerts/{alert_id}/narrative")
+    @limiter.limit("10/minute")
+    async def generate_alert_narrative(
+        request: Request,
+        alert_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Generate or regenerate a human-readable narrative for an alert."""
+        alerts = await store.list_alerts(hours=720)
+        alert_obj = next((a for a in alerts if a.alert_id == alert_id), None)
+        if not alert_obj:
+            raise HTTPException(404, "Alert not found")
+
+        # Gather context
+        p = await store.get_pipeline(alert_obj.pipeline_id) if alert_obj.pipeline_id else None
+        downstream = await store.list_dependents(alert_obj.pipeline_id) if alert_obj.pipeline_id else []
+        recent_runs = await store.list_runs(alert_obj.pipeline_id, limit=3) if alert_obj.pipeline_id else []
+        recent_errors = [r.error for r in recent_runs if r.error]
+        freshness = await store.get_latest_freshness(alert_obj.pipeline_id) if alert_obj.pipeline_id else None
+
+        narrative = await agent.generate_anomaly_narrative(
+            pipeline_name=alert_obj.pipeline_name,
+            alert_summary=alert_obj.summary,
+            alert_detail=alert_obj.detail,
+            severity=alert_obj.severity.value if hasattr(alert_obj.severity, "value") else alert_obj.severity,
+            tier=alert_obj.tier,
+            downstream_count=len(downstream),
+            recent_run_errors=recent_errors,
+            freshness_info={
+                "staleness_minutes": freshness.staleness_minutes,
+                "status": freshness.status.value if hasattr(freshness.status, "value") else freshness.status,
+            } if freshness else None,
+            schedule_cron=p.schedule_cron if p else "",
+        )
+
+        # Save narrative to the alert
+        alert_obj.narrative = narrative
+        await store.save_alert(alert_obj)
+
+        return {
+            "alert_id": alert_id,
+            "narrative": narrative,
+            "pipeline_name": alert_obj.pipeline_name,
+            "severity": alert_obj.severity.value if hasattr(alert_obj.severity, "value") else alert_obj.severity,
+        }
 
     # -----------------------------------------------------------------------
     # Lineage

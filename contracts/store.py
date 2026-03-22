@@ -795,18 +795,19 @@ class ContractStore:
         await self.pool.execute("""
             INSERT INTO alerts (
                 alert_id, severity, tier, pipeline_id, pipeline_name,
-                summary, detail, created_at, acknowledged,
+                summary, detail, narrative, created_at, acknowledged,
                 acknowledged_by, acknowledged_at, digested
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (alert_id) DO UPDATE SET
                 acknowledged=EXCLUDED.acknowledged,
                 acknowledged_by=EXCLUDED.acknowledged_by,
                 acknowledged_at=EXCLUDED.acknowledged_at,
-                digested=EXCLUDED.digested
+                digested=EXCLUDED.digested,
+                narrative=EXCLUDED.narrative
         """,
             a.alert_id, a.severity.value, a.tier,
             a.pipeline_id, a.pipeline_name, a.summary,
-            json.dumps(a.detail), a.created_at,
+            json.dumps(a.detail), a.narrative, a.created_at,
             a.acknowledged, a.acknowledged_by, a.acknowledged_at,
             a.digested,
         )
@@ -1744,6 +1745,7 @@ def _row_to_alert(row: asyncpg.Record) -> AlertRecord:
         pipeline_name=row["pipeline_name"],
         summary=row["summary"],
         detail=json.loads(row["detail"]),
+        narrative=row.get("narrative", ""),
         created_at=row["created_at"],
         acknowledged=row["acknowledged"],
         acknowledged_by=row["acknowledged_by"],
@@ -2328,6 +2330,8 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_log JSONB;
 -- Build 16: Data contracts (tables created via CREATE IF NOT EXISTS; no ALTER needed)
 -- Build 18: Composable step DAGs
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS steps JSONB NOT NULL DEFAULT '[]';
+-- Build 26: Anomaly narratives on alerts
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS narrative TEXT NOT NULL DEFAULT '';
 -- Build 26: Semantic tags, trust weights, business context
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS semantic_tags JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS trust_weights JSONB;

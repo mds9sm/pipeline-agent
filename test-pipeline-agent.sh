@@ -2450,6 +2450,43 @@ if [ "$CODE" = "200" ]; then
 else
     fail "Trust weights reset returned HTTP $CODE"
 fi
+# Test 14: Alerts include narrative field
+test_name "GET /api/observability/alerts includes narrative"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/observability/alerts?hours=72" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_NARRATIVE=$(echo "$BODY" | python3 -c "import sys,json; alerts=json.load(sys.stdin); print('yes' if alerts and 'narrative' in alerts[0] else 'empty' if not alerts else 'no')" 2>/dev/null)
+    if [ "$HAS_NARRATIVE" = "yes" ]; then
+        pass "Alerts include narrative field"
+    elif [ "$HAS_NARRATIVE" = "empty" ]; then
+        warn "No alerts to verify narrative (run pipelines first)"
+    else
+        fail "Alert missing narrative field"
+    fi
+else
+    fail "Alerts returned HTTP $CODE"
+fi
+
+# Test 15: Generate narrative for existing alert
+ALERT_ID=$(echo "$BODY" | python3 -c "import sys,json; alerts=json.load(sys.stdin); print(alerts[0]['alert_id'] if alerts else '')" 2>/dev/null)
+if [ -n "$ALERT_ID" ]; then
+test_name "POST /api/observability/alerts/{id}/narrative"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/observability/alerts/$ALERT_ID/narrative" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY_N=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    NAR=$(echo "$BODY_N" | python3 -c "import sys,json; print(json.load(sys.stdin).get('narrative','')[:60])" 2>/dev/null)
+    pass "Narrative generated: $NAR..."
+else
+    fail "Narrative generation returned HTTP $CODE"
+fi
+else
+    skip "No alerts to test narrative generation"
+fi
+
 fi # CAT_PID exists
 
 fi # --api (Build 26)

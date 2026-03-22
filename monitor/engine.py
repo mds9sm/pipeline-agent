@@ -614,20 +614,43 @@ class MonitorEngine:
                     if status == FreshnessStatus.CRITICAL
                     else AlertSeverity.WARNING
                 )
+                alert_summary = (
+                    f"Freshness {status.value}: {min(staleness, 99999):.0f}m stale "
+                    f"(SLA warn={sla_warn}m, critical={sla_critical}m)"
+                )
+                alert_detail = {
+                    "staleness_minutes": round(min(staleness, 99999), 1),
+                    "sla_warn_minutes": sla_warn,
+                    "sla_critical_minutes": sla_critical,
+                }
+
+                # Generate narrative (Build 26)
+                downstream = await self.store.list_dependents(pipeline.pipeline_id)
+                recent_runs = await self.store.list_runs(pipeline.pipeline_id, limit=3)
+                recent_errors = [r.error for r in recent_runs if r.error]
+                try:
+                    narrative = await self.agent.generate_anomaly_narrative(
+                        pipeline_name=pipeline.pipeline_name,
+                        alert_summary=alert_summary,
+                        alert_detail=alert_detail,
+                        severity=severity.value,
+                        tier=pipeline.tier,
+                        downstream_count=len(downstream),
+                        recent_run_errors=recent_errors,
+                        freshness_info={"staleness_minutes": round(min(staleness, 99999), 1)},
+                        schedule_cron=pipeline.schedule_cron,
+                    )
+                except Exception:
+                    narrative = ""
+
                 alert = AlertRecord(
                     severity=severity,
                     tier=pipeline.tier,
                     pipeline_id=pipeline.pipeline_id,
                     pipeline_name=pipeline.pipeline_name,
-                    summary=(
-                        f"Freshness {status.value}: {min(staleness, 99999):.0f}m stale "
-                        f"(SLA warn={sla_warn}m, critical={sla_critical}m)"
-                    ),
-                    detail={
-                        "staleness_minutes": round(min(staleness, 99999), 1),
-                        "sla_warn_minutes": sla_warn,
-                        "sla_critical_minutes": sla_critical,
-                    },
+                    summary=alert_summary,
+                    detail=alert_detail,
+                    narrative=narrative,
                 )
                 await self.store.save_alert(alert)
                 if not digest_only:

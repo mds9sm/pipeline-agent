@@ -1903,6 +1903,120 @@ Respond with JSON:
         }
 
     # ------------------------------------------------------------------
+    # generate_anomaly_narrative (Build 26)
+    # ------------------------------------------------------------------
+
+    async def generate_anomaly_narrative(
+        self,
+        pipeline_name: str,
+        alert_summary: str,
+        alert_detail: dict,
+        severity: str,
+        tier: int,
+        downstream_count: int = 0,
+        recent_run_errors: Optional[list[str]] = None,
+        freshness_info: Optional[dict] = None,
+        schedule_cron: str = "",
+    ) -> str:
+        """Generate a human-readable anomaly narrative with root cause and impact.
+
+        Returns a 2-4 sentence narrative explaining what happened, why, and what's affected.
+        """
+        recent_run_errors = recent_run_errors or []
+
+        if not self.has_api:
+            return self._rule_based_narrative(
+                pipeline_name, alert_summary, alert_detail, severity,
+                tier, downstream_count, recent_run_errors, freshness_info, schedule_cron,
+            )
+
+        context_parts = [f"Alert: {alert_summary}"]
+        if alert_detail:
+            context_parts.append(f"Detail: {json.dumps(alert_detail)}")
+        if recent_run_errors:
+            context_parts.append(f"Recent errors: {'; '.join(recent_run_errors[:3])}")
+        if freshness_info:
+            context_parts.append(f"Freshness: {json.dumps(freshness_info)}")
+        if downstream_count > 0:
+            context_parts.append(f"Downstream pipelines affected: {downstream_count}")
+
+        prompt = f"""Write a concise anomaly narrative (2-4 sentences) for a data pipeline alert.
+
+Pipeline: {pipeline_name} (tier {tier}, schedule: {schedule_cron or 'unset'})
+Severity: {severity}
+{chr(10).join(context_parts)}
+
+The narrative should:
+1. State what happened in plain language
+2. Explain the likely root cause
+3. Describe downstream impact (if any)
+4. Suggest expected recovery timeline
+
+Write as a single paragraph. Be specific, not generic. Do not use JSON."""
+
+        try:
+            resp = await self._call_claude(prompt, max_tokens=300)
+            text = resp.get("text", "") if isinstance(resp, dict) else str(resp)
+            # Clean up — just return the text, no JSON
+            text = text.strip().strip('"')
+            if text and len(text) > 20:
+                return text
+        except Exception as e:
+            log.warning("Narrative generation failed: %s", e)
+
+        return self._rule_based_narrative(
+            pipeline_name, alert_summary, alert_detail, severity,
+            tier, downstream_count, recent_run_errors, freshness_info, schedule_cron,
+        )
+
+    def _rule_based_narrative(
+        self,
+        pipeline_name: str,
+        alert_summary: str,
+        alert_detail: dict,
+        severity: str,
+        tier: int,
+        downstream_count: int,
+        recent_run_errors: list[str],
+        freshness_info: Optional[dict],
+        schedule_cron: str,
+    ) -> str:
+        """Generate a narrative without AI."""
+        parts = [f"{pipeline_name}: {alert_summary}."]
+
+        # Root cause hint
+        if recent_run_errors:
+            first_error = recent_run_errors[0]
+            if "connection" in first_error.lower() or "refused" in first_error.lower():
+                parts.append(f"Root cause: source database connection failure ({first_error[:80]}).")
+            elif "timeout" in first_error.lower():
+                parts.append("Root cause: query or connection timeout — likely a slow source or network issue.")
+            elif "permission" in first_error.lower() or "denied" in first_error.lower():
+                parts.append("Root cause: authentication or permission error on the source system.")
+            else:
+                parts.append(f"Last error: {first_error[:100]}.")
+
+        # Freshness context
+        if freshness_info:
+            staleness = freshness_info.get("staleness_minutes", 0)
+            if staleness > 0:
+                hours = staleness / 60
+                if hours >= 1:
+                    parts.append(f"Data is {hours:.1f} hours stale.")
+                else:
+                    parts.append(f"Data is {staleness:.0f} minutes stale.")
+
+        # Downstream impact
+        if downstream_count > 0:
+            parts.append(f"This affects {downstream_count} downstream pipeline{'s' if downstream_count > 1 else ''}.")
+
+        # Recovery hint
+        if schedule_cron:
+            parts.append(f"Next scheduled run: {schedule_cron}.")
+
+        return " ".join(parts)
+
+    # ------------------------------------------------------------------
     # infer_semantic_tags (Build 26)
     # ------------------------------------------------------------------
 
