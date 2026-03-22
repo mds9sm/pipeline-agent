@@ -19,6 +19,7 @@ from contracts.models import (
     PipelineMetadata, SchemaChangePolicy, PostPromotionHook,
     DataContract, ContractViolation, ChatInteraction, PipelineChangeLog,
     PipelineChangeType, RegisteredSource, SqlTransform, MaterializationType,
+    MetricDefinition, MetricSnapshot, MetricType,
     ColumnMapping, QualityConfig, CheckResult,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
@@ -1536,6 +1537,78 @@ class ContractStore:
     async def delete_sql_transform(self, transform_id: str) -> None:
         await self.pool.execute("DELETE FROM sql_transforms WHERE transform_id = $1", transform_id)
 
+    # ==================================================================
+    # Metrics (Build 31)
+    # ==================================================================
+
+    async def save_metric(self, m: MetricDefinition) -> None:
+        await self.pool.execute("""
+            INSERT INTO metrics (
+                metric_id, pipeline_id, metric_name, description, sql_expression,
+                metric_type, dimensions, schedule_cron, tags,
+                created_by, enabled, created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ON CONFLICT (metric_id) DO UPDATE SET
+                metric_name=EXCLUDED.metric_name,
+                description=EXCLUDED.description,
+                sql_expression=EXCLUDED.sql_expression,
+                metric_type=EXCLUDED.metric_type,
+                dimensions=EXCLUDED.dimensions,
+                schedule_cron=EXCLUDED.schedule_cron,
+                tags=EXCLUDED.tags,
+                enabled=EXCLUDED.enabled,
+                updated_at=EXCLUDED.updated_at
+        """,
+            m.metric_id, m.pipeline_id, m.metric_name, m.description,
+            m.sql_expression,
+            m.metric_type.value if hasattr(m.metric_type, "value") else m.metric_type,
+            json.dumps(m.dimensions),
+            m.schedule_cron,
+            json.dumps(m.tags),
+            m.created_by, m.enabled, m.created_at, m.updated_at,
+        )
+
+    async def get_metric(self, metric_id: str) -> Optional[MetricDefinition]:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM metrics WHERE metric_id = $1", metric_id
+        )
+        return _row_to_metric(row) if row else None
+
+    async def list_metrics(self, pipeline_id: str = "") -> list[MetricDefinition]:
+        if pipeline_id:
+            rows = await self.pool.fetch(
+                "SELECT * FROM metrics WHERE pipeline_id = $1 ORDER BY created_at DESC", pipeline_id
+            )
+        else:
+            rows = await self.pool.fetch("SELECT * FROM metrics ORDER BY created_at DESC")
+        return [_row_to_metric(r) for r in rows]
+
+    async def delete_metric(self, metric_id: str) -> None:
+        await self.pool.execute("DELETE FROM metric_snapshots WHERE metric_id = $1", metric_id)
+        await self.pool.execute("DELETE FROM metrics WHERE metric_id = $1", metric_id)
+
+    async def save_metric_snapshot(self, s: MetricSnapshot) -> None:
+        await self.pool.execute("""
+            INSERT INTO metric_snapshots (
+                snapshot_id, metric_id, pipeline_id, computed_at,
+                value, dimension_values, metadata
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+        """,
+            s.snapshot_id, s.metric_id, s.pipeline_id, s.computed_at,
+            s.value,
+            json.dumps(s.dimension_values),
+            json.dumps(s.metadata),
+        )
+
+    async def list_metric_snapshots(
+        self, metric_id: str, limit: int = 100,
+    ) -> list[MetricSnapshot]:
+        rows = await self.pool.fetch(
+            "SELECT * FROM metric_snapshots WHERE metric_id = $1 ORDER BY computed_at DESC LIMIT $2",
+            metric_id, limit,
+        )
+        return [_row_to_metric_snapshot(r) for r in rows]
+
     async def get_pipeline_by_target_table(self, target_table: str):
         """Look up a pipeline by its target table name (used for ref() resolution)."""
         row = await self.pool.fetchrow(
@@ -1988,6 +2061,41 @@ def _row_to_sql_transform(row: asyncpg.Record) -> SqlTransform:
     )
 
 
+def _row_to_metric(row: asyncpg.Record) -> MetricDefinition:
+    mt = row.get("metric_type", "custom")
+    try:
+        mt = MetricType(mt)
+    except ValueError:
+        mt = MetricType.CUSTOM
+    return MetricDefinition(
+        metric_id=row["metric_id"],
+        pipeline_id=row["pipeline_id"],
+        metric_name=row.get("metric_name", ""),
+        description=row.get("description", ""),
+        sql_expression=row.get("sql_expression", ""),
+        metric_type=mt,
+        dimensions=json.loads(row["dimensions"]) if row.get("dimensions") else [],
+        schedule_cron=row.get("schedule_cron", ""),
+        tags=json.loads(row["tags"]) if row.get("tags") else {},
+        created_by=row.get("created_by", "agent"),
+        enabled=row.get("enabled", True),
+        created_at=row.get("created_at", ""),
+        updated_at=row.get("updated_at", ""),
+    )
+
+
+def _row_to_metric_snapshot(row: asyncpg.Record) -> MetricSnapshot:
+    return MetricSnapshot(
+        snapshot_id=row["snapshot_id"],
+        metric_id=row["metric_id"],
+        pipeline_id=row["pipeline_id"],
+        computed_at=row.get("computed_at", ""),
+        value=float(row.get("value", 0.0)),
+        dimension_values=json.loads(row["dimension_values"]) if row.get("dimension_values") else {},
+        metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+    )
+
+
 # ======================================================================
 # DDL for create_tables() -- dev/test convenience
 # ======================================================================
@@ -2435,6 +2543,36 @@ CREATE INDEX IF NOT EXISTS idx_data_contracts_consumer ON data_contracts(consume
 CREATE INDEX IF NOT EXISTS idx_data_contracts_status ON data_contracts(status);
 CREATE INDEX IF NOT EXISTS idx_contract_violations_contract ON contract_violations(contract_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_contract_violations_unresolved ON contract_violations(resolved) WHERE resolved = FALSE;
+
+-- Build 31: Metrics / KPI layer
+CREATE TABLE IF NOT EXISTS metrics (
+    metric_id TEXT PRIMARY KEY,
+    pipeline_id TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    sql_expression TEXT NOT NULL DEFAULT '',
+    metric_type TEXT NOT NULL DEFAULT 'custom',
+    dimensions JSONB NOT NULL DEFAULT '[]',
+    schedule_cron TEXT NOT NULL DEFAULT '',
+    tags JSONB NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT 'agent',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_pipeline ON metrics(pipeline_id);
+
+CREATE TABLE IF NOT EXISTS metric_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    metric_id TEXT NOT NULL,
+    pipeline_id TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    value DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    dimension_values JSONB NOT NULL DEFAULT '{}',
+    metadata JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_metric_snapshots_metric ON metric_snapshots(metric_id, computed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_metric_snapshots_pipeline ON metric_snapshots(pipeline_id, computed_at DESC);
 """
 
 _ALTER_TABLES_SQL = """

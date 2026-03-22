@@ -2740,6 +2740,143 @@ fi
 fi # --api (Build 29)
 
 # ============================================================================
+# Build 31: Metrics / KPI Layer
+# ============================================================================
+
+if [ -z "$SKIP_API" ]; then
+
+echo ""
+echo -e "${BOLD}${CYAN}--- Metrics / KPI Layer (Build 31) ---${NC}"
+
+# We need a pipeline_id for metrics tests
+FIRST_PID=$(curl -s "$API_URL/api/pipelines" -H "Authorization: Bearer $TOKEN" | jq -r '.[0].pipeline_id // empty' 2>/dev/null)
+
+if [ -z "$FIRST_PID" ]; then
+    skip "No pipelines found, skipping metrics tests"
+else
+
+# Test 1: Suggest metrics for a pipeline
+test_name "POST /api/metrics/suggest/{pipeline_id}"
+echo -n "  Suggest metrics... "
+CODE=$(curl -s -o /tmp/pa_suggest.json -w '%{http_code}' \
+    -X POST "$API_URL/api/metrics/suggest/$FIRST_PID" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+if [ "$CODE" = "200" ]; then
+    SCOUNT=$(jq '.suggestions | length' /tmp/pa_suggest.json 2>/dev/null)
+    if [ "$SCOUNT" -gt 0 ] 2>/dev/null; then
+        pass "Agent suggested $SCOUNT metrics"
+    else
+        warn "Suggest returned 200 but no suggestions"
+    fi
+else
+    fail "Suggest metrics returned HTTP $CODE"
+fi
+
+# Test 2: Create a metric (agent generates SQL from description)
+test_name "POST /api/metrics (create)"
+echo -n "  Create metric... "
+CODE=$(curl -s -o /tmp/pa_metric_create.json -w '%{http_code}' \
+    -X POST "$API_URL/api/metrics" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"pipeline_id\": \"$FIRST_PID\", \"metric_name\": \"test_row_count\", \"description\": \"Total row count in target table\"}")
+if [ "$CODE" = "200" ]; then
+    METRIC_ID=$(jq -r '.metric_id' /tmp/pa_metric_create.json 2>/dev/null)
+    pass "Metric created: ${METRIC_ID:0:8}"
+else
+    fail "Create metric returned HTTP $CODE"
+    METRIC_ID=""
+fi
+
+# Test 3: List metrics
+test_name "GET /api/metrics"
+echo -n "  List metrics... "
+CODE=$(curl -s -o /tmp/pa_metrics_list.json -w '%{http_code}' \
+    "$API_URL/api/metrics?pipeline_id=$FIRST_PID" \
+    -H "Authorization: Bearer $TOKEN")
+if [ "$CODE" = "200" ]; then
+    MCOUNT=$(jq '.metrics | length' /tmp/pa_metrics_list.json 2>/dev/null)
+    pass "Listed $MCOUNT metric(s)"
+else
+    fail "List metrics returned HTTP $CODE"
+fi
+
+# Test 4: Get metric detail
+if [ -n "$METRIC_ID" ]; then
+test_name "GET /api/metrics/{metric_id}"
+echo -n "  Get metric detail... "
+CODE=$(curl -s -o /tmp/pa_metric_detail.json -w '%{http_code}' \
+    "$API_URL/api/metrics/$METRIC_ID" \
+    -H "Authorization: Bearer $TOKEN")
+if [ "$CODE" = "200" ]; then
+    MNAME=$(jq -r '.metric_name' /tmp/pa_metric_detail.json 2>/dev/null)
+    pass "Got metric: $MNAME"
+else
+    fail "Get metric returned HTTP $CODE"
+fi
+fi
+
+# Test 5: Update metric
+if [ -n "$METRIC_ID" ]; then
+test_name "PATCH /api/metrics/{metric_id}"
+echo -n "  Update metric... "
+CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X PATCH "$API_URL/api/metrics/$METRIC_ID" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"description": "Updated description for test"}')
+if [ "$CODE" = "200" ]; then
+    pass "Metric updated"
+else
+    fail "Update metric returned HTTP $CODE"
+fi
+fi
+
+# Test 6: Trend analysis (may have insufficient data)
+if [ -n "$METRIC_ID" ]; then
+test_name "GET /api/metrics/{metric_id}/trend"
+echo -n "  Metric trend... "
+CODE=$(curl -s -o /tmp/pa_metric_trend.json -w '%{http_code}' \
+    "$API_URL/api/metrics/$METRIC_ID/trend" \
+    -H "Authorization: Bearer $TOKEN")
+if [ "$CODE" = "200" ]; then
+    pass "Trend endpoint returned 200"
+else
+    fail "Trend returned HTTP $CODE"
+fi
+fi
+
+# Test 7: Delete metric
+if [ -n "$METRIC_ID" ]; then
+test_name "DELETE /api/metrics/{metric_id}"
+echo -n "  Delete metric... "
+CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE "$API_URL/api/metrics/$METRIC_ID" \
+    -H "Authorization: Bearer $TOKEN")
+if [ "$CODE" = "200" ]; then
+    pass "Metric deleted"
+else
+    fail "Delete metric returned HTTP $CODE"
+fi
+fi
+
+# Test 8: Chat routing — suggest metrics
+test_name "Chat: suggest metrics"
+echo -n "  Chat suggest metrics... "
+RESP=$(curl -s -X POST "$API_URL/api/chat" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"text": "suggest some KPI metrics for my pipeline"}')
+ROUTED_ACTION=$(echo "$RESP" | jq -r '.action // empty' 2>/dev/null)
+RESP_TEXT=$(echo "$RESP" | jq -r '.response // empty' 2>/dev/null)
+if [ -n "$RESP_TEXT" ]; then
+    pass "Chat returned response for metric suggestion"
+else
+    warn "Chat returned empty response"
+fi
+
+fi # FIRST_PID check
+
+fi # --api (Build 31)
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -2804,6 +2941,7 @@ echo "  - Agent diagnostics: diagnose, impact, anomalies, chat routing (Build 24
 echo "  - Data catalog: search, detail, trust, columns, stats, semantic tags, context, weights (Build 26)"
 echo "  - MCP server: import, resources, tools (Build 27)"
 echo "  - SQL transforms: CRUD, lineage, generate, chat routing (Build 29)"
+echo "  - Metrics / KPIs: suggest, create, list, get, update, trend, delete, chat (Build 31)"
 echo "  - GitOps API: status, log, diff, pipeline history, restore dry-run (Build 23)"
 echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21)"
 echo "  - Interaction audit: list, export (Build 21)"

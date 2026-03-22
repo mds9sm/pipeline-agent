@@ -1084,6 +1084,34 @@ def create_app(
                     lines.append(f"\n{anomalies['summary']}")
                 result_data = {"anomalies": anomalies, "fallback_text": "\n".join(lines)}
 
+            elif action == "suggest_metrics":
+                # Agent suggests KPI metrics for a pipeline
+                _pid = params.get("pipeline_id", "")
+                _p = await store.get_pipeline(_pid) if _pid else None
+                if _p:
+                    _cols = _p.column_mappings if _p.column_mappings else []
+                    suggestions = await agent.suggest_metrics(_p, _cols, _p.business_context or {})
+                    result_data = {"pipeline_id": _pid, "pipeline_name": _p.pipeline_name,
+                                   "suggestions": suggestions,
+                                   "fallback_text": f"Here are suggested metrics for {_p.pipeline_name}."}
+                else:
+                    result_data = {"fallback_text": "Please specify which pipeline to suggest metrics for."}
+
+            elif action == "interpret_metric_trend":
+                # Agent interprets a metric's trend
+                _mid = params.get("metric_id", "")
+                _m = await store.get_metric(_mid) if _mid else None
+                if _m:
+                    _snaps = await store.list_metric_snapshots(_mid, limit=50)
+                    _snap_dicts = [{"computed_at": s.computed_at, "value": s.value} for s in _snaps]
+                    _p = await store.get_pipeline(_m.pipeline_id)
+                    _pctx = {"pipeline_name": _p.pipeline_name, "target_table": _p.target_table} if _p else {}
+                    analysis = await agent.interpret_metric_trend(_m.metric_name, _snap_dicts, _pctx)
+                    result_data = {"metric_id": _mid, "metric_name": _m.metric_name, **analysis,
+                                   "fallback_text": f"Trend analysis for {_m.metric_name}."}
+                else:
+                    result_data = {"fallback_text": "Please specify which metric to analyze."}
+
             elif action == "explain":
                 # explain is inherently conversational — pass through
                 result_data = {
@@ -5087,6 +5115,276 @@ def create_app(
         resolved = resolve_vars(resolved, t.variables)
         lineage = parse_column_lineage(resolved, t.target_table or t.transform_name, refs)
         return {"transform_id": transform_id, "lineage": lineage, "refs": refs}
+
+    # -----------------------------------------------------------------------
+    # Metrics / KPI layer (Build 31)
+    # -----------------------------------------------------------------------
+
+    @app.post("/api/metrics/suggest/{pipeline_id}")
+    async def suggest_metrics(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Agent suggests KPI metrics for a pipeline's target table."""
+        require_role(caller, "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        columns = [
+            {"target_column": cm.target_column, "source_column": cm.source_column,
+             "target_type": cm.target_type, "is_nullable": cm.is_nullable,
+             "is_primary_key": cm.is_primary_key}
+            for cm in (p.column_mappings or [])
+        ]
+        suggestions = await agent.suggest_metrics(p, columns, p.business_context or {})
+        return {"pipeline_id": pipeline_id, "suggestions": suggestions}
+
+    class CreateMetricRequest(BaseModel):
+        pipeline_id: str
+        metric_name: str
+        description: str = ""
+        sql_expression: str = ""
+        metric_type: str = "custom"
+        dimensions: list = []
+        schedule_cron: str = ""
+        tags: dict = {}
+
+    @app.post("/api/metrics")
+    async def create_metric(
+        request: Request,
+        body: CreateMetricRequest,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Create a metric. If sql_expression is empty, agent generates it from description."""
+        require_role(caller, "operator")
+        from contracts.models import MetricDefinition, MetricType
+
+        p = await store.get_pipeline(body.pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        sql_expr = body.sql_expression
+        metric_type = body.metric_type
+
+        # Agent generates SQL if not provided
+        if not sql_expr and body.description:
+            columns = [
+                {"target_column": cm.target_column, "source_column": cm.source_column,
+                 "target_type": cm.target_type}
+                for cm in (p.column_mappings or [])
+            ]
+            target_table = f"{p.target_schema}.{p.target_table}"
+            generated = await agent.generate_metric_sql(body.description, target_table, columns)
+            sql_expr = generated.get("sql_expression", "")
+            metric_type = generated.get("metric_type", metric_type)
+
+        try:
+            mt = MetricType(metric_type.lower())
+        except (ValueError, AttributeError):
+            mt = MetricType.CUSTOM
+
+        metric = MetricDefinition(
+            pipeline_id=body.pipeline_id,
+            metric_name=body.metric_name,
+            description=body.description,
+            sql_expression=sql_expr,
+            metric_type=mt,
+            dimensions=body.dimensions,
+            schedule_cron=body.schedule_cron,
+            tags=body.tags,
+            created_by=caller.get("username", "api"),
+        )
+        await store.save_metric(metric)
+        return {"metric_id": metric.metric_id, "metric_name": metric.metric_name,
+                "sql_expression": sql_expr, "status": "created"}
+
+    @app.get("/api/metrics")
+    async def list_metrics(
+        request: Request,
+        pipeline_id: str = "",
+        caller: dict = Depends(auth_dep),
+    ):
+        """List metrics, optionally filtered by pipeline."""
+        metrics = await store.list_metrics(pipeline_id)
+        return [
+            {"metric_id": m.metric_id, "pipeline_id": m.pipeline_id,
+             "metric_name": m.metric_name, "description": m.description,
+             "metric_type": m.metric_type.value if hasattr(m.metric_type, "value") else m.metric_type,
+             "sql_expression": m.sql_expression,
+             "dimensions": m.dimensions, "schedule_cron": m.schedule_cron,
+             "tags": m.tags, "enabled": m.enabled, "created_by": m.created_by,
+             "created_at": m.created_at}
+            for m in metrics
+        ]
+
+    @app.get("/api/metrics/{metric_id}")
+    async def get_metric(
+        request: Request,
+        metric_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get metric detail with recent snapshots."""
+        m = await store.get_metric(metric_id)
+        if not m:
+            raise HTTPException(404, "Metric not found")
+        snapshots = await store.list_metric_snapshots(metric_id, limit=50)
+        return {
+            "metric_id": m.metric_id, "pipeline_id": m.pipeline_id,
+            "metric_name": m.metric_name, "description": m.description,
+            "metric_type": m.metric_type.value if hasattr(m.metric_type, "value") else m.metric_type,
+            "sql_expression": m.sql_expression,
+            "dimensions": m.dimensions, "schedule_cron": m.schedule_cron,
+            "tags": m.tags, "enabled": m.enabled, "created_by": m.created_by,
+            "created_at": m.created_at,
+            "snapshots": [
+                {"snapshot_id": s.snapshot_id, "computed_at": s.computed_at,
+                 "value": s.value, "dimension_values": s.dimension_values,
+                 "metadata": s.metadata}
+                for s in snapshots
+            ],
+        }
+
+    @app.post("/api/metrics/{metric_id}/compute")
+    async def compute_metric(
+        request: Request,
+        metric_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Compute a metric now by executing its SQL against the target database."""
+        require_role(caller, "operator")
+        from contracts.models import MetricSnapshot, now_iso
+
+        m = await store.get_metric(metric_id)
+        if not m:
+            raise HTTPException(404, "Metric not found")
+        p = await store.get_pipeline(m.pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline for metric not found")
+
+        # Resolve target connector and execute SQL
+        try:
+            tgt_params = {}
+            if p.target_host:
+                tgt_params["host"] = p.target_host
+            if p.target_port:
+                tgt_params["port"] = p.target_port
+            if p.target_database:
+                tgt_params["database"] = p.target_database
+            if p.target_user:
+                tgt_params["user"] = p.target_user
+            if p.target_password:
+                from crypto import decrypt_dict, CREDENTIAL_FIELDS
+                creds = decrypt_dict({"password": p.target_password}, CREDENTIAL_FIELDS)
+                tgt_params["password"] = creds.get("password", "")
+            if p.target_options:
+                tgt_params.update(p.target_options)
+
+            target = await registry.get_target(p.target_connector_id, tgt_params)
+            conn = await target.test_connection()
+            if not conn.success:
+                raise HTTPException(500, f"Cannot connect to target: {conn.message}")
+
+            # Execute the metric SQL
+            import time as _time
+            t0 = _time.monotonic()
+            result = await target.execute_sql(m.sql_expression)
+            elapsed_ms = int((_time.monotonic() - t0) * 1000)
+
+            # Extract value from result
+            value = 0.0
+            if result and len(result) > 0:
+                row = result[0]
+                if isinstance(row, dict):
+                    value = float(row.get("value", row.get(list(row.keys())[0], 0)))
+                elif isinstance(row, (list, tuple)):
+                    value = float(row[0])
+                else:
+                    value = float(row)
+
+            snapshot = MetricSnapshot(
+                metric_id=m.metric_id,
+                pipeline_id=m.pipeline_id,
+                value=value,
+                metadata={"elapsed_ms": elapsed_ms, "sql": m.sql_expression},
+            )
+            await store.save_metric_snapshot(snapshot)
+
+            return {"snapshot_id": snapshot.snapshot_id, "value": value,
+                    "computed_at": snapshot.computed_at, "elapsed_ms": elapsed_ms}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"Metric computation failed: {e}")
+
+    @app.get("/api/metrics/{metric_id}/trend")
+    async def metric_trend(
+        request: Request,
+        metric_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Agent interprets the metric's time-series trend."""
+        m = await store.get_metric(metric_id)
+        if not m:
+            raise HTTPException(404, "Metric not found")
+        snapshots = await store.list_metric_snapshots(metric_id, limit=50)
+        if len(snapshots) < 2:
+            return {"metric_id": metric_id, "trend": "insufficient_data",
+                    "interpretation": "Need at least 2 data points for trend analysis."}
+
+        p = await store.get_pipeline(m.pipeline_id)
+        snap_dicts = [{"computed_at": s.computed_at, "value": s.value} for s in snapshots]
+        pipeline_ctx = {
+            "pipeline_name": p.pipeline_name if p else "unknown",
+            "tier": p.tier if p else 2,
+            "business_context": p.business_context if p else {},
+        }
+        analysis = await agent.interpret_metric_trend(m.metric_name, snap_dicts, pipeline_ctx)
+        return {"metric_id": metric_id, "metric_name": m.metric_name, **analysis}
+
+    @app.patch("/api/metrics/{metric_id}")
+    async def update_metric(
+        request: Request,
+        metric_id: str,
+        body: dict = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Update metric fields."""
+        require_role(caller, "operator")
+        from contracts.models import MetricType, now_iso
+        m = await store.get_metric(metric_id)
+        if not m:
+            raise HTTPException(404, "Metric not found")
+        for field in ("metric_name", "description", "sql_expression", "schedule_cron", "enabled"):
+            if field in body:
+                setattr(m, field, body[field])
+        if "tags" in body:
+            m.tags = body["tags"]
+        if "dimensions" in body:
+            m.dimensions = body["dimensions"]
+        if "metric_type" in body:
+            try:
+                m.metric_type = MetricType(body["metric_type"].lower())
+            except (ValueError, AttributeError):
+                pass
+        m.updated_at = now_iso()
+        await store.save_metric(m)
+        return {"metric_id": metric_id, "status": "updated"}
+
+    @app.delete("/api/metrics/{metric_id}")
+    async def delete_metric(
+        request: Request,
+        metric_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Delete a metric and all its snapshots."""
+        require_role(caller, "admin")
+        m = await store.get_metric(metric_id)
+        if not m:
+            raise HTTPException(404, "Metric not found")
+        await store.delete_metric(metric_id)
+        return {"metric_id": metric_id, "status": "deleted"}
 
     # -----------------------------------------------------------------------
     # Serve static UI

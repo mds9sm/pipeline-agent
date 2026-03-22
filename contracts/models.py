@@ -969,3 +969,41 @@ class SqlTransform:
     pipeline_id: str = ""
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
+
+
+# ── Build 31: Metrics / KPI layer ─────────────────────────────────────
+
+class MetricType(str, Enum):
+    COUNT = "count"
+    SUM = "sum"
+    AVG = "avg"
+    RATIO = "ratio"
+    CUSTOM = "custom"
+
+
+@dataclass
+class MetricDefinition:
+    metric_id: str = field(default_factory=new_id)
+    pipeline_id: str = ""
+    metric_name: str = ""
+    description: str = ""
+    sql_expression: str = ""
+    metric_type: MetricType = MetricType.CUSTOM
+    dimensions: list = field(default_factory=list)
+    schedule_cron: str = ""
+    tags: dict = field(default_factory=dict)
+    created_by: str = "agent"
+    enabled: bool = True
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class MetricSnapshot:
+    snapshot_id: str = field(default_factory=new_id)
+    metric_id: str = ""
+    pipeline_id: str = ""
+    computed_at: str = field(default_factory=now_iso)
+    value: float = 0.0
+    dimension_values: dict = field(default_factory=dict)
+    metadata: dict = field(default_factory=dict)

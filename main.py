@@ -27,7 +27,7 @@ import uvicorn
 
 from config import Config
 from contracts.store import Store
-from contracts.models import now_iso, RunStatus
+from contracts.models import now_iso, RunStatus, MetricSnapshot
 from connectors.registry import ConnectorRegistry
 from staging.local import LocalStagingManager
 from agent.core import AgentCore
@@ -61,11 +61,12 @@ def setup_data_dirs(config: Config):
     os.makedirs(config.contracts_dir, exist_ok=True)
 
 
-async def observability_loop(config: Config, store: Store, agent: AgentCore, gitops=None):
+async def observability_loop(config: Config, store: Store, agent: AgentCore, registry=None, gitops=None):
     """
     30s base tick:
     - Daily digest at 9 AM UTC via agent.generate_digest()
     - Quality trend summary every 15m (logged)
+    - Scheduled metric computation every 5m
     - GitOps reconciliation every 5m when conflicts detected
     """
     log.info("Observability loop started.")
@@ -87,6 +88,10 @@ async def observability_loop(config: Config, store: Store, agent: AgentCore, git
             if tick % 30 == 0:
                 await _log_quality_summary(store)
                 await _check_anomalies(store, agent)
+
+            # Scheduled metric computation every 5m (10 ticks x 30s)
+            if registry and tick % 10 == 0:
+                await _compute_scheduled_metrics(store, registry)
 
             # GitOps reconciliation every 5m (10 ticks x 30s) when conflicts detected
             if gitops and gitops.needs_reconcile and tick % 10 == 0:
@@ -163,6 +168,58 @@ async def _check_anomalies(store: Store, agent):
             log.info("Anomaly reasoning: no anomalies detected.")
     except Exception as e:
         log.warning("Anomaly reasoning failed: %s", e)
+
+
+async def _compute_scheduled_metrics(store: Store, registry):
+    """Compute all enabled metrics that have a schedule_cron set."""
+    try:
+        metrics = await store.list_metrics()
+        enabled = [m for m in metrics if m.enabled and m.schedule_cron]
+        if not enabled:
+            return
+        for m in enabled:
+            try:
+                p = await store.get_pipeline(m.pipeline_id)
+                if not p:
+                    continue
+                tgt_params = {}
+                if p.target_host:
+                    tgt_params["host"] = p.target_host
+                if p.target_port:
+                    tgt_params["port"] = p.target_port
+                if p.target_database:
+                    tgt_params["database"] = p.target_database
+                if p.target_user:
+                    tgt_params["user"] = p.target_user
+                if p.target_password:
+                    from crypto import decrypt_dict, CREDENTIAL_FIELDS
+                    creds = decrypt_dict({"password": p.target_password}, CREDENTIAL_FIELDS)
+                    tgt_params["password"] = creds.get("password", "")
+                if p.target_options:
+                    tgt_params.update(p.target_options)
+                target = await registry.get_target(p.target_connector_id, tgt_params)
+                result = await target.execute_sql(m.sql_expression, timeout_seconds=30)
+                value = 0.0
+                if result and len(result) > 0:
+                    row = result[0]
+                    if isinstance(row, dict):
+                        value = float(row.get("value", row.get(list(row.keys())[0], 0)))
+                    elif isinstance(row, (list, tuple)):
+                        value = float(row[0])
+                    else:
+                        value = float(row)
+                snapshot = MetricSnapshot(
+                    metric_id=m.metric_id,
+                    pipeline_id=m.pipeline_id,
+                    value=value,
+                    metadata={"source": "scheduled"},
+                )
+                await store.save_metric_snapshot(snapshot)
+                log.info("Metric %s (%s) computed: %.4f", m.metric_id[:8], m.metric_name, value)
+            except Exception as e:
+                log.warning("Metric %s computation failed: %s", m.metric_id[:8], e)
+    except Exception as e:
+        log.warning("Scheduled metrics sweep failed: %s", e)
 
 
 async def _gitops_reconcile(store: Store, gitops):
@@ -329,7 +386,7 @@ async def main():
             server.serve(),
             scheduler.run_forever(),
             monitor.run_forever(),
-            observability_loop(config, store, agent, gitops=gitops),
+            observability_loop(config, store, agent, registry=registry, gitops=gitops),
             _demo_bootstrap_task(),
         )
 

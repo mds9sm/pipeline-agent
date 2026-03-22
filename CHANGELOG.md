@@ -25,12 +25,59 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 27 | MCP server | **Done** | Expose DAPOS to AI agents via Model Context Protocol (resources, tools, prompts) |
 | 29 | Native SQL transforms | **Done** | Replace dbt with in-pipeline SQL transforms — ref(), var(), materialization, AI generation |
 | 30 | Fully agentic failure detection & quality | **Done** | Agent decides quality gate, diagnoses failures, reasons about freshness/anomalies/contracts |
-| 31 | Dashboard / metrics layer | Planned | Lightweight KPI definitions on catalog tables |
+| 31 | Dashboard / metrics layer | **Done** | Lightweight KPI definitions on catalog tables, agentic suggest/generate/interpret |
 | 28 | Context API enrichment | Planned | Auto-context on pipeline runs, cross-pipeline context propagation |
 
 ---
 
 ## [Unreleased]
+
+### Build 31: Dashboard / Metrics Layer — 2026-03-22 (Claude Opus 4.6)
+
+**Lightweight KPI definitions on pipeline target tables with agentic nature at the core — agent suggests metrics, generates SQL from plain English, and interprets time-series trends.**
+
+#### Added
+- **Data model** (`contracts/models.py`):
+  - `MetricType` enum (count, sum, avg, ratio, custom)
+  - `MetricDefinition` dataclass — pipeline-scoped metric with SQL expression, schedule, dimensions, tags
+  - `MetricSnapshot` dataclass — point-in-time computed value with dimension values and metadata
+- **Store layer** (`contracts/store.py`):
+  - `metrics` + `metric_snapshots` tables with auto-migration
+  - Full CRUD: `save_metric`, `get_metric`, `list_metrics`, `delete_metric`, `save_metric_snapshot`, `list_metric_snapshots`
+- **Agent reasoning** (`agent/core.py`):
+  - `suggest_metrics()` — agent analyzes pipeline schema and business context, proposes 3-5 KPIs with rationale
+  - `generate_metric_sql()` — agent writes SQL from plain-English description against target table schema
+  - `interpret_metric_trend()` — agent analyzes time-series snapshots, returns direction/narrative/anomalies/recommendation
+  - Rule-based fallbacks: `_rule_based_suggest_metrics()`, `_rule_based_generate_metric_sql()`, `_rule_based_interpret_trend()`
+  - `route_command` updated with `suggest_metrics` and `interpret_metric_trend` actions
+- **REST API** (`api/server.py`):
+  - `POST /api/metrics/suggest/{pipeline_id}` — agent suggests metrics
+  - `POST /api/metrics` — create metric (agent generates SQL if not provided)
+  - `GET /api/metrics` — list metrics, optional pipeline_id filter
+  - `GET /api/metrics/{metric_id}` — detail with recent snapshots
+  - `POST /api/metrics/{metric_id}/compute` — execute SQL against target, store snapshot
+  - `GET /api/metrics/{metric_id}/trend` — agent trend interpretation
+  - `PATCH /api/metrics/{metric_id}` — update fields
+  - `DELETE /api/metrics/{metric_id}` — delete metric and snapshots
+  - Chat dispatch for `suggest_metrics` and `interpret_metric_trend` actions
+- **Scheduled computation** (`main.py`):
+  - Observability loop computes enabled metrics with `schedule_cron` every 5 minutes
+  - `_compute_scheduled_metrics()` helper with per-metric error isolation
+- **UI** (`ui/App.jsx`):
+  - `MetricsView` component — pipeline filter, suggest button, sparkline cards, expandable detail
+  - Agent suggestions panel with one-click "Create" from suggestion
+  - Compute Now button, trend narrative display, snapshot history table
+  - SVG sparkline visualization of recent values
+  - Nav: "Metrics" tab with `^` icon
+- **Tests** (`test-pipeline-agent.sh`):
+  - 8 tests: suggest, create, list, get, update, trend, delete, chat routing
+- **Documentation** (`docs/concepts/metrics.md`):
+  - Full reference: data model, API endpoints, chat integration, agentic architecture
+
+#### Changed
+- `ui/index.html` — cache bust v=47 → v=48
+
+---
 
 ### Build 30c: Runtime Agent Context — 2026-03-22 (Claude Opus 4.6)
 

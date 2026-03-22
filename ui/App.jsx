@@ -760,6 +760,7 @@ const NAV = [
   { id: "dag", label: "Lineage", icon: "%" },
   { id: "connectors", label: "Connectors", icon: "@" },
   { id: "alerts", label: "Alerts", icon: "!" },
+  { id: "metrics", label: "Metrics", icon: "^" },
   { id: "costs", label: "Costs", icon: "$" },
   { id: "docs", label: "Docs", icon: "i" },
 ];
@@ -3853,6 +3854,245 @@ function CostsView() {
 }
 
 // ---------------------------------------------------------------------------
+// Metrics View (Build 31)
+// ---------------------------------------------------------------------------
+
+function MetricsView() {
+  const [metrics, setMetrics] = useState([]);
+  const [pipelines, setPipelines] = useState([]);
+  const [selectedPipeline, setSelectedPipeline] = useState("");
+  const [expanded, setExpanded] = useState(null);
+  const [snapshots, setSnapshots] = useState({});
+  const [trend, setTrend] = useState({});
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestions, setSuggestions] = useState(null);
+  const [creating, setCreating] = useState(false);
+  const [computing, setComputing] = useState(null);
+
+  const loadMetrics = useCallback(() => {
+    const url = selectedPipeline ? `/api/metrics?pipeline_id=${selectedPipeline}` : "/api/metrics";
+    api("GET", url).then((r) => setMetrics(r.metrics || [])).catch(console.error);
+  }, [selectedPipeline]);
+
+  useEffect(() => {
+    api("GET", "/api/pipelines").then((r) => setPipelines(r.pipelines || [])).catch(console.error);
+  }, []);
+
+  useEffect(() => { loadMetrics(); }, [loadMetrics]);
+
+  const handleExpand = (mid) => {
+    if (expanded === mid) { setExpanded(null); return; }
+    setExpanded(mid);
+    api("GET", `/api/metrics/${mid}`).then((r) => {
+      setSnapshots((p) => ({ ...p, [mid]: r.snapshots || [] }));
+    }).catch(console.error);
+    api("GET", `/api/metrics/${mid}/trend`).then((r) => {
+      setTrend((p) => ({ ...p, [mid]: r }));
+    }).catch(console.error);
+  };
+
+  const handleSuggest = async () => {
+    if (!selectedPipeline) return;
+    setSuggesting(true);
+    try {
+      const r = await api("POST", `/api/metrics/suggest/${selectedPipeline}`);
+      setSuggestions(r.suggestions || []);
+    } catch (e) { console.error(e); }
+    setSuggesting(false);
+  };
+
+  const handleCreateFromSuggestion = async (s) => {
+    setCreating(true);
+    try {
+      await api("POST", "/api/metrics", {
+        pipeline_id: selectedPipeline,
+        metric_name: s.metric_name,
+        description: s.description || s.rationale || "",
+        metric_type: s.metric_type || "custom",
+      });
+      loadMetrics();
+      setSuggestions((prev) => prev.filter((x) => x.metric_name !== s.metric_name));
+    } catch (e) { console.error(e); }
+    setCreating(false);
+  };
+
+  const handleCompute = async (mid) => {
+    setComputing(mid);
+    try {
+      const r = await api("POST", `/api/metrics/${mid}/compute`);
+      setSnapshots((p) => ({ ...p, [mid]: [r, ...(p[mid] || [])] }));
+    } catch (e) { console.error(e); }
+    setComputing(null);
+  };
+
+  const handleDelete = async (mid) => {
+    try {
+      await api("DELETE", `/api/metrics/${mid}`);
+      loadMetrics();
+      if (expanded === mid) setExpanded(null);
+    } catch (e) { console.error(e); }
+  };
+
+  // Mini sparkline SVG
+  const Sparkline = ({ data }) => {
+    if (!data || data.length < 2) return null;
+    const vals = data.map((d) => d.value);
+    const mn = Math.min(...vals), mx = Math.max(...vals);
+    const range = mx - mn || 1;
+    const w = 120, h = 32;
+    const points = vals.map((v, i) => `${(i / (vals.length - 1)) * w},${h - ((v - mn) / range) * h}`).join(" ");
+    return (
+      <svg width={w} height={h} className="inline-block ml-2">
+        <polyline points={points} fill="none" stroke="#6366f1" strokeWidth="1.5" />
+      </svg>
+    );
+  };
+
+  return (
+    <div className="px-6 py-4">
+      <h1 className="text-lg font-semibold mb-4 text-stone-800">Metrics & KPIs</h1>
+
+      <div className="flex items-center gap-3 mb-4 flex-wrap">
+        <select
+          value={selectedPipeline}
+          onChange={(e) => setSelectedPipeline(e.target.value)}
+          className="text-sm border border-stone-200 rounded-lg px-3 py-1.5 bg-white text-stone-600"
+        >
+          <option value="">All pipelines</option>
+          {pipelines.map((p) => (
+            <option key={p.pipeline_id} value={p.pipeline_id}>{p.pipeline_name}</option>
+          ))}
+        </select>
+        {selectedPipeline && (
+          <button
+            onClick={handleSuggest}
+            disabled={suggesting}
+            className="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {suggesting ? "Thinking..." : "Suggest Metrics"}
+          </button>
+        )}
+      </div>
+
+      {suggestions && suggestions.length > 0 && (
+        <div className="mb-6 bg-indigo-50 border border-indigo-200 rounded-xl p-4">
+          <div className="text-sm font-semibold text-indigo-800 mb-2">Agent Suggestions</div>
+          <div className="space-y-2">
+            {suggestions.map((s, i) => (
+              <div key={i} className="flex items-center justify-between bg-white rounded-lg px-3 py-2 border border-indigo-100">
+                <div>
+                  <span className="text-sm font-medium text-stone-700">{s.metric_name}</span>
+                  <span className="text-xs text-stone-400 ml-2">{s.metric_type || "custom"}</span>
+                  {s.rationale && <div className="text-xs text-stone-500 mt-0.5">{s.rationale}</div>}
+                </div>
+                <button
+                  onClick={() => handleCreateFromSuggestion(s)}
+                  disabled={creating}
+                  className="text-xs px-2.5 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                >
+                  Create
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {metrics.length === 0 ? (
+        <div className="text-sm text-stone-400 py-8 text-center">
+          No metrics defined yet. Select a pipeline and click "Suggest Metrics" to get started.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {metrics.map((m) => (
+            <div key={m.metric_id} className="bg-white border border-stone-200 rounded-xl overflow-hidden">
+              <div
+                className="flex items-center justify-between px-4 py-3 cursor-pointer hover:bg-stone-50/50"
+                onClick={() => handleExpand(m.metric_id)}
+              >
+                <div className="flex items-center gap-3">
+                  <span className="text-sm font-medium text-stone-700">{m.metric_name}</span>
+                  <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-600 border border-indigo-100">
+                    {m.metric_type}
+                  </span>
+                  {m.latest_value !== undefined && m.latest_value !== null && (
+                    <span className="text-sm font-mono font-semibold text-indigo-700">{Number(m.latest_value).toLocaleString()}</span>
+                  )}
+                  {snapshots[m.metric_id] && <Sparkline data={[...(snapshots[m.metric_id] || [])].reverse()} />}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-stone-400 font-mono">{m.pipeline_name || m.pipeline_id?.slice(0, 8)}</span>
+                  <span className="text-stone-300">{expanded === m.metric_id ? "−" : "+"}</span>
+                </div>
+              </div>
+
+              {expanded === m.metric_id && (
+                <div className="border-t border-stone-200 px-4 py-3 bg-stone-50/30">
+                  <div className="text-xs text-stone-500 mb-2">{m.description}</div>
+                  {m.sql_expression && (
+                    <pre className="text-xs bg-stone-900 text-green-300 rounded-lg p-3 mb-3 overflow-x-auto font-mono">{m.sql_expression}</pre>
+                  )}
+
+                  <div className="flex gap-2 mb-3">
+                    <button
+                      onClick={() => handleCompute(m.metric_id)}
+                      disabled={computing === m.metric_id}
+                      className="text-xs px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                    >
+                      {computing === m.metric_id ? "Computing..." : "Compute Now"}
+                    </button>
+                    <button
+                      onClick={() => handleDelete(m.metric_id)}
+                      className="text-xs px-3 py-1 rounded bg-red-50 text-red-600 border border-red-200 hover:bg-red-100"
+                    >
+                      Delete
+                    </button>
+                  </div>
+
+                  {trend[m.metric_id] && trend[m.metric_id].narrative && (
+                    <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3 mb-3">
+                      <div className="text-xs font-semibold text-indigo-800 mb-1">Agent Trend Analysis</div>
+                      <div className="text-xs text-indigo-700">{trend[m.metric_id].narrative}</div>
+                      {trend[m.metric_id].direction && (
+                        <span className="inline-block text-xs mt-1 px-2 py-0.5 rounded bg-indigo-100 text-indigo-600">
+                          {trend[m.metric_id].direction}
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {snapshots[m.metric_id] && snapshots[m.metric_id].length > 0 && (
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1">Recent Snapshots</div>
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="text-stone-400 border-b border-stone-200">
+                            <th className="text-left py-1.5 px-2">Time</th>
+                            <th className="text-right py-1.5 px-2">Value</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {snapshots[m.metric_id].slice(0, 10).map((s) => (
+                            <tr key={s.snapshot_id} className="border-b border-stone-200/50">
+                              <td className="py-1 px-2 font-mono text-stone-400">{s.computed_at?.slice(0, 16)}</td>
+                              <td className="py-1 px-2 font-mono text-stone-700 text-right">{Number(s.value).toLocaleString()}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Docs View
 // ---------------------------------------------------------------------------
 
@@ -4111,6 +4351,7 @@ function App() {
     dag: <DAGView searchQuery={sq} />,
     connectors: <ConnectorsView />,
     alerts: <AlertsView tierFilter={tierFilter} searchQuery={sq} />,
+    metrics: <MetricsView />,
     costs: <CostsView />,
     docs: <DocsView />,
   };

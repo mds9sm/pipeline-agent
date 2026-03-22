@@ -23,6 +23,7 @@ Ships with 8 seed connectors (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebo
 - **Quality & Observability** — 7-check quality gate, schema drift detection, freshness monitoring, alerting. *(Implemented)*
 - **Post-promotion hooks** — SQL-based computed metadata after each pipeline run (XCom-style). *(Implemented)*
 - **Transforms** — Native SQL transforms with ref(), var(), 4 materialization strategies, AI generation. *(Implemented)*
+- **Metrics / KPIs** — Agent-suggested metrics, SQL generation from natural language, scheduled computation, trend interpretation. *(Implemented)*
 - **Composable pipeline steps** — Pipeline as a DAG of steps (extract, transform, gate, promote, cleanup) instead of fixed flow. *(Implemented)*
 - **Data contracts** — Formalized producer/consumer relationships between pipelines with cleanup policies and retention. *(Implemented)*
 - **DAG visualization** — UI-visible pipeline dependency graph with execution status. *(Implemented)*
@@ -88,7 +89,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `sandbox.py` | AST validation + restricted builtins + import whitelist |
 | `auth.py` | JWT auth with 3 roles (admin, operator, viewer) |
 | `crypto.py` | Fernet encryption for credentials at rest |
-| `ui/App.jsx` | React 18 SPA (CDN, no build) - 11 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Settings, Sources, Docs |
+| `ui/App.jsx` | React 18 SPA (CDN, no build) - 12 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Metrics (sparklines + agent suggest/trend), Settings, Sources, Docs |
 | `gitops/repo.py` | Separate git repo manager for pipeline YAML + connector code versioning |
 | `cli/__main__.py` | CLI interface — 14 commands, token caching, fuzzy pipeline resolution |
 | `transforms/engine.py` | SQL transform engine — ref/var resolution, materialization, validation, lineage parsing |
@@ -157,8 +158,8 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 **Test script**: `./test-pipeline-agent.sh`
 
 ```bash
-./test-pipeline-agent.sh              # Full suite (~165 tests, ~20 min)
-./test-pipeline-agent.sh --api        # REST API endpoints only (~36 tests, fast)
+./test-pipeline-agent.sh              # Full suite (~173 tests, ~20 min)
+./test-pipeline-agent.sh --api        # REST API endpoints only (~44 tests, fast)
 ./test-pipeline-agent.sh --sources    # Source connector requests + generation
 ./test-pipeline-agent.sh --targets    # Target connector requests + generation
 ./test-pipeline-agent.sh --chat       # Multi-turn conversations + agent understanding
@@ -194,6 +195,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Data catalog & AI enablement | 15 | search, query, detail, trust, columns, stats, semantic tags (get/infer/override), context questions, context save, trust weights (set/reset), alert narratives (field+generate) (Build 26) |
 | MCP server | 3 | server import, resource listing, tool listing (Build 27) |
 | SQL transforms | 13 | CRUD (create, list, get, update, delete), lineage, AI generate, chat routing x2, demo transforms (count, VIEW, refs, pipeline) (Build 29) |
+| Metrics / KPIs | 8 | suggest, create, list, get, update, trend, delete, chat routing (Build 31) |
 
 ### Adding New Tests
 

@@ -2024,6 +2024,8 @@ Available actions:
 - diagnose_pipeline: Diagnose why a pipeline is failing or unhealthy (params: pipeline_name or pipeline_id)
 - analyze_impact: Analyze downstream impact if a pipeline/table goes down (params: pipeline_name or pipeline_id)
 - check_anomalies: Check for platform-wide anomalies and unusual patterns (params: none)
+- suggest_metrics: Suggest KPI metrics for a pipeline's target table (params: pipeline_name or pipeline_id)
+- interpret_metric_trend: Analyze trends in a metric (params: metric_name or metric_id)
 - explain: Explain something about the system (params: topic)
 - unknown: Could not determine intent
 
@@ -2189,6 +2191,26 @@ Respond with JSON:
                 "action": "list_transforms",
                 "params": {},
                 "response_text": "Listing transforms...",
+            }
+
+        # Metrics / KPIs (Build 31)
+        if any(kw in text_lower for kw in (
+            "suggest metric", "recommend metric", "what metric",
+            "kpi", "dashboard metric", "suggest kpi",
+        )):
+            return {
+                "action": "suggest_metrics",
+                "params": {"query": user_text},
+                "response_text": "Analyzing table schema to suggest metrics...",
+            }
+        if any(kw in text_lower for kw in (
+            "metric trend", "trending", "analyze metric",
+            "metric analysis", "what's happening with",
+        )):
+            return {
+                "action": "interpret_metric_trend",
+                "params": {"query": user_text},
+                "response_text": "Analyzing metric trend...",
             }
 
         # Design topology (Build 20)
@@ -3380,4 +3402,269 @@ Rules:
             "refs": [],
             "variables": {},
             "unique_key": [],
+        }
+
+    # ------------------------------------------------------------------
+    # Agentic metrics / KPI layer (Build 31)
+    # ------------------------------------------------------------------
+
+    async def suggest_metrics(
+        self,
+        contract,
+        columns: list[dict],
+        business_context: dict,
+    ) -> list[dict]:
+        """Agent suggests KPI metrics based on table schema and business context.
+
+        Returns list of dicts with: metric_name, description, sql_expression,
+        metric_type, dimensions, reasoning.
+        """
+        if not self.has_api:
+            return self._rule_based_suggest_metrics(columns, contract)
+
+        col_summary = "\n".join(
+            f"  - {c.get('target_column', c.get('source_column', '?'))}: "
+            f"{c.get('target_type', 'unknown')}"
+            f"{' (PK)' if c.get('is_primary_key') else ''}"
+            f"{' (nullable)' if c.get('is_nullable') else ''}"
+            for c in columns[:30]
+        )
+        ctx_text = ""
+        if business_context:
+            ctx_text = "\nBusiness context:\n" + "\n".join(
+                f"  - {k}: {v}" for k, v in business_context.items()
+            )
+
+        target_table = f"{contract.target_schema}.{contract.target_table}"
+
+        user_prompt = f"""Table "{target_table}" for pipeline "{contract.pipeline_name}" (Tier {contract.tier}).
+
+Columns:
+{col_summary}
+{ctx_text}
+
+Suggest 3-5 useful KPI metrics for this table. Each metric should be a single SELECT query \
+that returns a numeric value (with optional GROUP BY for dimensions).
+
+For each metric provide:
+- metric_name: short snake_case name
+- description: what this metric measures, in plain language
+- sql_expression: the full SELECT query against {target_table}
+- metric_type: count | sum | avg | ratio | custom
+- dimensions: list of columns to GROUP BY (empty list if aggregate only)
+- reasoning: why this metric is useful
+
+Respond with a JSON array:
+[{{
+  "metric_name": "...",
+  "description": "...",
+  "sql_expression": "SELECT ... FROM {target_table} ...",
+  "metric_type": "count|sum|avg|ratio|custom",
+  "dimensions": [],
+  "reasoning": "..."
+}}]
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=contract.pipeline_id,
+                operation="suggest_metrics",
+            )
+            result = self._extract_json(text)
+            return result if isinstance(result, list) else []
+        except Exception as e:
+            log.warning("suggest_metrics Claude error: %s", e)
+            return self._rule_based_suggest_metrics(columns, contract)
+
+    def _rule_based_suggest_metrics(self, columns: list[dict], contract) -> list[dict]:
+        """Rule-based fallback: suggest basic metrics from column types."""
+        target_table = f"{contract.target_schema}.{contract.target_table}"
+        metrics = [{
+            "metric_name": "total_row_count",
+            "description": "Total number of rows in the table",
+            "sql_expression": f"SELECT COUNT(*) AS value FROM {target_table}",
+            "metric_type": "count",
+            "dimensions": [],
+            "reasoning": "Basic row count — tracks table growth over time",
+        }]
+        for c in columns:
+            col = c.get("target_column", c.get("source_column", ""))
+            ctype = (c.get("target_type") or "").lower()
+            if any(t in ctype for t in ("int", "numeric", "decimal", "float", "double", "money", "amount")):
+                if any(kw in col.lower() for kw in ("amount", "total", "price", "revenue", "cost", "quantity", "qty")):
+                    metrics.append({
+                        "metric_name": f"sum_{col}",
+                        "description": f"Sum of {col}",
+                        "sql_expression": f"SELECT SUM({col}) AS value FROM {target_table}",
+                        "metric_type": "sum",
+                        "dimensions": [],
+                        "reasoning": f"Numeric column '{col}' likely represents a business measure",
+                    })
+                    break
+            if c.get("is_nullable") and not c.get("is_primary_key"):
+                metrics.append({
+                    "metric_name": f"null_rate_{col}",
+                    "description": f"Percentage of null values in {col}",
+                    "sql_expression": f"SELECT ROUND(100.0 * COUNT(*) FILTER (WHERE {col} IS NULL) / NULLIF(COUNT(*), 0), 2) AS value FROM {target_table}",
+                    "metric_type": "ratio",
+                    "dimensions": [],
+                    "reasoning": f"Nullable column '{col}' — tracking null rate catches data quality issues",
+                })
+                break
+        return metrics[:5]
+
+    async def generate_metric_sql(
+        self,
+        description: str,
+        target_table: str,
+        columns: list[dict],
+    ) -> dict:
+        """Agent generates SQL for a metric from a natural language description.
+
+        Returns dict with: sql_expression, metric_type, dimensions, description.
+        """
+        if not self.has_api:
+            return self._rule_based_generate_metric_sql(target_table)
+
+        col_summary = "\n".join(
+            f"  - {c.get('target_column', c.get('source_column', '?'))}: "
+            f"{c.get('target_type', 'unknown')}"
+            for c in columns[:30]
+        )
+
+        user_prompt = f"""Generate a SQL metric query for: "{description}"
+
+Target table: {target_table}
+Columns:
+{col_summary}
+
+Requirements:
+- Single SELECT statement that returns one numeric value (or one per dimension group)
+- Reference the table as {target_table}
+- Use standard SQL (PostgreSQL-compatible)
+- Column alias the result as "value"
+
+Respond with JSON:
+{{
+  "sql_expression": "SELECT ... AS value FROM {target_table} ...",
+  "metric_type": "count|sum|avg|ratio|custom",
+  "dimensions": [],
+  "description": "refined description of what this measures"
+}}
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                operation="generate_metric_sql",
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("generate_metric_sql Claude error: %s", e)
+            return self._rule_based_generate_metric_sql(target_table)
+
+    def _rule_based_generate_metric_sql(self, target_table: str) -> dict:
+        return {
+            "sql_expression": f"SELECT COUNT(*) AS value FROM {target_table}",
+            "metric_type": "count",
+            "dimensions": [],
+            "description": "Total row count",
+        }
+
+    async def interpret_metric_trend(
+        self,
+        metric_name: str,
+        snapshots: list[dict],
+        pipeline_context: dict,
+    ) -> dict:
+        """Agent interprets a metric's time-series trend and detects anomalies.
+
+        Returns dict with: trend, is_anomalous, anomalies, interpretation, severity.
+        """
+        if not self.has_api:
+            return self._rule_based_interpret_trend(snapshots)
+
+        values_text = "\n".join(
+            f"  {s.get('computed_at', '?')}: {s.get('value', 0)}"
+            for s in snapshots[:30]
+        )
+
+        user_prompt = f"""Analyze the trend for metric "{metric_name}".
+
+Pipeline: {pipeline_context.get('pipeline_name', '?')} (Tier {pipeline_context.get('tier', 2)})
+Business context: {json.dumps(pipeline_context.get('business_context', {}))}
+
+Time series (newest first):
+{values_text}
+
+Analyze:
+1. Overall trend (increasing / decreasing / stable / volatile)
+2. Any anomalies (sudden spikes, drops, or pattern breaks)
+3. Business interpretation — what does this trend mean?
+4. Severity assessment (info / warning / critical)
+
+Respond with JSON:
+{{
+  "trend": "increasing|decreasing|stable|volatile",
+  "is_anomalous": true/false,
+  "anomalies": ["description of each anomaly"],
+  "interpretation": "2-3 sentence business interpretation",
+  "severity": "info|warning|critical"
+}}
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                operation="interpret_metric_trend",
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("interpret_metric_trend Claude error: %s", e)
+            return self._rule_based_interpret_trend(snapshots)
+
+    def _rule_based_interpret_trend(self, snapshots: list[dict]) -> dict:
+        """Rule-based fallback: basic statistical trend detection."""
+        if len(snapshots) < 2:
+            return {
+                "trend": "stable",
+                "is_anomalous": False,
+                "anomalies": [],
+                "interpretation": "Not enough data points to determine a trend.",
+                "severity": "info",
+            }
+        values = [s.get("value", 0) for s in snapshots]
+        mean = sum(values) / len(values) if values else 0
+        variance = sum((v - mean) ** 2 for v in values) / len(values) if values else 0
+        stddev = variance ** 0.5
+
+        # Detect trend direction
+        if len(values) >= 3:
+            recent = values[:3]
+            older = values[-3:]
+            recent_avg = sum(recent) / len(recent)
+            older_avg = sum(older) / len(older)
+            if older_avg > 0 and (recent_avg - older_avg) / older_avg > 0.1:
+                trend = "increasing"
+            elif older_avg > 0 and (older_avg - recent_avg) / older_avg > 0.1:
+                trend = "decreasing"
+            else:
+                trend = "stable"
+        else:
+            trend = "stable"
+
+        # Detect anomalies
+        anomalies = []
+        is_anomalous = False
+        if stddev > 0 and len(values) >= 3:
+            latest = values[0]
+            z = abs(latest - mean) / stddev
+            if z > 2.0:
+                anomalies.append(f"Latest value ({latest:.2f}) deviates {z:.1f} standard deviations from mean ({mean:.2f})")
+                is_anomalous = True
+
+        return {
+            "trend": trend,
+            "is_anomalous": is_anomalous,
+            "anomalies": anomalies,
+            "interpretation": f"Metric is {trend}. Mean: {mean:.2f}, StdDev: {stddev:.2f}.",
+            "severity": "warning" if is_anomalous else "info",
         }
