@@ -505,6 +505,125 @@ Use "halt" for dropped columns or type narrowing (e.g. BIGINT -> INT).
         }
 
     # ------------------------------------------------------------------
+    # generate_migration_sql — agent-generated DDL for schema drift
+    # ------------------------------------------------------------------
+
+    async def generate_migration_sql(
+        self,
+        contract: PipelineContract,
+        drift_info: dict,
+        target_type: str = "postgresql",
+    ) -> dict:
+        """Have the agent generate migration SQL for detected schema drift.
+
+        Returns dict with:
+            migration_sql: list of SQL statements to execute
+            reasoning: why these changes are needed
+            risk_assessment: what could go wrong
+            rollback_sql: list of SQL statements to undo the migration
+        """
+        schema = contract.target_schema or "raw"
+        table = contract.target_table
+
+        if not self.has_api:
+            return self._rule_based_migration_sql(contract, drift_info, target_type)
+
+        user_prompt = f"""Generate migration SQL for schema drift on pipeline "{contract.pipeline_name}".
+
+Target database: {target_type}
+Target table: "{schema}"."{table}"
+
+Current column mappings:
+{json.dumps([{{"source": m.source_column, "target": m.target_column, "type": m.target_type, "nullable": m.is_nullable}} for m in contract.column_mappings], indent=2)}
+
+Detected drift:
+{json.dumps(drift_info, indent=2)}
+
+Generate the exact SQL to align the target table with the source schema.
+Respond with JSON:
+{{
+  "migration_sql": ["ALTER TABLE ...", ...],
+  "reasoning": "why each statement is needed",
+  "risk_assessment": "what could go wrong and impact on existing data",
+  "rollback_sql": ["ALTER TABLE ...", ...]
+}}
+
+Rules:
+- Use IF NOT EXISTS / IF EXISTS where supported
+- For new columns, use the target_type from drift info
+- For type changes, only widen (never narrow) — e.g. INT -> BIGINT is safe
+- For dropped columns, generate DROP COLUMN IF EXISTS
+- Preserve existing data — never DROP and recreate
+- Quote all identifiers with double quotes
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=contract.pipeline_id,
+                operation="generate_migration_sql",
+            )
+            result = self._extract_json(text)
+            # Validate that we got SQL statements back
+            if not result.get("migration_sql"):
+                log.warning("Agent returned empty migration_sql, falling back to rule-based")
+                return self._rule_based_migration_sql(contract, drift_info, target_type)
+            return result
+        except Exception as e:
+            log.warning("Claude API error in generate_migration_sql: %s. Using fallback.", e)
+            return self._rule_based_migration_sql(contract, drift_info, target_type)
+
+    def _rule_based_migration_sql(
+        self,
+        contract: PipelineContract,
+        drift_info: dict,
+        target_type: str = "postgresql",
+    ) -> dict:
+        """Fallback: generate migration SQL without LLM when API is unavailable."""
+        schema = contract.target_schema or "raw"
+        table = contract.target_table
+        migration_sql = []
+        rollback_sql = []
+        reasons = []
+
+        for col in drift_info.get("new_columns", []):
+            col_name = col.get("name", "")
+            col_type = col.get("target_type", col.get("type", "TEXT"))
+            migration_sql.append(
+                f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "{col_name}" {col_type}'
+            )
+            rollback_sql.append(
+                f'ALTER TABLE "{schema}"."{table}" DROP COLUMN IF EXISTS "{col_name}"'
+            )
+            reasons.append(f"Add new column '{col_name}' ({col_type}) from source")
+
+        for tc in drift_info.get("type_changes", []):
+            col_name = tc.get("column", "")
+            new_type = tc.get("to", "")
+            if col_name and new_type:
+                migration_sql.append(
+                    f'ALTER TABLE "{schema}"."{table}" ALTER COLUMN "{col_name}" TYPE {new_type}'
+                )
+                rollback_sql.append(
+                    f'ALTER TABLE "{schema}"."{table}" ALTER COLUMN "{col_name}" TYPE {tc.get("from", "TEXT")}'
+                )
+                reasons.append(f"Widen column '{col_name}' from {tc.get('from', '?')} to {new_type}")
+
+        for col in drift_info.get("dropped_columns", []):
+            col_name = col if isinstance(col, str) else col.get("name", "")
+            migration_sql.append(
+                f'ALTER TABLE "{schema}"."{table}" DROP COLUMN IF EXISTS "{col_name}"'
+            )
+            rollback_sql.append(f"-- Cannot auto-rollback dropped column '{col_name}' (data lost)")
+            reasons.append(f"Drop column '{col_name}' (no longer in source)")
+
+        return {
+            "migration_sql": migration_sql,
+            "reasoning": "; ".join(reasons) if reasons else "No changes needed",
+            "risk_assessment": "Rule-based generation — review SQL before approval",
+            "rollback_sql": rollback_sql,
+        }
+
+    # ------------------------------------------------------------------
     # reason_about_quality
     # ------------------------------------------------------------------
 

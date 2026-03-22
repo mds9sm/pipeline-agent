@@ -370,38 +370,41 @@ class MonitorEngine:
                         mapping.is_nullable = nc["to_nullable"]
                         break
 
-        # ── ALTER the actual target table ──────────────────────────────
+        # ── Agent generates migration SQL and ALTERs the target table ──
         try:
             tgt_params = self._target_params(pipeline)
             target = await self.registry.get_target(
                 pipeline.target_connector_id, tgt_params,
             )
-            schema = pipeline.target_schema or "raw"
-            table = pipeline.target_table
-            alter_stmts = []
+            target_type = "postgresql"
+            try:
+                target_type = target.get_target_type()
+            except Exception:
+                pass
+
+            # Build drift info with type details for agent reasoning
+            drift_info = {}
             if new_columns:
-                for col_info in new_columns:
-                    col_name = col_info["name"]
-                    if col_name in live_cols:
-                        m = live_cols[col_name]
-                        alter_stmts.append(
-                            f'ALTER TABLE "{schema}"."{table}" '
-                            f'ADD COLUMN IF NOT EXISTS "{m.target_column}" {m.target_type}'
-                        )
+                drift_info["new_columns"] = [
+                    {"name": c["name"],
+                     "target_type": live_cols[c["name"]].target_type if c["name"] in live_cols else "TEXT",
+                     "source_type": live_cols[c["name"]].source_type if c["name"] in live_cols else "unknown",
+                     "nullable": live_cols[c["name"]].is_nullable if c["name"] in live_cols else True}
+                    for c in new_columns
+                ]
             if safe_type_changes:
-                for tc in safe_type_changes:
-                    col_name = tc["column"]
-                    if col_name in live_cols:
-                        m = live_cols[col_name]
-                        alter_stmts.append(
-                            f'ALTER TABLE "{schema}"."{table}" '
-                            f'ALTER COLUMN "{m.target_column}" TYPE {m.target_type}'
-                        )
-            for stmt in alter_stmts:
+                drift_info["type_changes"] = safe_type_changes
+
+            migration = await self.agent.generate_migration_sql(
+                pipeline, drift_info, target_type,
+            )
+            migration_sql = migration.get("migration_sql", [])
+            for stmt in migration_sql:
                 await target.execute_sql(stmt)
             if hasattr(target, "close"):
                 await target.close()
-            log.info("Applied %d ALTER statement(s) to target table", len(alter_stmts))
+            log.info("Applied %d agent-generated statement(s) to target table. Reasoning: %s",
+                     len(migration_sql), migration.get("reasoning", ""))
         except Exception as e:
             log.error("Failed to ALTER target table for %s: %s", pipeline.pipeline_id, e)
 

@@ -252,7 +252,7 @@ async def main():
         agent = AgentCore(config, store)
         gate = QualityGate(store, config)
         staging_mgr = LocalStagingManager(config.data_dir)
-        runner = PipelineRunner(config, store, registry, gate, staging_mgr)
+        runner = PipelineRunner(config, store, registry, gate, staging_mgr, agent)
         conversation = ConversationManager(config, store, registry, agent)
         scheduler = Scheduler(config, store, runner)
         monitor = MonitorEngine(config, store, registry, agent)

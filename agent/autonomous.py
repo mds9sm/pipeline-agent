@@ -57,12 +57,14 @@ class PipelineRunner:
         registry: ConnectorRegistry,
         gate: QualityGate,
         staging: LocalStagingManager,
+        agent=None,
     ):
         self.config = config
         self.store = store
         self.registry = registry
         self.gate = gate
         self.staging = staging
+        self.agent = agent  # AgentCore — used for agentic schema drift reasoning
 
     async def execute(
         self,
@@ -98,10 +100,13 @@ class PipelineRunner:
     ) -> str:
         """Compare source schema against pipeline column_mappings before extraction.
 
+        The agent reasons about detected drift, generates migration SQL, and
+        either auto-applies it or creates a proposal for human approval.
+
         Returns:
             "ok"      — no drift, proceed with extraction
-            "applied" — drift detected and auto-applied (target ALTERed)
-            "halted"  — drift detected, proposal created, run halted for approval
+            "applied" — drift detected and agent-generated SQL auto-applied
+            "halted"  — drift detected, proposal with agent SQL created, run halted
         """
         try:
             profile = await source.profile_table(
@@ -111,8 +116,10 @@ class PipelineRunner:
             existing_cols = {m.source_column for m in contract.column_mappings}
 
             new_columns = [
-                {"name": name} for name in live_cols
-                if name not in existing_cols
+                {"name": name, "target_type": live_cols[name].target_type,
+                 "source_type": live_cols[name].source_type,
+                 "nullable": live_cols[name].is_nullable}
+                for name in live_cols if name not in existing_cols
             ]
             if not new_columns:
                 self._log_step(run, "schema_check", "no drift detected")
@@ -127,19 +134,44 @@ class PipelineRunner:
                 self._log_step(run, "schema_check", f"ignored {len(new_columns)} new column(s)")
                 return "ok"
 
+            # Build drift info for the agent
+            drift_info = {"new_columns": new_columns}
+            target_type = "postgresql"
+            try:
+                target_type = target.get_target_type()
+            except Exception:
+                pass
+
+            # Agent generates migration SQL (uses LLM if available, rule-based fallback)
+            if self.agent:
+                migration = await self.agent.generate_migration_sql(
+                    contract, drift_info, target_type,
+                )
+            else:
+                # No agent available — use inline fallback
+                from agent.core import AgentCore
+                migration = AgentCore._rule_based_migration_sql(
+                    None, contract, drift_info, target_type,
+                )
+
+            migration_sql = migration.get("migration_sql", [])
+            reasoning = migration.get("reasoning", "")
+            risk_assessment = migration.get("risk_assessment", "")
+            rollback_sql = migration.get("rollback_sql", [])
+
+            if not migration_sql:
+                self._log_step(run, "schema_check", "agent generated no migration SQL — proceeding")
+                return "ok"
+
             if policy.on_new_column == "auto_add":
-                # Append mappings and ALTER target table
-                schema = contract.target_schema or "raw"
-                table = contract.target_table
+                # Agent-generated SQL, auto-applied
+                for stmt in migration_sql:
+                    await target.execute_sql(stmt)
+                # Update column mappings to match
                 for col_info in new_columns:
                     col_name = col_info["name"]
                     if col_name in live_cols:
-                        m = live_cols[col_name]
-                        contract.column_mappings.append(m)
-                        await target.execute_sql(
-                            f'ALTER TABLE "{schema}"."{table}" '
-                            f'ADD COLUMN IF NOT EXISTS "{m.target_column}" {m.target_type}'
-                        )
+                        contract.column_mappings.append(live_cols[col_name])
                 contract.version += 1
                 contract.updated_at = now_iso()
                 await self.store.save_pipeline(contract)
@@ -147,35 +179,48 @@ class PipelineRunner:
                     pipeline_id=contract.pipeline_id,
                     version=contract.version,
                     column_mappings=contract.column_mappings,
-                    change_summary=f"Pre-extract auto-add: {new_names}",
+                    change_summary=f"Pre-extract auto-add: {new_names}. Agent reasoning: {reasoning}",
                     change_type="add_column",
-                    applied_by="runner",
+                    applied_by="agent",
                 )
                 await self.store.save_schema_version(sv)
-                self._log_step(run, "schema_check", f"auto-added {len(new_columns)} column(s): {new_names}")
+                self._log_step(run, "schema_check",
+                    f"auto-applied {len(migration_sql)} agent-generated statement(s) for {new_names}")
                 return "applied"
 
-            # policy.on_new_column == "propose"
+            # policy.on_new_column == "propose" — agent SQL included in proposal
             proposal = ContractChangeProposal(
                 pipeline_id=contract.pipeline_id,
                 trigger_type=TriggerType.SCHEMA_DRIFT,
-                trigger_detail={"new_columns": new_columns, "detected_at": "pre_extract"},
+                trigger_detail={
+                    "new_columns": new_columns,
+                    "detected_at": "pre_extract",
+                    "target_type": target_type,
+                },
                 change_type=ChangeType.ADD_COLUMN,
                 current_state={"column_mappings": [asdict(m) for m in contract.column_mappings]},
-                proposed_state={"new_columns": new_columns},
-                reasoning=f"Source has {len(new_columns)} new column(s) not in target: {new_names}. Detected at run time before extraction.",
+                proposed_state={
+                    "new_columns": new_columns,
+                    "migration_sql": migration_sql,
+                    "rollback_sql": rollback_sql,
+                },
+                reasoning=f"{reasoning}\n\nRisk: {risk_assessment}",
                 confidence=0.9,
                 contract_version_before=contract.version,
             )
             await self.store.save_proposal(proposal)
 
-            # Halt the run — needs human approval
+            # Halt the run — needs human approval of agent-generated SQL
             run.status = RunStatus.HALTED
-            run.error = f"Schema drift: {len(new_columns)} new column(s) need approval: {new_names}"
+            run.error = (
+                f"Schema drift: {len(new_columns)} new column(s) need approval: {new_names}. "
+                f"Agent generated {len(migration_sql)} SQL statement(s)."
+            )
             run.completed_at = now_iso()
             await self.store.save_run(run)
-            self._log_step(run, "schema_check", f"HALTED — {len(new_columns)} new column(s) need approval", "halted")
-            log.warning("Run %s halted: schema drift requires approval", run.run_id[:8])
+            self._log_step(run, "schema_check",
+                f"HALTED — agent proposed {len(migration_sql)} SQL statement(s) for approval", "halted")
+            log.warning("Run %s halted: agent-generated schema migration needs approval", run.run_id[:8])
             return "halted"
 
         except Exception as e:

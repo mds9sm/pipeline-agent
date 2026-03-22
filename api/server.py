@@ -5163,15 +5163,49 @@ async def _apply_proposal(
         ChangeType.ALTER_COLUMN_TYPE,
         ChangeType.DROP_COLUMN,
     ):
-        # Build the set of existing target columns for diff
-        old_col_names = {m.target_column for m in pipeline.column_mappings}
-        alter_stmts = []
-        schema = pipeline.target_schema or "raw"
-        table = pipeline.target_table
+        # Use agent-generated SQL from proposal, or ask agent to generate it now
+        migration_sql = proposal.proposed_state.get("migration_sql", [])
 
+        if not migration_sql:
+            # Proposal was created before agentic migration — ask agent to generate now
+            drift_info = {}
+            if proposal.change_type == ChangeType.ADD_COLUMN:
+                drift_info["new_columns"] = proposal.proposed_state.get("new_columns", [])
+            elif proposal.change_type == ChangeType.ALTER_COLUMN_TYPE:
+                drift_info["type_changes"] = proposal.proposed_state.get("type_changes", [])
+            elif proposal.change_type == ChangeType.DROP_COLUMN:
+                drift_info["dropped_columns"] = proposal.proposed_state.get("dropped_columns", [])
+
+            target_type = proposal.trigger_detail.get("target_type", "postgresql")
+            migration = await agent.generate_migration_sql(pipeline, drift_info, target_type)
+            migration_sql = migration.get("migration_sql", [])
+            log.info("Agent generated %d migration statement(s) for proposal %s",
+                     len(migration_sql), proposal.proposal_id[:8])
+
+        # Execute agent-generated SQL on the actual target table
+        if migration_sql:
+            try:
+                tgt_params = {
+                    "host": pipeline.target_host, "port": pipeline.target_port,
+                    "database": pipeline.target_database,
+                    "user": pipeline.target_user, "password": pipeline.target_password,
+                    "default_schema": pipeline.target_schema,
+                }
+                if config and config.has_encryption_key:
+                    tgt_params = decrypt_dict(tgt_params, config.encryption_key, CREDENTIAL_FIELDS)
+                target = await registry.get_target(pipeline.target_connector_id, tgt_params)
+                for stmt in migration_sql:
+                    await target.execute_sql(stmt)
+                if hasattr(target, "close"):
+                    await target.close()
+                log.info("Executed %d agent-generated statement(s) for proposal %s",
+                         len(migration_sql), proposal.proposal_id[:8])
+            except Exception as e:
+                log.error("Failed to execute migration SQL for proposal %s: %s",
+                          proposal.proposal_id[:8], e)
+
+        # Update column mappings by re-profiling source for current state
         if proposal.change_type == ChangeType.ADD_COLUMN:
-            # proposed_state has {"new_columns": [{"name": ...}, ...]}
-            # Re-profile source to get full ColumnMapping objects
             new_col_names = [c["name"] for c in proposal.proposed_state.get("new_columns", [])]
             if new_col_names:
                 try:
@@ -5187,62 +5221,26 @@ async def _apply_proposal(
                     live_cols = {m.source_column: m for m in profile.columns}
                     for col_name in new_col_names:
                         if col_name in live_cols:
-                            m = live_cols[col_name]
-                            pipeline.column_mappings.append(m)
-                            alter_stmts.append(
-                                f'ALTER TABLE "{schema}"."{table}" '
-                                f'ADD COLUMN IF NOT EXISTS "{m.target_column}" {m.target_type}'
-                            )
+                            pipeline.column_mappings.append(live_cols[col_name])
                 except Exception as e:
                     log.error("Failed to re-profile source for ADD_COLUMN proposal: %s", e)
 
         elif proposal.change_type == ChangeType.ALTER_COLUMN_TYPE:
-            type_changes = proposal.proposed_state.get("type_changes", [])
-            for tc in type_changes:
+            for tc in proposal.proposed_state.get("type_changes", []):
                 col_name = tc.get("column", "")
                 new_type = tc.get("to", "")
                 for mapping in pipeline.column_mappings:
                     if mapping.source_column == col_name and new_type:
                         mapping.source_type = tc.get("from", mapping.source_type)
                         mapping.target_type = new_type
-                        alter_stmts.append(
-                            f'ALTER TABLE "{schema}"."{table}" '
-                            f'ALTER COLUMN "{mapping.target_column}" TYPE {new_type}'
-                        )
                         break
 
         elif proposal.change_type == ChangeType.DROP_COLUMN:
-            drop_cols = proposal.proposed_state.get("dropped_columns", [])
-            for col_info in drop_cols:
+            for col_info in proposal.proposed_state.get("dropped_columns", []):
                 col_name = col_info if isinstance(col_info, str) else col_info.get("name", "")
                 pipeline.column_mappings = [
                     m for m in pipeline.column_mappings if m.source_column != col_name
                 ]
-                alter_stmts.append(
-                    f'ALTER TABLE "{schema}"."{table}" DROP COLUMN IF EXISTS "{col_name}"'
-                )
-
-        # Execute ALTER statements on the actual target table
-        if alter_stmts:
-            try:
-                tgt_params = {
-                    "host": pipeline.target_host, "port": pipeline.target_port,
-                    "database": pipeline.target_database,
-                    "user": pipeline.target_user, "password": pipeline.target_password,
-                    "default_schema": pipeline.target_schema,
-                }
-                if config and config.has_encryption_key:
-                    tgt_params = decrypt_dict(tgt_params, config.encryption_key, CREDENTIAL_FIELDS)
-                target = await registry.get_target(pipeline.target_connector_id, tgt_params)
-                for stmt in alter_stmts:
-                    await target.execute_sql(stmt)
-                if hasattr(target, "close"):
-                    await target.close()
-                log.info("Applied %d ALTER statement(s) to target table for proposal %s",
-                         len(alter_stmts), proposal.proposal_id[:8])
-            except Exception as e:
-                log.error("Failed to ALTER target table for proposal %s: %s",
-                          proposal.proposal_id[:8], e)
 
         pipeline.version += 1
         proposal.contract_version_after = pipeline.version

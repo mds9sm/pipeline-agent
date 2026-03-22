@@ -91,11 +91,14 @@ Format: Each entry records what changed, why, and test results at the time of th
 Schema drift detection (monitor) correctly identified new columns from MySQL source and auto-added them to the pipeline's `column_mappings` in PostgreSQL. But the actual target table was never ALTERed. On next extract, the CSV included all columns (matching updated mappings), but `COPY ... FROM STDIN CSV HEADER` failed because the target table schema was stale.
 
 #### Architecture Decision
-Schema drift detection moved from monitor-only (5-minute background tick) to **run-time** (pre-extract check). The monitor still runs for continuous observability, but the critical path — catching drift before it causes a COPY failure — now happens at the point of execution. This means:
-- No more 5-minute delay between drift detection and action
-- Drift is caught exactly when it matters (before extraction)
-- The approval proposal is created in the run context, not as a background surprise
-- The run halts cleanly with HALTED status, not FAILED with a cryptic COPY error
+Schema drift detection moved from monitor-only (5-minute background tick) to **run-time** (pre-extract check). The monitor still runs for continuous observability, but the critical path — catching drift before it causes a COPY failure — now happens at the point of execution.
+
+**Agentic migration SQL** — All schema changes are now agent-generated, not hardcoded templates:
+- Pre-extract drift check → agent generates migration SQL (LLM reasoning + rule-based fallback)
+- Proposal contains the agent's SQL statements, reasoning, risk assessment, and rollback SQL
+- Approval executes the agent's SQL — human reviews what the agent proposed, not what a template produced
+- Monitor auto-apply also uses agent-generated SQL
+- Falls back to rule-based generation when API key is unavailable
 
 ---
 
