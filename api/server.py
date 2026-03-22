@@ -3820,6 +3820,188 @@ def create_app(
         return {"status": "deleted"}
 
     # -----------------------------------------------------------------------
+    # Platform Analytics
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/analytics/activity")
+    @limiter.limit("30/minute")
+    async def get_activity_analytics(
+        request: Request,
+        days: int = Query(90),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Activity heatmap + usage breakdown for the platform."""
+        # 1. Daily run counts (contribution heatmap)
+        heatmap_rows = await store.pool.fetch("""
+            SELECT DATE(started_at::timestamptz) AS day, COUNT(*) AS runs,
+                   SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) AS success,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+            FROM runs
+            WHERE started_at::timestamptz >= NOW() - ($1 || ' days')::interval
+            GROUP BY DATE(started_at::timestamptz)
+            ORDER BY day
+        """, str(days))
+
+        # 2. Daily chat interactions
+        chat_rows = await store.pool.fetch("""
+            SELECT DATE(created_at::timestamptz) AS day, COUNT(*) AS chats,
+                   COUNT(DISTINCT username) AS users
+            FROM chat_interactions
+            WHERE created_at::timestamptz >= NOW() - ($1 || ' days')::interval
+            GROUP BY DATE(created_at::timestamptz)
+            ORDER BY day
+        """, str(days))
+
+        # 3. Top users by interactions
+        user_rows = await store.pool.fetch("""
+            SELECT username, COUNT(*) AS interactions,
+                   SUM(input_tokens + output_tokens) AS total_tokens
+            FROM chat_interactions
+            WHERE created_at::timestamptz >= NOW() - ($1 || ' days')::interval
+              AND username IS NOT NULL AND username != ''
+            GROUP BY username
+            ORDER BY interactions DESC
+            LIMIT 10
+        """, str(days))
+
+        # 4. Top operations by token usage
+        op_rows = await store.pool.fetch("""
+            SELECT operation, COUNT(*) AS calls,
+                   COALESCE(SUM(input_tokens * 0.000003 + output_tokens * 0.000015), 0) AS total_cost,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+            FROM agent_cost_logs
+            WHERE timestamp::timestamptz >= NOW() - ($1 || ' days')::interval
+            GROUP BY operation
+            ORDER BY total_cost DESC
+            LIMIT 10
+        """, str(days))
+
+        # 5. Daily cost trend
+        cost_rows = await store.pool.fetch("""
+            SELECT DATE(timestamp::timestamptz) AS day,
+                   COALESCE(SUM(input_tokens * 0.000003 + output_tokens * 0.000015), 0) AS cost,
+                   COALESCE(SUM(total_tokens), 0) AS tokens,
+                   COUNT(*) AS calls
+            FROM agent_cost_logs
+            WHERE timestamp::timestamptz >= NOW() - ($1 || ' days')::interval
+            GROUP BY DATE(timestamp::timestamptz)
+            ORDER BY day
+        """, str(days))
+
+        # 6. Summary stats
+        summary_row = await store.pool.fetchrow("""
+            SELECT
+                (SELECT COUNT(*) FROM runs WHERE started_at::timestamptz >= NOW() - ($1 || ' days')::interval) AS total_runs,
+                (SELECT COUNT(*) FROM chat_interactions WHERE created_at::timestamptz >= NOW() - ($1 || ' days')::interval) AS total_chats,
+                (SELECT COUNT(DISTINCT username) FROM chat_interactions WHERE created_at::timestamptz >= NOW() - ($1 || ' days')::interval AND username IS NOT NULL AND username != '') AS active_users,
+                (SELECT COALESCE(SUM(input_tokens * 0.000003 + output_tokens * 0.000015), 0) FROM agent_cost_logs WHERE timestamp::timestamptz >= NOW() - ($1 || ' days')::interval) AS total_cost,
+                (SELECT COALESCE(SUM(total_tokens), 0) FROM agent_cost_logs WHERE timestamp::timestamptz >= NOW() - ($1 || ' days')::interval) AS total_tokens,
+                (SELECT COUNT(*) FROM pipelines) AS total_pipelines
+        """, str(days))
+
+        return {
+            "heatmap": [{"day": str(r["day"]), "runs": r["runs"], "success": r["success"], "failed": r["failed"]} for r in heatmap_rows],
+            "chat_activity": [{"day": str(r["day"]), "chats": r["chats"], "users": r["users"]} for r in chat_rows],
+            "top_users": [{"username": r["username"], "interactions": r["interactions"], "total_tokens": r["total_tokens"]} for r in user_rows],
+            "top_operations": [{"operation": r["operation"], "calls": r["calls"], "total_cost": float(r["total_cost"]), "total_tokens": r["total_tokens"]} for r in op_rows],
+            "cost_trend": [{"day": str(r["day"]), "cost": float(r["cost"]), "tokens": r["tokens"], "calls": r["calls"]} for r in cost_rows],
+            "summary": {
+                "total_runs": summary_row["total_runs"],
+                "total_chats": summary_row["total_chats"],
+                "active_users": summary_row["active_users"],
+                "total_cost": float(summary_row["total_cost"]),
+                "total_tokens": summary_row["total_tokens"],
+                "total_pipelines": summary_row["total_pipelines"],
+            },
+        }
+
+    @app.get("/api/analytics/timeline")
+    @limiter.limit("30/minute")
+    async def get_activity_timeline(
+        request: Request,
+        days: int = Query(90),
+        caller: dict = Depends(auth_dep),
+    ):
+        """GitHub-style contribution activity timeline — grouped by date."""
+        # Merge pipeline runs + chat interactions + approvals into a unified feed
+        events = []
+
+        # Pipeline runs grouped by day
+        run_rows = await store.pool.fetch("""
+            SELECT DATE(r.started_at::timestamptz) AS day,
+                   r.pipeline_id, p.pipeline_name, r.status, r.run_mode,
+                   COUNT(*) OVER (PARTITION BY DATE(r.started_at::timestamptz), r.pipeline_id) AS run_count,
+                   ROW_NUMBER() OVER (PARTITION BY DATE(r.started_at::timestamptz), r.pipeline_id ORDER BY r.started_at::timestamptz DESC) AS rn
+            FROM runs r
+            LEFT JOIN pipelines p ON r.pipeline_id = p.pipeline_id
+            WHERE r.started_at::timestamptz >= NOW() - ($1 || ' days')::interval
+            ORDER BY r.started_at::timestamptz DESC
+        """, str(days))
+        # Deduplicate to one entry per pipeline per day
+        seen_run_keys = set()
+        for r in run_rows:
+            key = f"{r['day']}_{r['pipeline_id']}"
+            if key in seen_run_keys:
+                continue
+            seen_run_keys.add(key)
+            events.append({
+                "day": str(r["day"]),
+                "type": "pipeline_run",
+                "pipeline_name": r["pipeline_name"] or r["pipeline_id"][:12],
+                "pipeline_id": r["pipeline_id"],
+                "count": r["run_count"],
+                "status": r["status"],
+                "mode": r["run_mode"] or "scheduled",
+            })
+
+        # Chat interactions grouped by day + action
+        chat_rows = await store.pool.fetch("""
+            SELECT DATE(created_at::timestamptz) AS day,
+                   username, routed_action, COUNT(*) AS count
+            FROM chat_interactions
+            WHERE created_at::timestamptz >= NOW() - ($1 || ' days')::interval
+              AND username IS NOT NULL AND username != ''
+            GROUP BY DATE(created_at::timestamptz), username, routed_action
+            ORDER BY day DESC
+        """, str(days))
+        for r in chat_rows:
+            events.append({
+                "day": str(r["day"]),
+                "type": "chat",
+                "username": r["username"],
+                "action": r["routed_action"] or "chat",
+                "count": r["count"],
+            })
+
+        # Connector approvals
+        approval_rows = await store.pool.fetch("""
+            SELECT DATE(created_at::timestamptz) AS day,
+                   connector_type, connector_name, status
+            FROM connectors
+            WHERE created_at::timestamptz >= NOW() - ($1 || ' days')::interval
+              AND status IN ('approved', 'applied')
+            ORDER BY created_at::timestamptz DESC
+        """, str(days))
+        for r in approval_rows:
+            events.append({
+                "day": str(r["day"]),
+                "type": "connector",
+                "name": r["connector_name"],
+                "connector_type": r["connector_type"],
+                "status": r["status"],
+            })
+
+        # Sort by day descending
+        events.sort(key=lambda e: e["day"], reverse=True)
+
+        # Group by day
+        grouped = {}
+        for e in events:
+            grouped.setdefault(e["day"], []).append(e)
+
+        return {"timeline": [{"day": day, "events": evts} for day, evts in grouped.items()]}
+
+    # -----------------------------------------------------------------------
     # Build 32: Business Knowledge & Agent Context
     # -----------------------------------------------------------------------
 
@@ -3829,6 +4011,68 @@ def create_app(
         """Read-only view of the agent's full system prompt (base + business knowledge)."""
         prompt = agent._system_prompt()
         return {"system_prompt": prompt}
+
+    # -----------------------------------------------------------------------
+    # Branding settings
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/settings/branding")
+    @limiter.limit("100/minute")
+    async def get_branding(request: Request, caller: dict = Depends(auth_dep)):
+        """Get custom branding (app name + logo)."""
+        prefs = await store.get_preferences(scope="global", scope_value="branding")
+        result = {"app_name": "DAPOS", "logo_url": ""}
+        for p in prefs:
+            val = p.preference_value.get("value", "") if isinstance(p.preference_value, dict) else p.preference_value
+            if p.preference_key == "app_name" and val:
+                result["app_name"] = val
+            elif p.preference_key == "logo_url" and val:
+                result["logo_url"] = val
+        return result
+
+    @app.post("/api/settings/branding/logo")
+    @limiter.limit("10/minute")
+    async def upload_logo(request: Request, caller: dict = Depends(auth_dep)):
+        """Upload a logo image (base64 data URL). Admin only. Max 256KB."""
+        require_role(caller, "admin")
+        body = await request.json()
+        data_url = body.get("data_url", "")
+        if not data_url.startswith("data:image/"):
+            return JSONResponse({"error": "Must be a data:image/* URL"}, 400)
+        # Rough size check (~256KB encoded)
+        if len(data_url) > 350_000:
+            return JSONResponse({"error": "Logo too large (max 256KB)"}, 400)
+        pref = AgentPreference(
+            preference_id="branding_logo_url",
+            scope="global",
+            scope_value="branding",
+            preference_key="logo_url",
+            preference_value={"value": data_url},
+            source="user_explicit",
+            confidence=1.0,
+        )
+        await store.save_preference(pref)
+        return {"status": "saved", "logo_url": data_url}
+
+    @app.put("/api/settings/branding")
+    @limiter.limit("20/minute")
+    async def set_branding(request: Request, caller: dict = Depends(auth_dep)):
+        """Set custom branding (app name + logo). Admin only."""
+        require_role(caller, "admin")
+        body = await request.json()
+        for key in ("app_name", "logo_url"):
+            if key in body:
+                pref = AgentPreference(
+                    preference_id=f"branding_{key}",
+                    scope="global",
+                    scope_value="branding",
+                    preference_key=key,
+                    preference_value={"value": body[key]},
+                    source="user_explicit",
+                    confidence=1.0,
+                )
+                await store.save_preference(pref)
+        return {"status": "saved"}
 
     @app.get("/api/settings/business-knowledge")
     @limiter.limit("100/minute")

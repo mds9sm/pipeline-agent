@@ -28,17 +28,59 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 31 | Dashboard / metrics layer | **Done** | Lightweight KPI definitions on catalog tables, agentic suggest/generate/interpret |
 | 28 | Context API enrichment | **Done** | Auto-context on pipeline runs, cross-pipeline context propagation |
 | 32 | Business context, agent knowledge & metrics reasoning | **Done** | Business knowledge, glossary, KPI definitions feed into agent reasoning |
-| 33 | Pipeline versioning + rollback | Planned | GitOps one-click revert to any prior config, version history UI, diff view, restore with validation |
-| 34 | Webhooks (inbound + outbound) | Planned | Outbound event delivery (run complete, halt, drift) with retry + signatures. Inbound webhook triggers (e.g., Stripe event → trigger sync) |
-| 35 | Freshness SLA dashboards | Planned | Visual SLA burn-down per contract, historical compliance, breach forecasting, per-consumer freshness view |
-| 36 | Multi-worker + resource pools | Planned | Distribute runs across processes/containers + per-source concurrency limits (e.g., max 2 against prod MySQL) |
-| 37 | CDC + streaming ingestion | Planned | Debezium/binlog/WAL capture, micro-batch staging, continuous quality gate, streaming-aware scheduling |
-| 38 | PII detection + column masking | Planned | Agent auto-detects PII via semantic tags (email, SSN, phone), recommends hash/mask at ingest. GDPR/CCPA compliance |
-| 39 | SCD Type 2 + soft deletes | Planned | First-class load strategies: `scd2` (_valid_from/_valid_to columns) and `soft_delete` (_deleted_at). Agent recommends based on table shape |
+| 33 | UI redesign, branding & platform usage | **Done** | Dark sidebar, SVG icons, tier labels, custom branding, GitHub-style usage dashboard |
+| 34 | Pipeline versioning + rollback | Planned | GitOps one-click revert to any prior config, version history UI, diff view, restore with validation |
+| 35 | Webhooks (inbound + outbound) | Planned | Outbound event delivery (run complete, halt, drift) with retry + signatures. Inbound webhook triggers (e.g., Stripe event → trigger sync) |
+| 36 | Freshness SLA dashboards | Planned | Visual SLA burn-down per contract, historical compliance, breach forecasting, per-consumer freshness view |
+| 37 | Multi-worker + resource pools | Planned | Distribute runs across processes/containers + per-source concurrency limits (e.g., max 2 against prod MySQL) |
+| 38 | CDC + streaming ingestion | Planned | Debezium/binlog/WAL capture, micro-batch staging, continuous quality gate, streaming-aware scheduling |
+| 39 | PII detection + column masking | Planned | Agent auto-detects PII via semantic tags (email, SSN, phone), recommends hash/mask at ingest. GDPR/CCPA compliance |
+| 40 | SCD Type 2 + soft deletes | Planned | First-class load strategies: `scd2` (_valid_from/_valid_to columns) and `soft_delete` (_deleted_at). Agent recommends based on table shape |
 
 ---
 
 ## [Unreleased]
+
+### Build 33: UI Redesign, Branding & Platform Usage Dashboard — 2026-03-22 (Claude Opus 4.6)
+
+**Modern data-platform UI with dark sidebar, SVG icons, custom branding, and GitHub-style platform usage dashboard.**
+
+#### Added
+- **SVG nav icons** — Replaced ASCII characters (`>`, `|`, `#`, `~`, `+`, `?`, `%`, `@`, `!`, `^`, `$`, `*`, `i`) with 13 Lucide-style inline SVG icons
+- **Tier label rename** — `T1`/`T2`/`T3` → `Critical`/`Standard`/`Exploratory` in TierBadge component and sidebar filter (internal keys preserved for API compatibility)
+- **Dark sidebar** — `bg-slate-950` sidebar with light text, replacing white sidebar
+- **Cool color palette** — Migrated from warm `stone` to cool `slate` Tailwind palette across entire UI (543 class replacements + hardcoded hex values)
+- **D-mark logo** — Original inline SVG logo (abstract "D" with data-flow lines) as default branding
+- **Custom branding** — Admin can set custom app name + upload logo image (PNG/JPG/SVG/WebP, max 256KB) via Settings → Branding
+  - `GET /api/settings/branding` — retrieve current branding
+  - `PUT /api/settings/branding` — update app name / logo URL
+  - `POST /api/settings/branding/logo` — upload logo as base64 data URL
+  - Branding stored in preferences table with deterministic IDs
+  - Live preview on dark sidebar before saving, reset to defaults
+- **Settings tab** — Consolidated nav item replacing "Costs", with 3 sub-tabs: Usage, Branding, Agent Costs
+- **Platform Usage dashboard** (Settings → Usage) — GitHub profile-style view:
+  - Summary stats row: Runs, Chats, Users, Pipelines, Cost, Tokens
+  - Full-year contribution heatmap (green squares, month labels, day-of-week labels, Less→More legend)
+  - Activity timeline grouped by date: pipeline runs (with per-pipeline breakdown + commit-bar visualization), chat interactions (with action badges), connector generation
+  - `GET /api/analytics/activity?days=N` — heatmap data, top users, operation costs, daily cost trend
+  - `GET /api/analytics/timeline?days=N` — contribution activity feed (runs + chats + connectors)
+
+#### Changed
+- **Nav consolidation** — "Costs" nav item → "Settings" (gear icon), Costs content moved to sub-tab
+- **Login page** — Updated to cool slate palette with D-mark logo
+- **Guide tooltips** — Updated arrow colors and ring offsets for dark sidebar
+- **Sidebar search** — Dark theme input with slate borders
+- **Cache bust** — `v=52` → `v=59`
+
+#### Fixed
+- **Warm hex colors in SVG charts** — Updated hardcoded `#e5e0d8`, `#9c9590` to slate equivalents in freshness chart
+- **`require_role` usage** — Fixed branding endpoints to use `require_role(caller, "admin")` inside function body (not as `Depends`)
+- **`agent_costs` → `agent_cost_logs`** — Fixed table name in analytics queries
+- **`display_name` → `connector_name`** — Fixed column name in timeline connector query
+- **`timestamp` column** — Used `timestamp::timestamptz` casts for TEXT date columns in all analytics SQL
+- **Missing `BrandingSettings` function declaration** — Restored after code generation dropped it
+
+---
 
 ### Build 32: Business Context, Agent Knowledge & Metrics Reasoning — 2026-03-22 (Claude Opus 4.6)
 

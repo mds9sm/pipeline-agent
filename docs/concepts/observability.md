@@ -36,11 +36,11 @@ The agent returns severity (`fresh`, `warning`, `critical`), whether to alert, a
 
 > **⚠️ RULE-BASED**: When the API key is unavailable, freshness uses static tier-based thresholds:
 
-| Tier | Warn | Critical |
-|------|------|----------|
-| Tier 1 (Production) | 15 minutes | 30 minutes |
-| Tier 2 (Standard) | 120 minutes (2h) | 360 minutes (6h) |
-| Tier 3 (Casual) | 1440 minutes (24h) | 4320 minutes (72h) |
+| Tier | UI Label | Warn | Critical |
+|------|----------|------|----------|
+| 1 | Critical | 15 minutes | 30 minutes |
+| 2 | Standard | 120 minutes (2h) | 360 minutes (6h) |
+| 3 | Exploratory | 1440 minutes (24h) | 4320 minutes (72h) |
 
 Override per-pipeline via `freshness_sla_minutes` on the contract.
 

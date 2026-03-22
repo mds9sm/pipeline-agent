@@ -90,5 +90,5 @@ Steps execute in topological order with per-step retry:
 | Transforms | `transforms/engine.py` | SQL transform engine — ref/var resolution, materialization |
 | MCP | `mcp_server.py` | MCP server — 12 resources, 24 tools, 3 prompts |
 | Docs | `docs/` | Structured documentation (quickstart, API, concepts, advanced) |
-| UI | `ui/App.jsx` | React 18 SPA (13 views: Chat, Pipelines, Activity, Freshness, Quality, Alerts, Lineage/DAG, Connectors, Metrics, Settings, Sources, Docs, Agent) |
+| UI | `ui/App.jsx` | React 18 SPA (dark sidebar, SVG icons, 13 views: Chat, Pipelines, Activity, Freshness, Quality, Alerts, Lineage/DAG, Connectors, Metrics, Settings [Usage/Branding/Agent Costs], Sources, Docs, Agent). Custom branding support. Tier labels: Critical/Standard/Exploratory. |
 | CLI | `cli/__main__.py` | 14-command CLI interface |

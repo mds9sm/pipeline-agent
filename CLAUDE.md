@@ -89,7 +89,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `sandbox.py` | AST validation + restricted builtins + import whitelist |
 | `auth.py` | JWT auth with 3 roles (admin, operator, viewer) |
 | `crypto.py` | Fernet encryption for credentials at rest |
-| `ui/App.jsx` | React 18 SPA (CDN, no build) - 13 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Metrics (sparklines + agent suggest/trend), Settings, Sources, Docs, Agent (business knowledge + KPI definitions + system prompt) |
+| `ui/App.jsx` | React 18 SPA (CDN, no build, dark sidebar, SVG icons) - 13 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Metrics (sparklines + agent suggest/trend), Settings (Usage dashboard + Branding + Agent Costs), Sources, Docs, Agent (business knowledge + KPI definitions + system prompt). Custom branding (app name + logo upload). Tier labels: Critical/Standard/Exploratory. |
 | `gitops/repo.py` | Separate git repo manager for pipeline YAML + connector code versioning |
 | `cli/__main__.py` | CLI interface — 14 commands, token caching, fuzzy pipeline resolution |
 | `transforms/engine.py` | SQL transform engine — ref/var resolution, materialization, validation, lineage parsing |

@@ -203,6 +203,21 @@ All endpoints require JWT authentication unless noted. Pass the token as `Author
 | PUT | `/api/settings/business-knowledge` | Update business knowledge | admin |
 | POST | `/api/settings/business-knowledge/parse-kpis` | Agent parses free-text KPIs into structured definitions | admin |
 
+## Settings & Branding (Build 33)
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| GET | `/api/settings/branding` | Get branding config (app_name, logo_url) | viewer+ |
+| PUT | `/api/settings/branding` | Update app name and/or logo URL | admin |
+| POST | `/api/settings/branding/logo` | Upload logo as base64 data URL (max 256KB) | admin |
+
+## Platform Analytics (Build 33)
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| GET | `/api/analytics/activity?days=N` | Platform usage: heatmap, top users, operation costs, summary stats | viewer+ |
+| GET | `/api/analytics/timeline?days=N` | GitHub-style activity timeline: pipeline runs, chats, connectors grouped by date | viewer+ |
+
 ## System
 
 | Method | Endpoint | Auth? | Description |

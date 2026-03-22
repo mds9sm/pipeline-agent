@@ -586,7 +586,7 @@ pipeline-agent/
 │
 ├── ui/
 │   ├── index.html
-│   └── App.jsx               # React SPA: 13 views (CDN React 18 + Tailwind)
+│   └── App.jsx               # React SPA: 13 views, dark sidebar, SVG icons (CDN React 18 + Tailwind)
 │
 ├── test-pipeline-agent.sh    # Comprehensive curl-based test suite (~187 tests)
 ├── CLAUDE.md                 # Product context for Claude Code sessions

@@ -11,13 +11,22 @@
         extend: {
           colors: {
             surface: '#ffffff',
-            bg: '#faf8f5',
-            border: '#e5e0d8',
+            bg: '#f8fafc',
+            border: '#e2e8f0',
+            sidebar: {
+              bg: '#0f172a',
+              hover: '#1e293b',
+              active: '#1e293b',
+              border: '#1e293b',
+              text: '#94a3b8',
+              'text-bright': '#e2e8f0',
+              muted: '#475569',
+            },
             text: {
-              primary: '#2d2a26',
-              secondary: '#6b6560',
-              muted: '#9c9590',
-              faint: '#b8b0a8',
+              primary: '#1e293b',
+              secondary: '#475569',
+              muted: '#94a3b8',
+              faint: '#cbd5e1',
             },
           },
           fontFamily: {
@@ -39,25 +48,25 @@
   <style>
     body {
       font-family: 'Outfit', sans-serif;
-      background: #faf8f5;
-      color: #2d2a26;
+      background: #f8fafc;
+      color: #1e293b;
       margin: 0;
     }
     * { box-sizing: border-box; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: #d5cfc7; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #c0b8ae; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
     .shadow-green { box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.12); }
     .shadow-red { box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.12); }
     .shadow-amber { box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.12); }
     pre { font-family: 'JetBrains Mono', monospace; }
-    input::placeholder { color: #b8b0a8; }
+    input::placeholder { color: #94a3b8; }
     select { appearance: none; }
   </style>
 </head>
 <body>
   <div id="root"></div>
-  <script type="text/babel" src="/static/App.jsx?v=52"></script>
+  <script type="text/babel" src="/static/App.jsx?v=59"></script>
 </body>
 </html>
