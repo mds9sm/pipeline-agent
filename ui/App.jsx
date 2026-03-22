@@ -2094,6 +2094,45 @@ function ActivityRunDetail({ r }) {
             </div>
           )}
 
+          {/* Run Insights */}
+          {r.insights && r.insights.length > 0 && (
+            <div className="bg-white border border-indigo-200 rounded-lg px-3 py-2">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] uppercase text-indigo-400 font-semibold">Insights</span>
+                <span className="text-[10px] bg-indigo-100 text-indigo-600 rounded-full px-1.5">{r.insights.length}</span>
+              </div>
+              <div className="space-y-2">
+                {r.insights.map((ins, i) => (
+                  <div key={i} className="flex items-start gap-2 text-xs">
+                    <span className={`w-2 h-2 rounded-full flex-shrink-0 mt-1 ${
+                      ins.priority === "high" ? "bg-red-400" :
+                      ins.priority === "medium" ? "bg-amber-400" : "bg-green-400"
+                    }`} />
+                    <div className="flex-1">
+                      <div className="flex items-center gap-1.5 mb-0.5">
+                        <span className="bg-stone-100 text-stone-500 rounded px-1.5 py-0 text-[10px] font-medium">{ins.category}</span>
+                        {ins.action_type === "patch_pipeline" && (
+                          <button
+                            className="bg-indigo-50 text-indigo-600 rounded px-1.5 py-0 text-[10px] font-medium hover:bg-indigo-100 cursor-pointer"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (confirm("Apply this suggestion to the pipeline?")) {
+                                api("PATCH", `/api/pipelines/${r.pipeline_id}`, ins.action_payload)
+                                  .then(() => alert("Applied!"))
+                                  .catch((err) => alert("Error: " + err.message));
+                              }
+                            }}
+                          >Apply</button>
+                        )}
+                      </div>
+                      <span className="text-stone-600">{ins.message}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Execution Log with Connector Code Links */}
           {r.execution_log && r.execution_log.length > 0 && (
             <ExecutionLogWithCode

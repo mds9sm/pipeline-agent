@@ -5604,6 +5604,7 @@ def _run_summary(r) -> dict:
         "triggered_by_run_id": r.triggered_by_run_id,
         "triggered_by_pipeline_id": r.triggered_by_pipeline_id,
         "execution_log": r.execution_log,
+        "insights": r.insights,
     }
 
 

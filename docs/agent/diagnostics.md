@@ -2,6 +2,8 @@
 
 The agent diagnostic layer lets DAPOS reason about why pipelines fail, what breaks if a pipeline goes down, and whether there are platform-wide anomalies — capabilities that traditional tools like Fivetran, Airflow, or Monte Carlo cannot provide without an LLM reasoning layer.
 
+> **Agentic behavior**: All diagnostic decisions are made by the agent with contextual reasoning. Rule-based fallbacks are explicitly marked. See each section for fallback details.
+
 ---
 
 ## Pipeline Diagnosis
@@ -70,6 +72,37 @@ python -m cli diagnose demo-stripe-charges
 
 ---
 
+## Run Failure Diagnosis
+
+**Agentic**: When a pipeline run fails, the agent automatically classifies the failure via `diagnose_run_failure()`.
+
+### What the Agent Does
+
+The agent receives the error message, pipeline context, and recent run history, then:
+
+1. **Classifies the failure** into a category: `connector_bug`, `source_unavailable`, `target_unavailable`, `network_error`, `schema_mismatch`, `configuration_error`, `resource_exhaustion`, or `unknown`
+2. **Determines transience** — is this likely to succeed on retry?
+3. **Decides whether to alert** — not every failure warrants a notification
+4. **Enriches the error message** — the run record includes the agent's classification and reasoning
+
+### Rule-Based Fallback
+
+> **⚠️ RULE-BASED**: `_rule_based_failure_diagnosis()` uses keyword matching:
+> - Timeout/connection/refused → `network_error`, transient
+> - Auth/permission/denied → `configuration_error`, not transient
+> - Column/type/schema → `schema_mismatch`, not transient
+> - Default → `unknown`, not transient
+
+---
+
+## Preflight Failure Reasoning
+
+**Agentic**: When preflight checks fail (missing connector, inactive pipeline, etc.), the agent calls `reason_about_preflight_failure()` to explain why and recommend action.
+
+The agent receives the list of failure reasons with context (e.g., which connector is missing, what the pipeline status is) and produces actionable guidance.
+
+---
+
 ## Impact Analysis
 
 **"What breaks if this pipeline goes down?"**
@@ -82,14 +115,9 @@ The agent traces downstream dependencies recursively to estimate blast radius.
 - Active data contracts (SLA commitments at risk)
 - Downstream pipeline tiers (Tier 1 impact is worse than Tier 3)
 
-### Impact Severity
+### Agent-Determined Severity
 
-| Level | Criteria |
-|-------|----------|
-| `low` | 0-1 downstream pipelines, all Tier 3 |
-| `medium` | 2-5 downstream, no Tier 1 |
-| `high` | 5+ downstream or any Tier 1 affected |
-| `critical` | Tier 1 pipeline with active data contracts violated |
+The agent evaluates impact severity based on the full context — number of downstream pipelines, their tiers, active contracts, and current health state. The agent considers whether downstream pipelines have alternative data sources, what the business impact of staleness would be, and whether contracts are at risk.
 
 ### Response Format
 ```json
@@ -139,49 +167,47 @@ python -m cli impact demo-ecommerce-orders
 
 **"Is anything unusual happening across the platform?"**
 
-Runs proactively every 15 minutes. Smart cost optimization ensures Claude is only called when anomalies exist.
+Runs proactively every 15 minutes. Uses **per-pipeline agentic evaluation** for contextual anomaly detection.
 
-### Pre-Filter (Zero Cost When Healthy)
+### How It Works
 
-Before calling Claude, the system scans all active pipelines for:
+1. For each active pipeline, gather signals: volume deviation, failure count, error budget, freshness
+2. **Agent evaluates each pipeline individually** via `evaluate_anomaly_signals()` — considering tier, schedule, day-of-week, historical patterns
+3. After per-pipeline evaluation, agent performs **cross-pipeline pattern analysis** — correlating failures across pipelines sharing sources, identifying platform-wide issues vs. isolated problems
+4. Returns anomaly list with severity, reasoning, and whether each is expected
 
-| Signal | Threshold |
-|--------|-----------|
-| Volume anomaly | > 30% deviation from 30-run average |
-| Repeated failures | 2+ failures in last 24 hours |
-| Error budget pressure | < 5% budget remaining |
-| Freshness critical | Status = CRITICAL |
+### What the Agent Considers Per Pipeline
 
-If **nothing anomalous** is detected → short-circuit, no LLM call, zero cost.
+| Signal | Agent Reasoning |
+|--------|----------------|
+| Volume drop | Is this a weekend/holiday pattern? Source-specific seasonality? |
+| Repeated failures | Transient (timeouts) or persistent (schema change)? Correlated with upstream? |
+| Error budget pressure | Degrading trend or recovering? Recent fixes deployed? |
+| Freshness violation | Is the SLA realistic for this schedule? Expected maintenance window? |
 
-### LLM Reasoning (When Anomalies Found)
+### Cross-Pipeline Patterns
 
-Claude receives anomaly signals with context and considers:
-- Day-of-week patterns (weekend volume drops are expected)
-- Pipeline tier (Tier 1 anomalies are more urgent)
-- Correlated failures (multiple pipelines from same source = source issue)
-- Historical patterns (this pipeline always drops on Sundays)
+The agent identifies:
+- **Source correlation**: Multiple pipelines from the same source failing → source issue, not pipeline issues
+- **Cascading failures**: Upstream failure causing downstream halts
+- **Platform-wide events**: Infrastructure issues affecting all pipelines
 
-### Response
-```json
-{
-  "status": "anomalies_detected",
-  "anomalies": [
-    {
-      "pipeline": "demo-stripe-charges",
-      "signal": "volume_drop",
-      "detail": "Row count dropped 65% vs 30-run average",
-      "severity": "warning",
-      "recommendation": "Investigate — unlikely to be day-of-week pattern for Stripe charges"
-    }
-  ],
-  "summary": "1 anomaly detected: volume drop on demo-stripe-charges"
-}
-```
+### Rule-Based Fallback
+
+> **⚠️ RULE-BASED**: `_rule_based_anomaly_evaluation()` uses fixed thresholds:
+>
+> | Signal | Threshold |
+> |--------|-----------|
+> | Volume deviation | > 30% from 30-run average |
+> | Repeated failures | 2+ failures in 24 hours |
+> | Error budget pressure | Budget remaining < 5% |
+> | Freshness violation | Status = CRITICAL |
+>
+> No contextual reasoning — signals are evaluated independently with no cross-pipeline analysis.
 
 ### CRITICAL Alerts
 
-When the proactive scan finds unexpected anomalies, it automatically creates CRITICAL alerts that are dispatched through configured notification channels.
+When the agent finds unexpected anomalies (not explained by known patterns), it automatically creates CRITICAL alerts with agent reasoning included in the alert detail.
 
 ### Usage
 
@@ -196,3 +222,43 @@ python -m cli anomalies
 "are there any anomalies"
 "platform health check"
 ```
+
+---
+
+## Error Budget Diagnosis
+
+**Agentic**: When a pipeline's error budget is exhausted, the agent calls `diagnose_error_budget()` to analyze the failure pattern.
+
+### What the Agent Returns
+
+| Field | Description |
+|-------|-------------|
+| `pattern` | `transient`, `persistent`, or `degrading` |
+| `diagnosis` | Natural language explanation of what's happening |
+| `recommended_actions` | Specific steps to recover |
+| `should_pause` | Whether to stop scheduling this pipeline |
+
+### Rule-Based Fallback
+
+> **⚠️ RULE-BASED**: `_rule_based_budget_diagnosis()` classifies by scanning error messages for keywords:
+> - Timeout/connection → `transient`, recommend retry with backoff
+> - Auth/permission → `persistent`, recommend credential check
+> - Default → `unknown`, recommend manual investigation
+
+---
+
+## Contract Violation Assessment
+
+**Agentic**: When a data contract is violated (freshness SLA breach, schema incompatibility), the agent calls `assess_contract_violation()` to evaluate actual impact.
+
+The agent considers:
+- How many consumers are affected
+- Whether consumers have alternative data sources
+- The business criticality of the affected data
+- Whether the violation is temporary or structural
+
+Returns severity (INFO/WARNING/CRITICAL) and impact assessment narrative.
+
+### Rule-Based Fallback
+
+> **⚠️ RULE-BASED**: Without API key, all contract violations are assigned WARNING severity with a generic message. No impact assessment is performed.

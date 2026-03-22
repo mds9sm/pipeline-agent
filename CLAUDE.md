@@ -71,7 +71,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `main.py` | Entry point - wires 4 async loops + dependency injection |
 | `config.py` | Environment variable loading with defaults |
 | `api/server.py` | FastAPI with 40+ endpoints, JWT auth, rate limiting |
-| `agent/core.py` | Claude API calls: route_command, propose_strategy, generate_connector, reason_about_quality, parse_schedule, guided_pipeline_response |
+| `agent/core.py` | Claude API calls: route_command, propose_strategy, generate_connector, decide_quality_gate, diagnose_run_failure, diagnose_error_budget, reason_about_freshness, evaluate_anomaly_signals, assess_contract_violation, generate_migration_sql, parse_schedule, guided_pipeline_response (each with `_rule_based_*` fallback) |
 | `agent/conversation.py` | Multi-turn onboarding/discovery flow |
 | `agent/autonomous.py` | Pipeline execution state machine (PENDING -> COMPLETE/HALTED) with structured execution logging (13 steps) |
 | `contracts/models.py` | All dataclasses + enums (PipelineContract, ConnectorRecord, RunRecord, etc.) |
@@ -105,6 +105,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 6. **No dbt, no Airflow** — DAPOS is the transform and orchestration layer. Native SQL transforms, not external tool delegation.
 7. **Never delete unconsumed data** — Any cleanup hook must prove its boundary (watermark, batch_id, transaction scope). Static `DELETE FROM table` without bounds is rejected by the agent.
 8. **Pipelines are composable** — Moving toward step DAGs (extract → transform → gate → promote → cleanup) instead of a fixed linear flow. New features should be built as composable steps.
+9. **Agentic-first** — All runtime decisions (quality gate, failure diagnosis, freshness evaluation, anomaly detection, error budget diagnosis, schema migration, contract violation assessment) MUST use agent reasoning via Claude API. Rule-based logic is acceptable ONLY as a fallback when the API key is unavailable. Fallback methods MUST be named `_rule_based_*()` or `_fallback_*()` and clearly marked as non-agentic. When adding new decision logic, always implement the agentic path first, then add a rule-based fallback. The approval flow must be considered for any structural change the agent proposes.
 
 ## How to Start
 

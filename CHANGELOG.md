@@ -32,6 +32,38 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ## [Unreleased]
 
+### Build 30b: Run Insights — 2026-03-22 (Claude Opus 4.6)
+
+**After every pipeline run, the agent analyzes results and generates actionable suggestions. Shown in the Activity view as an Insights card with one-click "Apply" buttons for configuration changes.**
+
+#### Added
+- **`generate_run_insights()` agentic method** (`agent/core.py`):
+  - Agent receives run results, quality checks, pipeline config, baselines, and history
+  - Generates 2-5 contextual insights per run (strategy, quality, schedule, volume, config, errors)
+  - First-run insights: baseline established, strategy optimization, merge key suggestions
+  - Subsequent runs: volume trends, quality patterns, performance, error patterns
+  - Each insight has: category, message, priority, optional action_type + action_payload
+  - `_rule_based_run_insights()` fallback for when API key unavailable
+
+- **Insights generation in execution flow** (`agent/autonomous.py`):
+  - Called after every run reaches terminal state (complete, failed, halted)
+  - Non-blocking — insight generation errors never fail the run
+  - Works for both legacy and step-DAG execution paths
+  - Logged as "insights" execution step
+
+- **`insights` field on RunRecord** (`contracts/models.py`, `contracts/store.py`):
+  - JSONB column on runs table (DDL migration included)
+  - Persisted and returned in all run API responses
+
+- **Insights card in Activity view** (`ui/App.jsx`):
+  - Indigo-themed card between Quality Gate and Execution Log
+  - Priority indicator dots (red/amber/green)
+  - Category pills (strategy, quality, volume, etc.)
+  - "Apply" button for `patch_pipeline` suggestions — one-click configuration changes
+  - Count badge in header
+
+---
+
 ### Build 30: Fully Agentic Failure Detection & Quality — 2026-03-22 (Claude Opus 4.6)
 
 **Replace hardcoded threshold logic with agent reasoning across all failure detection and data quality systems. The agent IS the decision maker — checks provide signals, the agent decides.**
@@ -88,6 +120,14 @@ Format: Each entry records what changed, why, and test results at the time of th
 - `PipelineRunner` passes `agent` for failure diagnosis, preflight, and error budget
 - Every agentic method has a `_rule_based_*` fallback for when API key is unavailable
 - Agent methods: `decide_quality_gate`, `diagnose_error_budget`, `reason_about_freshness`, `diagnose_run_failure`, `reason_about_preflight_failure`, `assess_contract_violation`, `evaluate_anomaly_signals`
+
+#### Documentation & Convention
+- **CLAUDE.md**: Added critical design constraint #9 — "Agentic-first" convention requiring all new features to use agent reasoning with rule-based fallbacks explicitly named `_rule_based_*`
+- **docs/concepts/quality-gate.md**: Rewritten — agent decides PROMOTE/HALT from check signals, rule-based fallback highlighted with ⚠️ marker
+- **docs/concepts/observability.md**: Rewritten — agentic freshness evaluation, error budget diagnosis, per-pipeline anomaly detection with cross-pipeline analysis; all rule-based fallbacks explicitly marked
+- **docs/agent/overview.md**: New operations table with all 8 agentic decision methods + their fallbacks; reframed rule-based section as convention documentation
+- **docs/agent/diagnostics.md**: Rewritten — added run failure diagnosis, preflight reasoning, error budget diagnosis, contract violation assessment sections; removed hardcoded threshold tables, replaced with agent reasoning descriptions
+- **docs/advanced/schema-drift.md**: Updated — pre-extract check described, agent-generated migration SQL documented, rule-based fallback noted
 
 ---
 

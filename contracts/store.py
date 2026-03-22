@@ -280,8 +280,8 @@ class ContractStore:
                 drift_detected, quality_results, gate_decision,
                 error, retry_count,
                 triggered_by_run_id, triggered_by_pipeline_id,
-                execution_log
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+                execution_log, insights
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
             ON CONFLICT (run_id) DO UPDATE SET
                 completed_at=EXCLUDED.completed_at, status=EXCLUDED.status,
                 rows_extracted=EXCLUDED.rows_extracted, rows_loaded=EXCLUDED.rows_loaded,
@@ -295,7 +295,8 @@ class ContractStore:
                 error=EXCLUDED.error, retry_count=EXCLUDED.retry_count,
                 triggered_by_run_id=EXCLUDED.triggered_by_run_id,
                 triggered_by_pipeline_id=EXCLUDED.triggered_by_pipeline_id,
-                execution_log=EXCLUDED.execution_log
+                execution_log=EXCLUDED.execution_log,
+                insights=EXCLUDED.insights
         """,
             r.run_id, r.pipeline_id, r.started_at, r.completed_at,
             r.status.value, r.run_mode.value,
@@ -309,6 +310,7 @@ class ContractStore:
             r.error, r.retry_count,
             r.triggered_by_run_id, r.triggered_by_pipeline_id,
             json.dumps(r.execution_log) if r.execution_log else None,
+            json.dumps(r.insights) if r.insights else None,
         )
 
     async def get_run(self, run_id: str) -> Optional[RunRecord]:
@@ -1661,6 +1663,7 @@ def _row_to_run(row: asyncpg.Record) -> RunRecord:
         execution_log=json.loads(row["execution_log"]) if row.get("execution_log") else None,
         triggered_by_run_id=row.get("triggered_by_run_id"),
         triggered_by_pipeline_id=row.get("triggered_by_pipeline_id"),
+        insights=json.loads(row["insights"]) if row.get("insights") else None,
     )
 
 
@@ -2452,6 +2455,8 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS narrative TEXT NOT NULL DEFAULT '';
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS semantic_tags JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS trust_weights JSONB;
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS business_context JSONB NOT NULL DEFAULT '{}';
+-- Build 30: Run insights
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS insights JSONB;
 """
 
 # Alias used by several modules (agent, scheduler, monitor, api).

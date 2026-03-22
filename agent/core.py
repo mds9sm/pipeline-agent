@@ -15,10 +15,11 @@ import httpx
 
 from config import Config
 from contracts.models import (
-    TableProfile, PipelineContract, CheckResult, AgentPreference,
+    TableProfile, PipelineContract, RunRecord, CheckResult, AgentPreference,
     ContractChangeProposal, ConnectorRecord, AlertRecord, AgentCostLog,
     ConnectorType, ConnectorStatus, TestStatus, ChangeType, TriggerType,
     ProposalStatus, PreferenceScope, PreferenceSource,
+    RunStatus, GateDecision,
     new_id, now_iso,
 )
 from contracts.store import Store
@@ -1003,6 +1004,221 @@ Persistent examples: schema mismatch, missing table, authentication failure, dis
         return {"root_cause": error, "category": "unknown", "is_transient": False,
                 "recommended_action": "Investigate error manually",
                 "should_retry": False, "should_alert": True}
+
+    # ------------------------------------------------------------------
+    # Agentic run insights (Build 30)
+    # ------------------------------------------------------------------
+
+    async def generate_run_insights(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+        prior_runs: list,
+    ) -> list[dict]:
+        """Agent analyzes completed run and generates actionable insights.
+
+        Returns list of dicts, each with:
+            category: quality | performance | strategy | schema | schedule | volume | configuration | error
+            message: human-readable insight
+            priority: high | medium | low
+            action_type: patch_pipeline | investigate | acknowledge | null
+            action_payload: dict for patch_pipeline actions, or null
+        """
+        is_first_run = len([r for r in prior_runs if r.status == RunStatus.COMPLETE]) == 0
+
+        # Build run summary for prompt
+        checks_summary = ""
+        if run.quality_results and isinstance(run.quality_results.get("checks"), list):
+            checks_summary = "\n".join(
+                f"  - {c.get('name', '?')}: {c.get('status', '?')} — {c.get('detail', '')}"
+                for c in run.quality_results["checks"]
+            )
+
+        prior_summary = ""
+        if prior_runs:
+            prior_summary = "\n".join(
+                f"  - {r.status.value if hasattr(r.status, 'value') else r.status}: "
+                f"{r.rows_extracted} rows, gate={r.gate_decision.value if r.gate_decision and hasattr(r.gate_decision, 'value') else r.gate_decision}"
+                for r in prior_runs[:5]
+            )
+
+        refresh = contract.refresh_type.value if hasattr(contract.refresh_type, "value") else contract.refresh_type
+        load = contract.load_type.value if hasattr(contract.load_type, "value") else contract.load_type
+
+        if not self.has_api:
+            return self._rule_based_run_insights(contract, run, prior_runs)
+
+        user_prompt = f"""Pipeline "{contract.pipeline_name}" just completed a run. Analyze the results and provide actionable insights.
+
+Run results:
+- Status: {run.status.value if hasattr(run.status, 'value') else run.status}
+- Rows extracted: {run.rows_extracted}
+- Rows loaded: {run.rows_loaded}
+- Gate decision: {run.gate_decision.value if run.gate_decision and hasattr(run.gate_decision, 'value') else run.gate_decision}
+- Error: {run.error or "none"}
+- Watermark: {run.watermark_before} → {run.watermark_after}
+- Is first run: {is_first_run}
+
+Quality checks:
+{checks_summary or "  (none)"}
+
+Pipeline configuration:
+- Refresh type: {refresh}
+- Load type: {load}
+- Merge keys: {contract.merge_keys or "none"}
+- Incremental column: {contract.incremental_column or "none"}
+- Schedule: {contract.schedule_cron or "none"}
+- Tier: {contract.tier}
+- Source: {contract.source_schema}.{contract.source_table}
+- Target: {contract.target_schema}.{contract.target_table}
+- Column mappings: {len(contract.column_mappings)} columns
+- Baselines: row_avg={contract.baseline_volume_avg}, row_stddev={contract.baseline_volume_stddev}
+
+Recent run history (newest first):
+{prior_summary or "  (no prior runs)"}
+
+Generate 2-5 insights. Focus on:
+- First runs: baseline establishment, strategy optimization, merge key suggestions, schedule recommendations
+- Subsequent runs: volume trends, quality patterns, performance, error patterns
+- Always: configuration improvements, strategy mismatches, actionable quick-wins
+
+For action_type "patch_pipeline", provide the exact fields to PATCH in action_payload.
+
+Respond with a JSON array:
+[{{
+  "category": "quality|performance|strategy|schema|schedule|volume|configuration|error",
+  "message": "Clear, actionable insight in 1-2 sentences for a non-technical user",
+  "priority": "high|medium|low",
+  "action_type": "patch_pipeline" or "investigate" or "acknowledge" or null,
+  "action_payload": {{}} or null
+}}]
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=contract.pipeline_id,
+                operation="generate_run_insights",
+            )
+            result = self._extract_json(text)
+            if isinstance(result, list):
+                return result[:5]  # cap at 5 insights
+            return []
+        except Exception as e:
+            log.warning("generate_run_insights Claude error: %s", e)
+            return self._rule_based_run_insights(contract, run, prior_runs)
+
+    def _rule_based_run_insights(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+        prior_runs: list,
+    ) -> list[dict]:
+        """Rule-based fallback for run insights when API key is unavailable."""
+        insights = []
+        is_first_run = len([r for r in prior_runs if r.status == RunStatus.COMPLETE]) == 0
+        refresh = contract.refresh_type.value if hasattr(contract.refresh_type, "value") else contract.refresh_type
+        load = contract.load_type.value if hasattr(contract.load_type, "value") else contract.load_type
+        status = run.status.value if hasattr(run.status, "value") else run.status
+
+        if status == "complete":
+            if is_first_run:
+                insights.append({
+                    "category": "volume",
+                    "message": f"First run complete — {run.rows_extracted} rows established as your baseline. Future runs will be compared against this.",
+                    "priority": "medium",
+                    "action_type": None,
+                    "action_payload": None,
+                })
+            # Suggest incremental if full refresh and has timestamp column
+            if refresh == "full" and contract.incremental_column:
+                insights.append({
+                    "category": "strategy",
+                    "message": f"This pipeline uses full refresh but has an incremental column '{contract.incremental_column}'. Switching to incremental would be faster and use less resources.",
+                    "priority": "high",
+                    "action_type": "patch_pipeline",
+                    "action_payload": {"refresh_type": "incremental"},
+                })
+            # Suggest merge keys if using append
+            if load == "append" and contract.merge_keys:
+                insights.append({
+                    "category": "strategy",
+                    "message": "This pipeline appends data but has merge keys defined. Switching to merge (upsert) would prevent duplicate rows on re-runs.",
+                    "priority": "high",
+                    "action_type": "patch_pipeline",
+                    "action_payload": {"load_type": "merge"},
+                })
+            # Volume anomaly check
+            if (
+                not is_first_run
+                and contract.baseline_volume_avg
+                and contract.baseline_volume_avg > 0
+                and run.rows_extracted > 0
+            ):
+                ratio = run.rows_extracted / contract.baseline_volume_avg
+                if ratio < 0.5:
+                    insights.append({
+                        "category": "volume",
+                        "message": f"Row count ({run.rows_extracted}) is {ratio:.0%} of the baseline average ({contract.baseline_volume_avg:.0f}). This is a significant drop worth investigating.",
+                        "priority": "high",
+                        "action_type": "investigate",
+                        "action_payload": None,
+                    })
+                elif ratio > 2.0:
+                    insights.append({
+                        "category": "volume",
+                        "message": f"Row count ({run.rows_extracted}) is {ratio:.1f}x the baseline average ({contract.baseline_volume_avg:.0f}). Verify this volume spike is expected.",
+                        "priority": "medium",
+                        "action_type": "investigate",
+                        "action_payload": None,
+                    })
+            # Quality warnings
+            if run.gate_decision and (
+                run.gate_decision == GateDecision.PROMOTE_WITH_WARNING
+                or (hasattr(run.gate_decision, "value") and run.gate_decision.value == "promote_with_warning")
+            ):
+                insights.append({
+                    "category": "quality",
+                    "message": "Data was promoted with warnings. Review the quality check details above to see which checks flagged issues.",
+                    "priority": "medium",
+                    "action_type": "investigate",
+                    "action_payload": None,
+                })
+
+        elif status == "failed":
+            insights.append({
+                "category": "error",
+                "message": f"Run failed: {(run.error or 'unknown error')[:200]}. Check the error details and execution log for root cause.",
+                "priority": "high",
+                "action_type": "investigate",
+                "action_payload": None,
+            })
+            # Count consecutive failures
+            consec_failures = 0
+            for r in prior_runs:
+                s = r.status.value if hasattr(r.status, "value") else r.status
+                if s == "failed":
+                    consec_failures += 1
+                else:
+                    break
+            if consec_failures >= 2:
+                insights.append({
+                    "category": "error",
+                    "message": f"This is the {consec_failures + 1}{'rd' if consec_failures + 1 == 3 else 'th'} consecutive failure. Consider pausing the pipeline until the root cause is resolved.",
+                    "priority": "high",
+                    "action_type": "investigate",
+                    "action_payload": None,
+                })
+
+        elif status == "halted":
+            insights.append({
+                "category": "quality",
+                "message": "The quality gate halted this run — data was not promoted to production. Review the check results to understand why.",
+                "priority": "high",
+                "action_type": "investigate",
+                "action_payload": None,
+            })
+
+        return insights[:5]
 
     # ------------------------------------------------------------------
     # Agentic preflight reasoning (Tier 2B)

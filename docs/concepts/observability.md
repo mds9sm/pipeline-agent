@@ -2,6 +2,8 @@
 
 DAPOS provides built-in observability across freshness monitoring, alerting, error budgets, cost tracking, and AI-powered anomaly detection — replacing external tools like Monte Carlo.
 
+> **Agentic behavior**: Freshness severity, anomaly detection, error budget diagnosis, and contract violation assessment are all **agent-driven decisions**. The monitor and observability loops collect signals; the agent interprets them in context. Rule-based fallbacks exist for when the API key is unavailable and are explicitly marked as such.
+
 ---
 
 ## Freshness Monitoring
@@ -14,18 +16,25 @@ The **monitor loop** (every 5 minutes) checks each active pipeline:
 
 1. Reads the last successful run's completion timestamp
 2. Calculates `staleness_minutes = now - last_completed_at`
-3. Compares against the pipeline's freshness SLA
+3. Agent evaluates freshness context via `reason_about_freshness()`
 4. Saves a `FreshnessSnapshot` record (rows accumulate for time-series)
 
-### Freshness Status
+### Agentic Freshness Evaluation
 
-| Status | Condition |
-|--------|-----------|
-| **FRESH** | staleness < SLA threshold |
-| **WARNING** | staleness > warn threshold |
-| **CRITICAL** | staleness > critical threshold |
+The agent receives staleness data along with context and reasons about:
 
-### Per-Tier SLA Defaults
+| Factor | What the Agent Considers |
+|--------|--------------------------|
+| **SLA realism** | Is the freshness SLA achievable given the pipeline's schedule? (e.g., hourly SLA on a daily-scheduled pipeline is unrealistic) |
+| **Tier context** | Tier 1 pipelines get urgent severity; Tier 3 gets informational |
+| **Pattern recognition** | Is this pipeline always stale at this time of day? Weekend pattern? |
+| **Alert necessity** | Should this actually trigger an alert, or is it expected? |
+
+The agent returns severity (`fresh`, `warning`, `critical`), whether to alert, and reasoning.
+
+### Rule-Based Fallback
+
+> **⚠️ RULE-BASED**: When the API key is unavailable, freshness uses static tier-based thresholds:
 
 | Tier | Warn | Critical |
 |------|------|----------|
@@ -45,14 +54,16 @@ The UI Freshness tab renders staleness over time as line charts with SLA thresho
 
 ## Alerts
 
-Alerts are dispatched through multiple channels when pipelines breach thresholds.
+Alerts are dispatched through multiple channels when the agent determines a condition warrants notification.
 
 ### Alert Severity
 
-| Severity | When |
-|----------|------|
+Alert severity is determined by the agent based on context, not fixed rules. General patterns:
+
+| Severity | Typical Conditions |
+|----------|-------------------|
 | **INFO** | First-run warnings, minor schema additions |
-| **WARNING** | Quality gate warnings, freshness approaching SLA, error budget < 20% |
+| **WARNING** | Quality gate warnings, freshness approaching SLA, error budget pressure |
 | **CRITICAL** | Pipeline halted, freshness SLA breached, error budget exhausted, contract violated |
 
 ### Dispatch Channels
@@ -69,7 +80,7 @@ Tier 3 pipelines use **daily digest** (default 9 AM UTC) instead of immediate al
 
 ### Alert Lifecycle
 
-1. Alert created with severity and detail
+1. Alert created with agent-determined severity and detail (including reasoning)
 2. Dispatched to configured channels based on tier policy
 3. Visible in UI Alerts tab and via `GET /api/alerts`
 4. Acknowledged by operator (tracked with `acknowledged_by` and timestamp)
@@ -84,7 +95,7 @@ Tier 3 pipelines use **daily digest** (default 9 AM UTC) instead of immediate al
 
 ## Error Budgets
 
-Error budgets track pipeline reliability over a rolling window and automatically pause scheduling when reliability drops too low.
+Error budgets track pipeline reliability over a rolling window. When exhausted, the **agent diagnoses the failure pattern** and recommends recovery actions.
 
 ### How It Works
 
@@ -98,27 +109,28 @@ escalated = success_rate < threshold
 
 **Default threshold**: 90% (configurable per-pipeline).
 
+### Agentic Error Budget Diagnosis
+
+When the error budget is exhausted, the agent calls `diagnose_error_budget()` to:
+
+| Analysis | What the Agent Does |
+|----------|-------------------|
+| **Pattern classification** | Identifies if failures are transient, persistent, or degrading |
+| **Recovery recommendation** | Suggests specific actions (retry, investigate source, pause, escalate) |
+| **Alert enrichment** | Includes diagnosis, pattern, and recommended_actions in the alert |
+| **Pause decision** | Determines whether to actually pause scheduling based on pattern |
+
+### Rule-Based Fallback
+
+> **⚠️ RULE-BASED**: Without API key, error budget diagnosis uses keyword matching to classify failures as `transient` (timeout/connection keywords), `persistent` (auth/permission keywords), or `unknown`.
+
 ### Escalation
 
 When `escalated = true` (success rate below threshold):
-- **Scheduler stops triggering** the pipeline
-- **CRITICAL alert** dispatched
+- Agent diagnoses the failure pattern
+- **CRITICAL alert** dispatched with diagnosis
+- **Scheduler stops triggering** the pipeline (if agent recommends pause)
 - Pipeline requires manual intervention (fix root cause, then resume)
-
-This prevents cascading failures — a repeatedly failing pipeline won't keep consuming resources.
-
-### Example
-
-| Metric | Value |
-|--------|-------|
-| Window | 7 days |
-| Total runs | 42 |
-| Successful | 36 |
-| Failed | 6 |
-| Success rate | 85.7% |
-| Threshold | 90% |
-| Budget remaining | -43% (exhausted) |
-| Escalated | **true** |
 
 ### Viewing
 
@@ -137,7 +149,7 @@ Every LLM call made by the agent is logged with token counts and latency.
 | Field | Description |
 |-------|-------------|
 | `pipeline_id` | Which pipeline triggered the call (if applicable) |
-| `operation` | e.g., `propose_strategy`, `generate_connector`, `diagnose_pipeline` |
+| `operation` | e.g., `propose_strategy`, `generate_connector`, `decide_quality_gate` |
 | `model` | Claude model used |
 | `input_tokens` | Prompt tokens consumed |
 | `output_tokens` | Response tokens generated |
@@ -155,34 +167,57 @@ Every LLM call made by the agent is logged with token counts and latency.
 
 ## Anomaly Detection
 
-DAPOS proactively scans for platform-wide anomalies every 15 minutes using AI reasoning.
+DAPOS proactively scans for platform-wide anomalies every 15 minutes using **per-pipeline agentic evaluation**.
 
-### Pre-Filter (No LLM Cost if Healthy)
+### How It Works
 
-Before calling Claude, the system pre-filters all active pipelines for:
+For each active pipeline, the agent calls `evaluate_anomaly_signals()` which:
 
-| Signal | Threshold |
-|--------|-----------|
-| Volume deviation | > 30% from 30-run average |
-| Repeated failures | 2+ failures in 24 hours |
-| Error budget pressure | Budget remaining < 5% |
-| Freshness violation | Status = CRITICAL |
+1. Gathers signals: volume deviation, failure count, error budget pressure, freshness status
+2. The **agent evaluates each pipeline's signals in context** — considering tier, schedule, day-of-week patterns, and historical norms
+3. Returns whether the pipeline is anomalous, severity, and reasoning
+4. After per-pipeline evaluation, the agent performs **cross-pipeline pattern analysis** (e.g., multiple pipelines from the same source failing = source issue, not pipeline issues)
 
-If **no anomalies detected**, the check short-circuits — no Claude API call, zero cost.
+### Agent Context for Anomaly Evaluation
 
-### LLM Reasoning (When Anomalies Found)
+| Signal | What the Agent Considers |
+|--------|--------------------------|
+| Volume deviation | Is this a weekend/holiday pattern? Is the source known to have variable volume? |
+| Repeated failures | Are these transient (timeouts) or persistent (schema change)? |
+| Error budget pressure | Is the pipeline degrading or recovering? |
+| Freshness violation | Is the SLA realistic for the schedule? |
+| Cross-pipeline correlation | Are multiple pipelines from the same source affected? |
 
-When anomalies are present, Claude receives:
-- Anomalous pipeline signals with context
-- Day-of-week patterns (weekend volume drops are normal)
-- Pipeline tier and SLA expectations
-- Historical patterns
+### Rule-Based Fallback
 
-Returns: anomaly descriptions, severity, and recommended actions (investigate, auto-remediate, skip).
+> **⚠️ RULE-BASED**: Without API key, anomaly detection falls back to `_rule_based_anomaly_evaluation()` with fixed thresholds:
+>
+> | Signal | Threshold |
+> |--------|-----------|
+> | Volume deviation | > 30% from 30-run average |
+> | Repeated failures | 2+ failures in 24 hours |
+> | Error budget pressure | Budget remaining < 5% |
+> | Freshness violation | Status = CRITICAL |
+>
+> If **no signals trigger** → short-circuit, no anomaly reported.
 
-**API**: `GET /api/observability/anomalies`
+### CRITICAL Alerts
 
-**CLI**: `python -m cli anomalies`
+When the agent finds unexpected anomalies (not explained by known patterns), it automatically creates CRITICAL alerts with agent reasoning included in the alert detail.
+
+### Usage
+
+```bash
+# API
+GET /api/observability/anomalies
+
+# CLI
+python -m cli anomalies
+
+# Chat
+"are there any anomalies"
+"platform health check"
+```
 
 ---
 

@@ -508,6 +508,8 @@ class RunRecord:
     # Build 15: upstream trigger context
     triggered_by_run_id: Optional[str] = None
     triggered_by_pipeline_id: Optional[str] = None
+    # Build 30: post-run agent insights
+    insights: Optional[list] = None
 
 
 @dataclass

@@ -390,10 +390,14 @@ class PipelineRunner:
             run.status = RunStatus.COMPLETE
             run.completed_at = now_iso()
             self._log_step(run, "complete", f"{run.rows_extracted} rows promoted successfully")
+
+            # 10. Generate run insights
+            await self._generate_insights(contract, run)
+
             await self.store.save_run(run)
             log.info("Run complete -- %d rows extracted", run.rows_extracted)
 
-            # 10. Update error budget
+            # 11. Update error budget
             await self._update_error_budget(contract, run)
 
             return run
@@ -426,6 +430,9 @@ class PipelineRunner:
                     )
                 except Exception as diag_err:
                     log.warning("Agent failure diagnosis error: %s", diag_err)
+
+            # Generate insights even for failed runs
+            await self._generate_insights(contract, run)
 
             await self.store.save_run(run)
 
@@ -602,6 +609,31 @@ class PipelineRunner:
             contract.baseline_volume_stddev = (
                 math.sqrt(variance) if variance > 0 else 0.0
             )
+
+    # ------------------------------------------------------------------
+    # Run insights
+    # ------------------------------------------------------------------
+
+    async def _generate_insights(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+    ) -> None:
+        """Generate agent insights for a completed run. Non-blocking — never fails the run."""
+        if not self.agent:
+            return
+        try:
+            prior_runs = await self.store.list_runs(contract.pipeline_id, limit=10)
+            # Exclude current run from priors
+            prior_runs = [r for r in prior_runs if r.run_id != run.run_id]
+            run.insights = await self.agent.generate_run_insights(
+                contract, run, prior_runs,
+            )
+            count = len(run.insights) if run.insights else 0
+            if count:
+                self._log_step(run, "insights", f"{count} insight(s) generated")
+        except Exception as e:
+            log.warning("Insight generation error: %s", e)
 
     # ------------------------------------------------------------------
     # Error budget
@@ -1196,6 +1228,7 @@ class PipelineRunner:
             await self._write_run_metadata(contract, run, extract_result, upstream_run)
 
             self._log_step(run, "complete", f"{run.rows_extracted} rows, {len(ordered)} steps executed")
+            await self._generate_insights(contract, run)
             await self.store.save_run(run)
             await self._update_error_budget(contract, run)
             return run
@@ -1206,6 +1239,7 @@ class PipelineRunner:
             run.error = str(e)
             run.status = RunStatus.FAILED
             run.completed_at = now_iso()
+            await self._generate_insights(contract, run)
             await self.store.save_run(run)
             await self._update_error_budget(contract, run)
             return run
