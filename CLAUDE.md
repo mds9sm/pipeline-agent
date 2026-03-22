@@ -29,7 +29,7 @@ Ships with 8 seed connectors (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebo
 - **DAG visualization** — UI-visible pipeline dependency graph with execution status. *(Implemented)*
 - **Agent topology reasoning** — User describes a business problem, agent designs multi-pipeline architecture with the right patterns (consume-and-merge, fan-in, SCD, etc.). *(Implemented)*
 - **Data catalog & AI enablement** — Built-in catalog with trust scores, semantic tags, business context, anomaly narratives. *(Implemented)*
-- **MCP server** — Expose DAPOS to AI agents via Model Context Protocol (9 resources, 13 tools, 3 prompts). *(Implemented)*
+- **MCP server** — Expose DAPOS to AI agents via Model Context Protocol (12 resources, 24 tools, 3 prompts). *(Implemented)*
 
 **Key patterns the platform must support:**
 | Pattern | Example |
@@ -93,7 +93,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `gitops/repo.py` | Separate git repo manager for pipeline YAML + connector code versioning |
 | `cli/__main__.py` | CLI interface — 14 commands, token caching, fuzzy pipeline resolution |
 | `transforms/engine.py` | SQL transform engine — ref/var resolution, materialization, validation, lineage parsing |
-| `mcp_server.py` | MCP server — 11 resources, 17 tools, 3 prompts; exposes DAPOS to AI agents via Model Context Protocol |
+| `mcp_server.py` | MCP server — 12 resources, 24 tools, 3 prompts; exposes DAPOS to AI agents via Model Context Protocol (incl. metrics) |
 | `docs/` | Structured documentation — quickstart, architecture, concepts, API/CLI reference |
 
 ## Critical Design Constraints

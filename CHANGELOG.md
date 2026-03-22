@@ -75,7 +75,20 @@ Format: Each entry records what changed, why, and test results at the time of th
   - Full reference: data model, API endpoints, chat integration, agentic architecture
 
 #### Changed
-- `ui/index.html` — cache bust v=47 → v=48
+- **Scheduled metric computation** (`main.py`):
+  - Uses `croniter` to evaluate each metric's `schedule_cron` expression
+  - Only computes metrics that are actually due (not all enabled metrics every tick)
+  - Evaluates based on last snapshot timestamp vs next cron occurrence
+- **UI metric editing** (`ui/App.jsx`):
+  - Inline edit form: name, description, SQL expression, schedule cron, enabled toggle
+  - Edit / Disable / Enable buttons on each expanded metric card
+  - Schedule badge ("auto") and disabled badge ("off") on metric header row
+  - Cache bust v=48 → v=49
+- **MCP metrics** (`mcp_server.py`):
+  - 2 resources: `dapos://metrics` (list), `dapos://metrics/{metric_id}` (detail)
+  - 7 tools: `list_metrics`, `suggest_metrics`, `create_metric`, `compute_metric`, `get_metric_trend`, `update_metric`, `delete_metric`
+  - Total MCP: 12 resources, 24 tools, 3 prompts
+  - Fixed `FastMCP()` init: `description` → `instructions` (API change in mcp library)
 - **Demo bootstrap** (`demo/bootstrap.py`):
   - `_bootstrap_demo_metrics()` — creates demo metrics via REST API + chat interaction
   - Agent suggests metrics for orders pipeline via chat, then creates 3 predefined metrics (total_orders, avg_order_value, unique_customers) with agent-generated SQL

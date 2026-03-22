@@ -20,7 +20,7 @@ try:
 except ImportError:
     pass
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import uvicorn
@@ -171,13 +171,28 @@ async def _check_anomalies(store: Store, agent):
 
 
 async def _compute_scheduled_metrics(store: Store, registry, config: Config):
-    """Compute all enabled metrics that have a schedule_cron set."""
+    """Compute enabled metrics whose cron schedule says they are due."""
     try:
+        from croniter import croniter
         metrics = await store.list_metrics()
         enabled = [m for m in metrics if m.enabled and m.schedule_cron]
         if not enabled:
             return
+        now = datetime.now(timezone.utc)
         for m in enabled:
+            # Check if metric is due based on its cron expression
+            try:
+                snaps = await store.list_metric_snapshots(m.metric_id, limit=1)
+                last_computed = datetime.fromisoformat(snaps[0].computed_at) if snaps else (now - timedelta(days=1))
+                if last_computed.tzinfo is None:
+                    last_computed = last_computed.replace(tzinfo=timezone.utc)
+                ci = croniter(m.schedule_cron, last_computed)
+                next_run = ci.get_next(datetime)
+                if now < next_run:
+                    continue  # Not due yet
+            except Exception as e:
+                log.warning("Metric %s cron eval failed: %s", m.metric_id[:8], e)
+                continue
             try:
                 p = await store.get_pipeline(m.pipeline_id)
                 if not p:

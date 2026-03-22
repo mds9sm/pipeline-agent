@@ -29,7 +29,7 @@ DAPOS_PASSWORD = os.getenv("DAPOS_PASSWORD", "admin")
 
 mcp = FastMCP(
     "DAPOS",
-    description="Data Agent Platform — search data catalog, check trust scores, diagnose pipelines, analyze impact, and more.",
+    instructions="Data Agent Platform — search data catalog, check trust scores, diagnose pipelines, analyze impact, manage metrics, and more.",
 )
 
 # ---------------------------------------------------------------------------
@@ -616,6 +616,127 @@ def validate_transform(transform_id: str) -> str:
 
 # ---------------------------------------------------------------------------
 # MCP Prompts — reusable prompt templates
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Metrics resources & tools
+# ---------------------------------------------------------------------------
+
+@mcp.resource("dapos://metrics")
+def metrics_list() -> str:
+    """All defined metrics with type, schedule, and enabled status."""
+    result = _api("GET", "/api/metrics")
+    items = result.get("metrics", [])
+    if not items:
+        return "No metrics defined yet."
+    lines = [f"# DAPOS Metrics — {len(items)} total\n"]
+    for m in items:
+        sched = f" | Schedule: {m['schedule_cron']}" if m.get("schedule_cron") else ""
+        enabled = " (DISABLED)" if not m.get("enabled", True) else ""
+        lines.append(
+            f"- **{m['metric_name']}** ({m.get('metric_type', '?')}){enabled}\n"
+            f"  Pipeline: {m.get('pipeline_id', '?')[:8]}{sched}\n"
+            f"  SQL: `{m.get('sql_expression', '?')[:100]}`"
+        )
+    return "\n".join(lines)
+
+
+@mcp.resource("dapos://metrics/{metric_id}")
+def metric_detail(metric_id: str) -> str:
+    """Metric detail with SQL, schedule, and recent snapshots."""
+    result = _api("GET", f"/api/metrics/{metric_id}")
+    return _fmt(result)
+
+
+@mcp.tool()
+def list_metrics(pipeline_id: str = "") -> str:
+    """List all metrics, optionally filtered by pipeline_id."""
+    params = {"pipeline_id": pipeline_id} if pipeline_id else {}
+    result = _api("GET", "/api/metrics", params=params)
+    return _fmt(result)
+
+
+@mcp.tool()
+def suggest_metrics(pipeline_id: str) -> str:
+    """Ask the agent to suggest KPI metrics for a pipeline based on its schema and business context."""
+    result = _api("POST", f"/api/metrics/suggest/{pipeline_id}")
+    return _fmt(result)
+
+
+@mcp.tool()
+def create_metric(
+    pipeline_id: str,
+    metric_name: str,
+    description: str,
+    metric_type: str = "custom",
+    sql_expression: str = "",
+    schedule_cron: str = "",
+) -> str:
+    """Create a metric. If sql_expression is empty, the agent generates it from the description."""
+    data = {
+        "pipeline_id": pipeline_id,
+        "metric_name": metric_name,
+        "description": description,
+        "metric_type": metric_type,
+    }
+    if sql_expression:
+        data["sql_expression"] = sql_expression
+    if schedule_cron:
+        data["schedule_cron"] = schedule_cron
+    result = _api("POST", "/api/metrics", data=data)
+    return _fmt(result)
+
+
+@mcp.tool()
+def compute_metric(metric_id: str) -> str:
+    """Compute a metric now by executing its SQL against the target database."""
+    result = _api("POST", f"/api/metrics/{metric_id}/compute")
+    return _fmt(result)
+
+
+@mcp.tool()
+def get_metric_trend(metric_id: str) -> str:
+    """Get agent interpretation of a metric's time-series trend including direction, anomalies, and recommendations."""
+    result = _api("GET", f"/api/metrics/{metric_id}/trend")
+    return _fmt(result)
+
+
+@mcp.tool()
+def update_metric(
+    metric_id: str,
+    metric_name: str = "",
+    description: str = "",
+    sql_expression: str = "",
+    schedule_cron: str = "",
+    enabled: Optional[bool] = None,
+) -> str:
+    """Update a metric's fields (name, description, SQL, schedule, enabled/disabled)."""
+    data = {}
+    if metric_name:
+        data["metric_name"] = metric_name
+    if description:
+        data["description"] = description
+    if sql_expression:
+        data["sql_expression"] = sql_expression
+    if schedule_cron is not None and schedule_cron != "":
+        data["schedule_cron"] = schedule_cron
+    if enabled is not None:
+        data["enabled"] = enabled
+    if not data:
+        return "No fields to update."
+    result = _api("PATCH", f"/api/metrics/{metric_id}", data=data)
+    return _fmt(result)
+
+
+@mcp.tool()
+def delete_metric(metric_id: str) -> str:
+    """Delete a metric and all its snapshots."""
+    result = _api("DELETE", f"/api/metrics/{metric_id}")
+    return _fmt(result)
+
+
+# ---------------------------------------------------------------------------
+# Prompts
 # ---------------------------------------------------------------------------
 
 @mcp.prompt()

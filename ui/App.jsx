@@ -3868,6 +3868,9 @@ function MetricsView() {
   const [suggestions, setSuggestions] = useState(null);
   const [creating, setCreating] = useState(false);
   const [computing, setComputing] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [editForm, setEditForm] = useState({});
+  const [saving, setSaving] = useState(false);
 
   const loadMetrics = useCallback(() => {
     const url = selectedPipeline ? `/api/metrics?pipeline_id=${selectedPipeline}` : "/api/metrics";
@@ -3923,6 +3926,36 @@ function MetricsView() {
       setSnapshots((p) => ({ ...p, [mid]: [r, ...(p[mid] || [])] }));
     } catch (e) { console.error(e); }
     setComputing(null);
+  };
+
+  const handleEdit = (m) => {
+    setEditing(m.metric_id);
+    setEditForm({
+      metric_name: m.metric_name || "",
+      description: m.description || "",
+      sql_expression: m.sql_expression || "",
+      schedule_cron: m.schedule_cron || "",
+      enabled: m.enabled !== false,
+    });
+  };
+
+  const handleSaveEdit = async (mid) => {
+    setSaving(true);
+    try {
+      await api("PATCH", `/api/metrics/${mid}`, editForm);
+      setEditing(null);
+      loadMetrics();
+      // Refresh detail
+      handleExpand(mid);
+    } catch (e) { console.error(e); }
+    setSaving(false);
+  };
+
+  const handleToggleEnabled = async (m) => {
+    try {
+      await api("PATCH", `/api/metrics/${m.metric_id}`, { enabled: !m.enabled });
+      loadMetrics();
+    } catch (e) { console.error(e); }
   };
 
   const handleDelete = async (mid) => {
@@ -4015,6 +4048,12 @@ function MetricsView() {
                   <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-600 border border-indigo-100">
                     {m.metric_type}
                   </span>
+                  {m.schedule_cron && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-100" title={m.schedule_cron}>auto</span>
+                  )}
+                  {!m.enabled && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-stone-100 text-stone-400 border border-stone-200">off</span>
+                  )}
                   {m.latest_value !== undefined && m.latest_value !== null && (
                     <span className="text-sm font-mono font-semibold text-indigo-700">{Number(m.latest_value).toLocaleString()}</span>
                   )}
@@ -4028,9 +4067,59 @@ function MetricsView() {
 
               {expanded === m.metric_id && (
                 <div className="border-t border-stone-200 px-4 py-3 bg-stone-50/30">
-                  <div className="text-xs text-stone-500 mb-2">{m.description}</div>
-                  {m.sql_expression && (
-                    <pre className="text-xs bg-stone-900 text-green-300 rounded-lg p-3 mb-3 overflow-x-auto font-mono">{m.sql_expression}</pre>
+
+                  {editing === m.metric_id ? (
+                    <div className="space-y-2 mb-3">
+                      <div>
+                        <label className="text-xs text-stone-500 block mb-0.5">Name</label>
+                        <input value={editForm.metric_name} onChange={(e) => setEditForm((f) => ({ ...f, metric_name: e.target.value }))}
+                          className="w-full text-sm border border-stone-200 rounded px-2 py-1" />
+                      </div>
+                      <div>
+                        <label className="text-xs text-stone-500 block mb-0.5">Description</label>
+                        <input value={editForm.description} onChange={(e) => setEditForm((f) => ({ ...f, description: e.target.value }))}
+                          className="w-full text-sm border border-stone-200 rounded px-2 py-1" />
+                      </div>
+                      <div>
+                        <label className="text-xs text-stone-500 block mb-0.5">SQL Expression</label>
+                        <textarea value={editForm.sql_expression} onChange={(e) => setEditForm((f) => ({ ...f, sql_expression: e.target.value }))}
+                          className="w-full text-xs font-mono border border-stone-200 rounded px-2 py-1.5 bg-stone-900 text-green-300" rows={3} />
+                      </div>
+                      <div>
+                        <label className="text-xs text-stone-500 block mb-0.5">Schedule (cron)</label>
+                        <input value={editForm.schedule_cron} onChange={(e) => setEditForm((f) => ({ ...f, schedule_cron: e.target.value }))}
+                          placeholder="e.g. */15 * * * * (every 15 min)" className="w-full text-sm font-mono border border-stone-200 rounded px-2 py-1" />
+                        <div className="text-xs text-stone-400 mt-0.5">Leave empty for manual-only computation</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input type="checkbox" checked={editForm.enabled} onChange={(e) => setEditForm((f) => ({ ...f, enabled: e.target.checked }))} id={`en-${m.metric_id}`} />
+                        <label htmlFor={`en-${m.metric_id}`} className="text-xs text-stone-600">Enabled</label>
+                      </div>
+                      <div className="flex gap-2 pt-1">
+                        <button onClick={() => handleSaveEdit(m.metric_id)} disabled={saving}
+                          className="text-xs px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50">
+                          {saving ? "Saving..." : "Save"}
+                        </button>
+                        <button onClick={() => setEditing(null)}
+                          className="text-xs px-3 py-1 rounded bg-stone-100 text-stone-600 hover:bg-stone-200">Cancel</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="text-xs text-stone-500 mb-2">{m.description}</div>
+                      {m.sql_expression && (
+                        <pre className="text-xs bg-stone-900 text-green-300 rounded-lg p-3 mb-3 overflow-x-auto font-mono">{m.sql_expression}</pre>
+                      )}
+                      {m.schedule_cron && (
+                        <div className="text-xs text-stone-500 mb-2">
+                          <span className="text-stone-400">Schedule:</span>{" "}
+                          <span className="font-mono text-indigo-600">{m.schedule_cron}</span>
+                        </div>
+                      )}
+                      {!m.enabled && (
+                        <div className="text-xs text-amber-600 mb-2">Disabled — metric will not auto-compute</div>
+                      )}
+                    </>
                   )}
 
                   <div className="flex gap-2 mb-3">
@@ -4040,6 +4129,14 @@ function MetricsView() {
                       className="text-xs px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
                     >
                       {computing === m.metric_id ? "Computing..." : "Compute Now"}
+                    </button>
+                    <button onClick={() => handleEdit(m)}
+                      className="text-xs px-3 py-1 rounded bg-stone-100 text-stone-600 border border-stone-200 hover:bg-stone-200">
+                      Edit
+                    </button>
+                    <button onClick={() => handleToggleEnabled(m)}
+                      className={`text-xs px-3 py-1 rounded border ${m.enabled ? "bg-amber-50 text-amber-600 border-amber-200 hover:bg-amber-100" : "bg-green-50 text-green-600 border-green-200 hover:bg-green-100"}`}>
+                      {m.enabled ? "Disable" : "Enable"}
                     </button>
                     <button
                       onClick={() => handleDelete(m.metric_id)}
