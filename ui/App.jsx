@@ -194,6 +194,367 @@ function ErrorBudgetCard({ eb }) {
 }
 
 // ---------------------------------------------------------------------------
+// StepDAGSection — shows pipeline steps with transform SQL details
+// ---------------------------------------------------------------------------
+
+function TransformStepCard({ step, tf, nameById, typeColors, onTransformUpdate }) {
+  const [isExpanded, setExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editSql, setEditSql] = useState("");
+  const [editDesc, setEditDesc] = useState("");
+  const [editMat, setEditMat] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const [validating, setValidating] = useState(false);
+  const [validationResult, setValidationResult] = useState(null);
+  const [msg, setMsg] = useState(null);
+
+  const colorCls = typeColors[step.step_type] || typeColors.custom;
+  const matColor = (m) =>
+    m === "view" ? "bg-indigo-100 text-indigo-700" :
+    m === "incremental" ? "bg-orange-100 text-orange-700" :
+    m === "ephemeral" ? "bg-stone-100 text-stone-600" :
+    "bg-emerald-100 text-emerald-700";
+
+  function startEdit() {
+    setEditSql(tf.sql);
+    setEditDesc(tf.description || "");
+    setEditMat(tf.materialization);
+    setEditing(true);
+    setValidationResult(null);
+    setMsg(null);
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setValidationResult(null);
+    setMsg(null);
+  }
+
+  async function handleValidate() {
+    setValidating(true);
+    setValidationResult(null);
+    try {
+      const res = await api("POST", `/api/transforms/${tf.transform_id}/validate`);
+      setValidationResult(res);
+    } catch (e) {
+      setValidationResult({ valid: false, error: e.message });
+    }
+    setValidating(false);
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const body = { sql: editSql, approved: false };
+      if (editDesc !== (tf.description || "")) body.description = editDesc;
+      if (editMat !== tf.materialization) body.materialization = editMat;
+      const res = await api("PATCH", `/api/transforms/${tf.transform_id}`, body);
+      // Re-fetch updated transform
+      const updated = await api("GET", `/api/transforms/${tf.transform_id}`);
+      onTransformUpdate(step.step_id, updated);
+      setEditing(false);
+      setMsg({ type: "ok", text: `Saved v${res.version} — pending approval` });
+    } catch (e) {
+      setMsg({ type: "err", text: e.message });
+    }
+    setSaving(false);
+  }
+
+  async function handleApprove() {
+    setApproving(true);
+    setMsg(null);
+    try {
+      const res = await api("PATCH", `/api/transforms/${tf.transform_id}`, { approved: true });
+      const updated = await api("GET", `/api/transforms/${tf.transform_id}`);
+      onTransformUpdate(step.step_id, updated);
+      setMsg({ type: "ok", text: `Approved v${res.version}` });
+    } catch (e) {
+      setMsg({ type: "err", text: e.message });
+    }
+    setApproving(false);
+  }
+
+  return (
+    <div className="border border-stone-300 rounded-lg bg-white w-full">
+      <div
+        className="flex items-center gap-2 px-3 py-2 cursor-pointer"
+        onClick={() => { if (!editing) setExpanded(!isExpanded); }}
+      >
+        <span className={"text-[10px] font-bold px-1.5 py-0.5 rounded " + colorCls}>
+          {step.step_type}
+        </span>
+        <span className="text-xs font-medium text-stone-700">
+          {step.step_name || step.step_id.slice(0, 8)}
+        </span>
+        {step.depends_on && step.depends_on.length > 0 && (
+          <span className="text-[10px] text-stone-400">
+            depends on: {step.depends_on.map((id) => nameById[id] || id.slice(0, 8)).join(", ")}
+          </span>
+        )}
+        <span className="ml-auto text-[10px] text-stone-400">
+          {isExpanded ? "collapse" : "expand"}
+        </span>
+      </div>
+
+      {isExpanded && (
+        <div className="border-t border-stone-200 px-3 py-2 space-y-2">
+          {/* Header row: materialization, target, refs, status, actions */}
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className={"text-[10px] font-bold px-1.5 py-0.5 rounded " + matColor(tf.materialization)}>
+              {tf.materialization}
+            </span>
+            <span className="text-[10px] text-stone-500">
+              {tf.target_schema}.{tf.target_table}
+            </span>
+            {tf.refs && tf.refs.length > 0 && (
+              <span className="text-[10px] text-stone-400">
+                refs: {tf.refs.join(", ")}
+              </span>
+            )}
+            {tf.approved ? (
+              <span className="text-[10px] text-green-600 font-medium">approved</span>
+            ) : (
+              <span className="text-[10px] text-amber-600 font-medium">pending approval</span>
+            )}
+            <span className="text-[10px] text-stone-400">v{tf.version}</span>
+            <div className="ml-auto flex gap-1">
+              {!editing && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); startEdit(); }}
+                  className="text-[10px] px-2 py-0.5 rounded bg-stone-200 text-stone-600 hover:bg-stone-300"
+                >Edit SQL</button>
+              )}
+              {!editing && !tf.approved && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleApprove(); }}
+                  disabled={approving}
+                  className="text-[10px] px-2 py-0.5 rounded bg-green-100 text-green-700 hover:bg-green-200 disabled:opacity-50"
+                >{approving ? "Approving..." : "Approve"}</button>
+              )}
+            </div>
+          </div>
+
+          {/* Status message */}
+          {msg && (
+            <div className={"text-[10px] px-2 py-1 rounded " + (msg.type === "ok" ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700")}>
+              {msg.text}
+            </div>
+          )}
+
+          {/* Description */}
+          {!editing && tf.description && (
+            <div className="text-xs text-stone-600">{tf.description}</div>
+          )}
+
+          {/* Edit mode */}
+          {editing ? (
+            <div className="space-y-2">
+              <div className="flex gap-2 items-center">
+                <label className="text-[10px] text-stone-500">Description</label>
+                <input
+                  className="flex-1 text-xs border border-stone-300 rounded px-2 py-1 bg-white"
+                  value={editDesc}
+                  onChange={(e) => setEditDesc(e.target.value)}
+                />
+                <label className="text-[10px] text-stone-500">Materialization</label>
+                <select
+                  className="text-xs border border-stone-300 rounded px-2 py-1 bg-white"
+                  value={editMat}
+                  onChange={(e) => setEditMat(e.target.value)}
+                >
+                  <option value="table">table</option>
+                  <option value="view">view</option>
+                  <option value="incremental">incremental</option>
+                  <option value="ephemeral">ephemeral</option>
+                </select>
+              </div>
+              <textarea
+                className="w-full text-xs font-mono bg-stone-900 text-green-300 rounded p-3 border-0 outline-none resize-y"
+                style={{ minHeight: "160px" }}
+                value={editSql}
+                onChange={(e) => setEditSql(e.target.value)}
+                spellCheck={false}
+              />
+              {validationResult && (
+                <div className={"text-[10px] px-2 py-1 rounded " + (validationResult.valid ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700")}>
+                  {validationResult.valid ? "Validation passed" : `Validation failed: ${validationResult.error || JSON.stringify(validationResult.errors || [])}`}
+                </div>
+              )}
+              <div className="flex gap-2 justify-end">
+                <button
+                  onClick={handleValidate}
+                  disabled={validating}
+                  className="text-[10px] px-3 py-1 rounded bg-blue-100 text-blue-700 hover:bg-blue-200 disabled:opacity-50"
+                >{validating ? "Validating..." : "Validate"}</button>
+                <button
+                  onClick={cancelEdit}
+                  className="text-[10px] px-3 py-1 rounded bg-stone-200 text-stone-600 hover:bg-stone-300"
+                >Cancel</button>
+                <button
+                  onClick={handleSave}
+                  disabled={saving || editSql === tf.sql && editDesc === (tf.description || "") && editMat === tf.materialization}
+                  className="text-[10px] px-3 py-1 rounded bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50"
+                >{saving ? "Saving..." : "Save & Submit for Approval"}</button>
+              </div>
+            </div>
+          ) : (
+            <pre className="text-xs bg-stone-900 text-green-300 rounded p-3 overflow-x-auto whitespace-pre-wrap">{tf.sql}</pre>
+          )}
+
+          {/* Variables */}
+          {tf.variables && Object.keys(tf.variables).length > 0 && (
+            <div className="text-[10px] text-stone-400">
+              variables: {Object.entries(tf.variables).map(([k, v]) => `${k}=${v}`).join(", ")}
+            </div>
+          )}
+        </div>
+      )}
+
+      {!isExpanded && (
+        <div className="border-t border-stone-200 px-3 py-1.5">
+          <div className="flex items-center gap-2">
+            <span className={"text-[10px] font-bold px-1.5 py-0.5 rounded " + matColor(tf.materialization)}>
+              {tf.materialization}
+            </span>
+            <span className="text-[10px] text-stone-500 truncate flex-1">
+              {tf.description || tf.sql.slice(0, 80) + (tf.sql.length > 80 ? "..." : "")}
+            </span>
+            {tf.approved ? (
+              <span className="text-[10px] text-green-600">approved</span>
+            ) : (
+              <span className="text-[10px] text-amber-600">pending</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StepDAGSection({ steps, pipelineId }) {
+  const [transforms, setTransforms] = useState({});
+
+  useEffect(() => {
+    if (!steps || steps.length === 0) return;
+    const transformSteps = steps.filter(
+      (s) => s.step_type === "transform" && s.config && s.config.transform_id
+    );
+    if (transformSteps.length === 0) return;
+    Promise.all(
+      transformSteps.map((s) =>
+        api("GET", `/api/transforms/${s.config.transform_id}`)
+          .then((t) => ({ stepId: s.step_id, transform: t }))
+          .catch(() => null)
+      )
+    ).then((results) => {
+      const map = {};
+      results.filter(Boolean).forEach((r) => { map[r.stepId] = r.transform; });
+      setTransforms(map);
+    });
+  }, [steps]);
+
+  function handleTransformUpdate(stepId, updated) {
+    setTransforms((prev) => ({ ...prev, [stepId]: updated }));
+  }
+
+  if (!steps || steps.length === 0) return null;
+
+  // Build step name lookup
+  const nameById = {};
+  steps.forEach((s) => { nameById[s.step_id] = s.step_name || s.step_id.slice(0, 8); });
+
+  // Group steps into layers by topological depth
+  const depthOf = {};
+  function calcDepth(s) {
+    if (depthOf[s.step_id] !== undefined) return depthOf[s.step_id];
+    if (!s.depends_on || s.depends_on.length === 0) { depthOf[s.step_id] = 0; return 0; }
+    const maxParent = Math.max(...s.depends_on.map((id) => {
+      const parent = steps.find((p) => p.step_id === id);
+      return parent ? calcDepth(parent) : 0;
+    }));
+    depthOf[s.step_id] = maxParent + 1;
+    return depthOf[s.step_id];
+  }
+  steps.forEach((s) => calcDepth(s));
+
+  const layers = {};
+  steps.forEach((s) => {
+    const d = depthOf[s.step_id] || 0;
+    if (!layers[d]) layers[d] = [];
+    layers[d].push(s);
+  });
+  const sortedDepths = Object.keys(layers).map(Number).sort((a, b) => a - b);
+
+  const typeColors = {
+    extract: "bg-blue-100 text-blue-700",
+    transform: "bg-purple-100 text-purple-700",
+    quality_gate: "bg-amber-100 text-amber-700",
+    promote: "bg-green-100 text-green-700",
+    cleanup: "bg-red-100 text-red-700",
+    hook: "bg-teal-100 text-teal-700",
+    sensor: "bg-cyan-100 text-cyan-700",
+    custom: "bg-stone-100 text-stone-600",
+  };
+
+  return (
+    <div className="bg-stone-50 border border-stone-200 rounded-lg px-4 py-3">
+      <div className="text-xs font-semibold text-stone-500 mb-3">Pipeline Steps</div>
+      <div className="space-y-3">
+        {sortedDepths.map((depth) => (
+          <div key={depth}>
+            {sortedDepths.length > 1 && (
+              <div className="text-[10px] text-stone-400 mb-1">Layer {depth + 1}</div>
+            )}
+            <div className="flex flex-wrap gap-2">
+              {layers[depth].map((step) => {
+                const tf = transforms[step.step_id];
+                const colorCls = typeColors[step.step_type] || typeColors.custom;
+                if (tf) {
+                  return (
+                    <TransformStepCard
+                      key={step.step_id}
+                      step={step}
+                      tf={tf}
+                      nameById={nameById}
+                      typeColors={typeColors}
+                      onTransformUpdate={handleTransformUpdate}
+                    />
+                  );
+                }
+                return (
+                  <div key={step.step_id} className="border border-stone-300 rounded-lg bg-white">
+                    <div className="flex items-center gap-2 px-3 py-2">
+                      <span className={"text-[10px] font-bold px-1.5 py-0.5 rounded " + colorCls}>
+                        {step.step_type}
+                      </span>
+                      <span className="text-xs font-medium text-stone-700">
+                        {step.step_name || step.step_id.slice(0, 8)}
+                      </span>
+                      {step.depends_on && step.depends_on.length > 0 && (
+                        <span className="text-[10px] text-stone-400">
+                          depends on: {step.depends_on.map((id) => nameById[id] || id.slice(0, 8)).join(", ")}
+                        </span>
+                      )}
+                      {step.config && Object.keys(step.config).length > 0 && (
+                        <span className="text-[10px] text-stone-400 ml-auto">
+                          {Object.entries(step.config).map(([k, v]) => `${k}: ${v}`).join(", ")}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Login component
 // ---------------------------------------------------------------------------
 
@@ -939,6 +1300,11 @@ function PipelinesView({ tierFilter, searchQuery }) {
                       ))}
                     </div>
                   </div>
+                )}
+
+                {/* ---- Step DAG / Transforms (Build 29) ---- */}
+                {!editForm && (detail.steps || []).length > 0 && (
+                  <StepDAGSection steps={detail.steps} pipelineId={detail.pipeline_id} />
                 )}
 
                 {/* ---- Post-Promotion Hooks (Build 13) ---- */}
