@@ -445,6 +445,17 @@ class PipelineContract:
     # Post-promotion SQL hooks (Build 13)
     post_promotion_hooks: list[PostPromotionHook] = field(default_factory=list)
 
+    # Semantic column tags (Build 26) — AI-inferred, user-overridable
+    # Format: {"column_name": {"semantic_name": str, "domain": str, "description": str, "pii": bool, "unit": str, "source": "ai"|"user"}}
+    semantic_tags: dict = field(default_factory=dict)
+
+    # Configurable trust score weights (Build 26) — override global defaults per pipeline
+    # Format: {"freshness": 0.30, "quality_gate": 0.30, "error_budget": 0.25, "schema_stability": 0.15}
+    trust_weights: Optional[dict] = None
+
+    # Pipeline business context (Build 26) — captured via guided questions
+    business_context: dict = field(default_factory=dict)
+
     # Composable step DAG (Build 18) — empty list = legacy mode
     steps: list[StepDefinition] = field(default_factory=list)
 

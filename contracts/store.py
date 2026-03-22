@@ -157,11 +157,13 @@ class ContractStore:
                 baseline_row_count, baseline_null_rates, baseline_null_stddevs,
                 baseline_cardinality, baseline_volume_avg, baseline_volume_stddev,
                 auto_approve_additive_schema, approval_notification_channel,
-                schema_change_policy, post_promotion_hooks, steps
+                schema_change_policy, post_promotion_hooks, steps,
+                semantic_tags, trust_weights, business_context
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
                 $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
-                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56
+                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,
+                $57,$58,$59
             )
             ON CONFLICT (pipeline_id) DO UPDATE SET
                 pipeline_name=EXCLUDED.pipeline_name, version=EXCLUDED.version,
@@ -206,7 +208,10 @@ class ContractStore:
                 approval_notification_channel=EXCLUDED.approval_notification_channel,
                 schema_change_policy=EXCLUDED.schema_change_policy,
                 post_promotion_hooks=EXCLUDED.post_promotion_hooks,
-                steps=EXCLUDED.steps
+                steps=EXCLUDED.steps,
+                semantic_tags=EXCLUDED.semantic_tags,
+                trust_weights=EXCLUDED.trust_weights,
+                business_context=EXCLUDED.business_context
         """,
             p.pipeline_id, p.pipeline_name, p.version, p.created_at, p.updated_at,
             p.status.value, p.environment,
@@ -230,6 +235,8 @@ class ContractStore:
             p.baseline_volume_avg, p.baseline_volume_stddev,
             p.auto_approve_additive_schema, p.approval_notification_channel,
             scp_json, hooks_json, steps_json,
+            json.dumps(p.semantic_tags), json.dumps(p.trust_weights) if p.trust_weights else None,
+            json.dumps(p.business_context),
         )
 
     async def get_pipeline(self, pipeline_id: str) -> Optional[PipelineContract]:
@@ -1554,6 +1561,9 @@ def _row_to_pipeline(row: asyncpg.Record) -> PipelineContract:
         schema_change_policy=_parse_schema_change_policy(row),
         post_promotion_hooks=_parse_post_promotion_hooks(row),
         steps=_parse_steps(row),
+        semantic_tags=json.loads(row["semantic_tags"]) if row.get("semantic_tags") else {},
+        trust_weights=json.loads(row["trust_weights"]) if row.get("trust_weights") else None,
+        business_context=json.loads(row["business_context"]) if row.get("business_context") else {},
     )
 
 
@@ -2318,6 +2328,10 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_log JSONB;
 -- Build 16: Data contracts (tables created via CREATE IF NOT EXISTS; no ALTER needed)
 -- Build 18: Composable step DAGs
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS steps JSONB NOT NULL DEFAULT '[]';
+-- Build 26: Semantic tags, trust weights, business context
+ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS semantic_tags JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS trust_weights JSONB;
+ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS business_context JSONB NOT NULL DEFAULT '{}';
 """
 
 # Alias used by several modules (agent, scheduler, monitor, api).

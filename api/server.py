@@ -4100,6 +4100,12 @@ def create_app(
             # Text search across multiple fields
             if q:
                 q_lower = q.lower()
+                # Include semantic tags and business context in search
+                sem_text = " ".join(
+                    f"{t.get('semantic_name', '')} {t.get('domain', '')} {t.get('description', '')}"
+                    for t in (p.semantic_tags or {}).values()
+                )
+                ctx_text = " ".join(str(v) for v in (p.business_context or {}).values() if isinstance(v, str))
                 searchable = " ".join([
                     p.pipeline_name or "",
                     p.source_table or "",
@@ -4111,6 +4117,8 @@ def create_app(
                     " ".join(str(k) for k in (p.tags or {}).keys()),
                     " ".join(m.source_column for m in (p.column_mappings or [])),
                     " ".join(m.target_column for m in (p.column_mappings or [])),
+                    sem_text,
+                    ctx_text,
                 ]).lower()
                 if q_lower not in searchable:
                     continue
@@ -4189,6 +4197,8 @@ def create_app(
                 "error_budget": budget_info,
                 "trust_score": trust["score"],
                 "trust_detail": trust["detail"],
+                "semantic_tags": p.semantic_tags or {},
+                "business_context": p.business_context or {},
                 "created_at": p.created_at,
                 "updated_at": p.updated_at,
             })
@@ -4453,6 +4463,242 @@ def create_app(
             "source_types": source_types,
             "trust_distribution": trust_counts,
         }
+
+    # -----------------------------------------------------------------------
+    # Semantic Tags & Business Context (Build 26 continued)
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/catalog/tables/{pipeline_id}/tags")
+    async def get_semantic_tags(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get semantic tags for all columns in a pipeline."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        return {
+            "pipeline_id": p.pipeline_id,
+            "pipeline_name": p.pipeline_name,
+            "target_table": f"{p.target_schema}.{p.target_table}",
+            "tags": p.semantic_tags or {},
+            "column_count": len(p.column_mappings or []),
+            "tagged_count": len(p.semantic_tags or {}),
+            "ai_tagged": sum(1 for t in (p.semantic_tags or {}).values() if t.get("source") == "ai"),
+            "user_tagged": sum(1 for t in (p.semantic_tags or {}).values() if t.get("source") == "user"),
+        }
+
+    @app.post("/api/catalog/tables/{pipeline_id}/tags/infer")
+    @limiter.limit("10/minute")
+    async def infer_semantic_tags(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """AI-infer semantic tags for columns. Preserves user-overridden tags."""
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        columns = [
+            {
+                "target_column": m.target_column,
+                "source_column": m.source_column,
+                "target_type": m.target_type,
+                "source_type": m.source_type,
+                "is_nullable": m.is_nullable,
+                "is_primary_key": m.is_primary_key,
+            }
+            for m in (p.column_mappings or [])
+        ]
+
+        tags = await agent.infer_semantic_tags(
+            pipeline_name=p.pipeline_name,
+            source_table=f"{p.source_schema}.{p.source_table}",
+            target_table=f"{p.target_schema}.{p.target_table}",
+            columns=columns,
+            existing_tags=p.semantic_tags,
+        )
+
+        p.semantic_tags = tags
+        await store.save_pipeline(p)
+
+        return {
+            "pipeline_id": p.pipeline_id,
+            "tags": tags,
+            "inferred_count": sum(1 for t in tags.values() if t.get("source") == "ai"),
+            "user_preserved": sum(1 for t in tags.values() if t.get("source") == "user"),
+        }
+
+    @app.put("/api/catalog/tables/{pipeline_id}/tags")
+    async def set_semantic_tags(
+        request: Request,
+        pipeline_id: str,
+        tags: dict = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Set/override semantic tags for columns. Marks overridden tags as source=user."""
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        existing = p.semantic_tags or {}
+        for col_name, tag_data in tags.items():
+            if isinstance(tag_data, dict):
+                tag_data["source"] = "user"  # Always mark manual overrides
+                existing[col_name] = tag_data
+
+        p.semantic_tags = existing
+        await store.save_pipeline(p)
+
+        return {
+            "pipeline_id": p.pipeline_id,
+            "tags": existing,
+            "updated_columns": list(tags.keys()),
+        }
+
+    @app.patch("/api/catalog/tables/{pipeline_id}/tags/{column_name}")
+    async def update_column_tag(
+        request: Request,
+        pipeline_id: str,
+        column_name: str,
+        tag: dict = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Update semantic tag for a single column."""
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        existing = p.semantic_tags or {}
+        current = existing.get(column_name, {})
+        current.update(tag)
+        current["source"] = "user"
+        existing[column_name] = current
+
+        p.semantic_tags = existing
+        await store.save_pipeline(p)
+
+        return {"pipeline_id": p.pipeline_id, "column": column_name, "tag": current}
+
+    # -----------------------------------------------------------------------
+    # Pipeline Business Context (Build 26)
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/catalog/tables/{pipeline_id}/context/questions")
+    async def get_context_questions(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get targeted business context questions for a pipeline."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        columns = [
+            {"target_column": m.target_column, "source_column": m.source_column}
+            for m in (p.column_mappings or [])[:20]
+        ]
+
+        questions = await agent.generate_business_context_questions(
+            pipeline_name=p.pipeline_name,
+            source_table=f"{p.source_schema}.{p.source_table}",
+            target_table=f"{p.target_schema}.{p.target_table}",
+            columns=columns,
+        )
+
+        return {
+            "pipeline_id": p.pipeline_id,
+            "pipeline_name": p.pipeline_name,
+            "questions": questions,
+            "existing_context": p.business_context or {},
+        }
+
+    @app.put("/api/catalog/tables/{pipeline_id}/context")
+    async def set_business_context(
+        request: Request,
+        pipeline_id: str,
+        context: dict = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Save business context answers for a pipeline."""
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        existing = p.business_context or {}
+        existing.update(context)
+        existing["_last_updated"] = now_iso()
+        existing["_updated_by"] = caller.get("username", "unknown")
+        p.business_context = existing
+        await store.save_pipeline(p)
+
+        return {"pipeline_id": p.pipeline_id, "context": existing}
+
+    # -----------------------------------------------------------------------
+    # Configurable Trust Weights (Build 26)
+    # -----------------------------------------------------------------------
+
+    @app.put("/api/catalog/tables/{pipeline_id}/trust-weights")
+    async def set_trust_weights(
+        request: Request,
+        pipeline_id: str,
+        weights: dict = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Override trust score weights for a pipeline. Weights must sum to ~1.0."""
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        # Validate weights
+        valid_keys = {"freshness", "quality_gate", "error_budget", "schema_stability"}
+        for k in weights:
+            if k not in valid_keys:
+                raise HTTPException(400, f"Invalid weight key: {k}. Must be one of: {valid_keys}")
+        total = sum(weights.values())
+        if abs(total - 1.0) > 0.05:
+            raise HTTPException(400, f"Weights must sum to ~1.0, got {total:.2f}")
+
+        p.trust_weights = weights
+        await store.save_pipeline(p)
+
+        # Recompute trust with new weights
+        freshness = await store.get_latest_freshness(p.pipeline_id)
+        gates = await store.get_quality_trend(p.pipeline_id, limit=1)
+        budget = await store.get_error_budget(p.pipeline_id)
+        trust = _compute_trust_score(freshness, gates[0] if gates else None, budget, p)
+
+        return {
+            "pipeline_id": p.pipeline_id,
+            "weights": weights,
+            "trust_score": trust["score"],
+            "detail": trust["detail"],
+            "recommendation": trust["recommendation"],
+        }
+
+    @app.delete("/api/catalog/tables/{pipeline_id}/trust-weights")
+    async def reset_trust_weights(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Reset to global default trust weights."""
+        require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        p.trust_weights = None
+        await store.save_pipeline(p)
+        return {"pipeline_id": p.pipeline_id, "weights": _TRUST_WEIGHTS, "message": "Reset to defaults"}
 
     # -----------------------------------------------------------------------
     # Serve static UI
@@ -4894,9 +5140,11 @@ def _compute_trust_score(
 ) -> dict:
     """Compute a 0.0-1.0 trust score from available signals.
 
-    Each component scores 0.0-1.0, then weighted by _TRUST_WEIGHTS.
-    Returns {"score": float|None, "detail": dict, "recommendation": str}.
+    Each component scores 0.0-1.0, then weighted by pipeline-specific
+    or global _TRUST_WEIGHTS. Returns {"score": float|None, "detail": dict, "recommendation": str}.
     """
+    # Use per-pipeline weights if configured, otherwise global defaults
+    weights = (pipeline.trust_weights if hasattr(pipeline, "trust_weights") and pipeline.trust_weights else _TRUST_WEIGHTS)
     components = {}
     has_data = False
 
@@ -4946,7 +5194,7 @@ def _compute_trust_score(
     if not has_data:
         return {
             "score": None,
-            "detail": {k: {"score": None, "weight": v} for k, v in _TRUST_WEIGHTS.items()},
+            "detail": {k: {"score": None, "weight": v} for k, v in weights.items()},
             "recommendation": "No data available yet — run the pipeline to establish baselines",
         }
 
@@ -4954,7 +5202,7 @@ def _compute_trust_score(
     weighted_sum = 0.0
     weight_sum = 0.0
     detail = {}
-    for key, weight in _TRUST_WEIGHTS.items():
+    for key, weight in weights.items():
         val = components.get(key)
         detail[key] = {"score": round(val, 3) if val is not None else None, "weight": weight}
         if val is not None:

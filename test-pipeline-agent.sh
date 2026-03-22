@@ -2333,6 +2333,125 @@ else
     fail "Catalog stats returned HTTP $CODE"
 fi
 
+# Test 7: Get semantic tags (initially empty)
+if [ -n "$CAT_PID" ]; then
+test_name "GET /api/catalog/tables/{id}/tags"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/catalog/tables/$CAT_PID/tags" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_FIELDS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'tags' in d and 'tagged_count' in d else 'no')" 2>/dev/null)
+    if [ "$HAS_FIELDS" = "yes" ]; then
+        pass "Semantic tags endpoint returns tag metadata"
+    else
+        fail "Semantic tags missing expected fields"
+    fi
+else
+    fail "Semantic tags returned HTTP $CODE"
+fi
+
+# Test 8: Infer semantic tags
+test_name "POST /api/catalog/tables/{id}/tags/infer"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/catalog/tables/$CAT_PID/tags/infer" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    INFERRED=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('inferred_count',0))" 2>/dev/null)
+    pass "Inferred semantic tags for $INFERRED columns"
+else
+    fail "Tag inference returned HTTP $CODE"
+fi
+
+# Test 9: Override a semantic tag
+test_name "PATCH /api/catalog/tables/{id}/tags/{column} (user override)"
+FIRST_COL=$(echo "$BODY" | python3 -c "import sys,json; tags=json.load(sys.stdin).get('tags',{}); print(list(tags.keys())[0] if tags else '')" 2>/dev/null)
+if [ -n "$FIRST_COL" ]; then
+RESP=$(curl -s -w "\n%{http_code}" -X PATCH "$BASE_URL/api/catalog/tables/$CAT_PID/tags/$FIRST_COL" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"semantic_name":"custom_override","domain":"finance","description":"User-defined tag"}')
+CODE=$(echo "$RESP" | tail -1)
+BODY_PATCH=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    SRC=$(echo "$BODY_PATCH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag',{}).get('source',''))" 2>/dev/null)
+    if [ "$SRC" = "user" ]; then
+        pass "User override marked as source=user"
+    else
+        fail "Override source should be 'user', got '$SRC'"
+    fi
+else
+    fail "Tag override returned HTTP $CODE"
+fi
+else
+    skip "No columns to test tag override"
+fi
+
+# Test 10: Business context questions
+test_name "GET /api/catalog/tables/{id}/context/questions"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/catalog/tables/$CAT_PID/context/questions" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    Q_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('questions',[])))" 2>/dev/null)
+    if [ "$Q_COUNT" -gt 0 ] 2>/dev/null; then
+        pass "Got $Q_COUNT context questions"
+    else
+        fail "No context questions returned"
+    fi
+else
+    fail "Context questions returned HTTP $CODE"
+fi
+
+# Test 11: Save business context
+test_name "PUT /api/catalog/tables/{id}/context"
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/api/catalog/tables/$CAT_PID/context" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"business_process":"Revenue & billing","consumers":"Business analysts","criticality":"High"}')
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_CTX=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin).get('context',{}); print('yes' if 'business_process' in d and '_last_updated' in d else 'no')" 2>/dev/null)
+    if [ "$HAS_CTX" = "yes" ]; then
+        pass "Business context saved with timestamp"
+    else
+        fail "Business context missing expected fields"
+    fi
+else
+    fail "Business context save returned HTTP $CODE"
+fi
+
+# Test 12: Set custom trust weights
+test_name "PUT /api/catalog/tables/{id}/trust-weights"
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/api/catalog/tables/$CAT_PID/trust-weights" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"freshness":0.40,"quality_gate":0.30,"error_budget":0.20,"schema_stability":0.10}')
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    W=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('weights',{}).get('freshness',0))" 2>/dev/null)
+    if [ "$W" = "0.4" ]; then
+        pass "Custom trust weights saved (freshness=0.4)"
+    else
+        fail "Custom weight freshness should be 0.4, got $W"
+    fi
+else
+    fail "Trust weights save returned HTTP $CODE"
+fi
+
+# Test 13: Reset trust weights
+test_name "DELETE /api/catalog/tables/{id}/trust-weights"
+RESP=$(curl -s -w "\n%{http_code}" -X DELETE "$BASE_URL/api/catalog/tables/$CAT_PID/trust-weights" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+if [ "$CODE" = "200" ]; then
+    pass "Trust weights reset to defaults"
+else
+    fail "Trust weights reset returned HTTP $CODE"
+fi
+fi # CAT_PID exists
+
 fi # --api (Build 26)
 
 # ============================================================================
@@ -2397,7 +2516,7 @@ echo "  - Topology reasoning: design endpoint, chat routing (Build 20)"
 echo "  - Source registry: register, list, get, update, discover, delete (Build 21)"
 echo "  - Step DAG: steps definition, validate, cycle detection, preview, PATCH update (Build 18)"
 echo "  - Agent diagnostics: diagnose, impact, anomalies, chat routing (Build 24)"
-echo "  - Data catalog: search, table detail, trust score, columns, stats (Build 26)"
+echo "  - Data catalog: search, detail, trust, columns, stats, semantic tags, context, weights (Build 26)"
 echo "  - GitOps API: status, log, diff, pipeline history, restore dry-run (Build 23)"
 echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21)"
 echo "  - Interaction audit: list, export (Build 21)"

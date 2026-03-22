@@ -1901,3 +1901,257 @@ Respond with JSON:
             "summary": f"{len(anomalous)} of {len(pipelines)} active pipelines show anomalies. "
                        f"{len(recent_failures)} failures in last 24h.",
         }
+
+    # ------------------------------------------------------------------
+    # infer_semantic_tags (Build 26)
+    # ------------------------------------------------------------------
+
+    async def infer_semantic_tags(
+        self,
+        pipeline_name: str,
+        source_table: str,
+        target_table: str,
+        columns: list[dict],
+        existing_tags: Optional[dict] = None,
+    ) -> dict:
+        """Infer semantic tags for columns using AI.
+
+        Returns a dict keyed by column name with semantic metadata.
+        Preserves any user-overridden tags from existing_tags.
+        """
+        existing_tags = existing_tags or {}
+
+        # Skip columns already tagged by user
+        columns_to_infer = []
+        for col in columns:
+            name = col.get("target_column") or col.get("source_column") or col.get("name", "")
+            existing = existing_tags.get(name, {})
+            if existing.get("source") == "user":
+                continue  # Don't overwrite user-set tags
+            columns_to_infer.append(col)
+
+        if not columns_to_infer:
+            return existing_tags
+
+        col_descriptions = "\n".join(
+            f"  - {c.get('target_column') or c.get('source_column') or c.get('name', '?')}: "
+            f"{c.get('target_type') or c.get('source_type') or c.get('type', 'unknown')} "
+            f"(nullable={c.get('is_nullable', c.get('nullable', True))}, pk={c.get('is_primary_key', c.get('primary_key', False))})"
+            for c in columns_to_infer
+        )
+
+        if not self.has_api:
+            # Rule-based fallback
+            return self._infer_tags_rule_based(columns_to_infer, existing_tags)
+
+        prompt = f"""Analyze these database columns and infer their business semantics.
+
+Pipeline: {pipeline_name}
+Source table: {source_table}
+Target table: {target_table}
+
+Columns:
+{col_descriptions}
+
+For each column, provide semantic metadata. Respond with JSON only:
+{{
+  "column_name": {{
+    "semantic_name": "human-readable business name (e.g., monthly_recurring_revenue)",
+    "domain": "business domain (e.g., finance, marketing, product, operations, identity, temporal)",
+    "description": "one-line description of what this column represents",
+    "pii": true/false,
+    "unit": "unit if applicable (e.g., USD, count, percent, seconds) or null"
+  }}
+}}
+
+Guidelines:
+- semantic_name should be snake_case, descriptive, business-oriented
+- PII includes: email, phone, name, address, SSN, IP address, geolocation
+- domain should be one of: finance, marketing, product, operations, identity, temporal, technical, geography
+- Be concise but accurate in descriptions
+"""
+        try:
+            resp = await self._call_claude(prompt, max_tokens=2000)
+            text = resp.get("text", "")
+            parsed = self._extract_json(text)
+            if isinstance(parsed, dict):
+                result = dict(existing_tags)
+                for col_name, tags in parsed.items():
+                    if isinstance(tags, dict):
+                        tags["source"] = "ai"
+                        result[col_name] = tags
+                return result
+        except Exception as e:
+            log.warning("Semantic tag inference failed: %s", e)
+
+        return self._infer_tags_rule_based(columns_to_infer, existing_tags)
+
+    def _infer_tags_rule_based(self, columns: list[dict], existing_tags: dict) -> dict:
+        """Fallback: infer basic semantic tags from column names without AI."""
+        PII_PATTERNS = {"email", "phone", "ssn", "address", "first_name", "last_name",
+                        "name", "ip_address", "ip", "zip", "postal", "dob", "birth"}
+        TEMPORAL_PATTERNS = {"created_at", "updated_at", "deleted_at", "timestamp",
+                             "date", "time", "shipped_at", "delivered_at", "started_at",
+                             "completed_at", "checked_at", "expires_at"}
+        FINANCE_PATTERNS = {"price", "cost", "amount", "total", "subtotal", "tax",
+                            "shipping", "revenue", "fee", "balance", "payment", "charge"}
+        ID_PATTERNS = {"id", "uuid", "key", "code", "sku", "number"}
+
+        result = dict(existing_tags)
+        for col in columns:
+            name = col.get("target_column") or col.get("source_column") or col.get("name", "")
+            if not name or result.get(name, {}).get("source") == "user":
+                continue
+
+            name_lower = name.lower()
+            words = set(name_lower.replace("-", "_").split("_"))
+
+            # Detect domain and PII
+            is_pii = bool(words & PII_PATTERNS)
+            if words & TEMPORAL_PATTERNS or name_lower.endswith("_at") or name_lower.endswith("_date"):
+                domain = "temporal"
+            elif words & FINANCE_PATTERNS:
+                domain = "finance"
+            elif words & PII_PATTERNS:
+                domain = "identity"
+            elif words & ID_PATTERNS:
+                domain = "technical"
+            else:
+                domain = "operations"
+
+            # Generate semantic name
+            semantic = name_lower.strip("_")
+
+            # Unit inference
+            unit = None
+            if words & {"price", "cost", "amount", "total", "subtotal", "tax", "shipping", "fee", "charge"}:
+                unit = "currency"
+            elif name_lower.endswith("_pct") or name_lower.endswith("_percent"):
+                unit = "percent"
+            elif name_lower.endswith("_count") or name_lower.endswith("_qty"):
+                unit = "count"
+            elif name_lower.endswith("_seconds") or name_lower.endswith("_ms"):
+                unit = "seconds" if "_seconds" in name_lower else "milliseconds"
+
+            result[name] = {
+                "semantic_name": semantic,
+                "domain": domain,
+                "description": f"Column {name} from source table",
+                "pii": is_pii,
+                "unit": unit,
+                "source": "ai",
+            }
+
+        return result
+
+    # ------------------------------------------------------------------
+    # generate_business_context_questions (Build 26)
+    # ------------------------------------------------------------------
+
+    async def generate_business_context_questions(
+        self,
+        pipeline_name: str,
+        source_table: str,
+        target_table: str,
+        columns: list[dict],
+    ) -> list[dict]:
+        """Generate targeted questions to capture business context for a pipeline.
+
+        Returns a list of questions with multiple-choice answers.
+        """
+        if not self.has_api:
+            return self._default_context_questions(pipeline_name)
+
+        col_names = ", ".join(
+            c.get("target_column") or c.get("source_column") or c.get("name", "?")
+            for c in (columns or [])[:20]
+        )
+
+        prompt = f"""You are helping a user document the business context of a data pipeline.
+
+Pipeline: {pipeline_name}
+Source: {source_table}
+Target: {target_table}
+Columns: {col_names}
+
+Generate 3-5 targeted questions to understand the business context. Each question should have 4-5 multiple choice options.
+
+Focus on:
+1. What business process/function this data supports
+2. Who consumes this data and for what purpose
+3. How critical this data is (what decisions depend on it)
+4. Expected update frequency from a business perspective
+
+Respond with JSON only:
+[
+  {{
+    "id": "business_process",
+    "question": "What business function does this data primarily support?",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "allow_custom": true
+  }}
+]
+"""
+        try:
+            resp = await self._call_claude(prompt, max_tokens=1500)
+            text = resp.get("text", "")
+            parsed = self._extract_json(text)
+            if isinstance(parsed, list) and parsed:
+                return parsed
+        except Exception as e:
+            log.warning("Context question generation failed: %s", e)
+
+        return self._default_context_questions(pipeline_name)
+
+    def _default_context_questions(self, pipeline_name: str) -> list[dict]:
+        """Fallback: standard business context questions."""
+        return [
+            {
+                "id": "business_process",
+                "question": "What business function does this data support?",
+                "options": [
+                    "Revenue & billing",
+                    "Customer analytics",
+                    "Operations & logistics",
+                    "Marketing & growth",
+                    "Product usage & telemetry",
+                    "Compliance & audit",
+                ],
+                "allow_custom": True,
+            },
+            {
+                "id": "consumers",
+                "question": "Who primarily consumes this data?",
+                "options": [
+                    "Executive dashboards",
+                    "Data science / ML models",
+                    "Business analysts",
+                    "Downstream pipelines",
+                    "Customer-facing product",
+                    "Finance / accounting",
+                ],
+                "allow_custom": True,
+            },
+            {
+                "id": "criticality",
+                "question": "How critical is this data for decision-making?",
+                "options": [
+                    "Mission critical — outage blocks business operations",
+                    "High — daily decisions depend on it",
+                    "Medium — weekly reporting and analysis",
+                    "Low — nice to have, exploratory",
+                ],
+                "allow_custom": False,
+            },
+            {
+                "id": "freshness_expectation",
+                "question": "How fresh does this data need to be?",
+                "options": [
+                    "Real-time (< 5 minutes)",
+                    "Near real-time (< 1 hour)",
+                    "Daily",
+                    "Weekly or less frequent",
+                ],
+                "allow_custom": False,
+            },
+        ]
