@@ -155,6 +155,7 @@ class CreatePipelineRequest(BaseModel):
     column_mappings: Optional[list[dict]] = None
     auto_approve_additive: bool = False
     steps: Optional[list[dict]] = None
+    schema_change_policy: Optional[dict] = None
 
 
 class BatchCreateRequest(BaseModel):
@@ -1708,6 +1709,11 @@ def create_app(
             pipeline.steps = _parse_step_dicts(req.steps)
             await store.save_pipeline(pipeline)
 
+        # Apply schema change policy if provided
+        if req.schema_change_policy:
+            pipeline.schema_change_policy = SchemaChangePolicy(**req.schema_change_policy)
+            await store.save_pipeline(pipeline)
+
         await _log_pipeline_change(
             pipeline.pipeline_id, pipeline.pipeline_name,
             PipelineChangeType.CREATED, caller,
@@ -2451,7 +2457,7 @@ def create_app(
 
         if req.action == "approve":
             proposal.status = ProposalStatus.APPROVED
-            await _apply_proposal(proposal, store, registry, agent, gitops)
+            await _apply_proposal(proposal, store, registry, agent, gitops, config)
         elif req.action == "reject":
             proposal.status = ProposalStatus.REJECTED
             if req.note:
@@ -5119,6 +5125,7 @@ async def _apply_proposal(
     registry: ConnectorRegistry,
     agent: AgentCore,
     gitops=None,
+    config=None,
 ):
     """Apply an approved proposal, updating connectors or pipeline schemas."""
     if proposal.change_type == ChangeType.NEW_CONNECTOR and proposal.connector_id:
@@ -5156,8 +5163,87 @@ async def _apply_proposal(
         ChangeType.ALTER_COLUMN_TYPE,
         ChangeType.DROP_COLUMN,
     ):
-        proposed_cols = proposal.proposed_state.get("column_mappings", [])
-        pipeline.column_mappings = [ColumnMapping(**m) for m in proposed_cols]
+        # Build the set of existing target columns for diff
+        old_col_names = {m.target_column for m in pipeline.column_mappings}
+        alter_stmts = []
+        schema = pipeline.target_schema or "raw"
+        table = pipeline.target_table
+
+        if proposal.change_type == ChangeType.ADD_COLUMN:
+            # proposed_state has {"new_columns": [{"name": ...}, ...]}
+            # Re-profile source to get full ColumnMapping objects
+            new_col_names = [c["name"] for c in proposal.proposed_state.get("new_columns", [])]
+            if new_col_names:
+                try:
+                    src_params = {
+                        "host": pipeline.source_host, "port": pipeline.source_port,
+                        "database": pipeline.source_database,
+                        "user": pipeline.source_user, "password": pipeline.source_password,
+                    }
+                    if config and config.has_encryption_key:
+                        src_params = decrypt_dict(src_params, config.encryption_key, CREDENTIAL_FIELDS)
+                    source = await registry.get_source(pipeline.source_connector_id, src_params)
+                    profile = await source.profile_table(pipeline.source_schema, pipeline.source_table)
+                    live_cols = {m.source_column: m for m in profile.columns}
+                    for col_name in new_col_names:
+                        if col_name in live_cols:
+                            m = live_cols[col_name]
+                            pipeline.column_mappings.append(m)
+                            alter_stmts.append(
+                                f'ALTER TABLE "{schema}"."{table}" '
+                                f'ADD COLUMN IF NOT EXISTS "{m.target_column}" {m.target_type}'
+                            )
+                except Exception as e:
+                    log.error("Failed to re-profile source for ADD_COLUMN proposal: %s", e)
+
+        elif proposal.change_type == ChangeType.ALTER_COLUMN_TYPE:
+            type_changes = proposal.proposed_state.get("type_changes", [])
+            for tc in type_changes:
+                col_name = tc.get("column", "")
+                new_type = tc.get("to", "")
+                for mapping in pipeline.column_mappings:
+                    if mapping.source_column == col_name and new_type:
+                        mapping.source_type = tc.get("from", mapping.source_type)
+                        mapping.target_type = new_type
+                        alter_stmts.append(
+                            f'ALTER TABLE "{schema}"."{table}" '
+                            f'ALTER COLUMN "{mapping.target_column}" TYPE {new_type}'
+                        )
+                        break
+
+        elif proposal.change_type == ChangeType.DROP_COLUMN:
+            drop_cols = proposal.proposed_state.get("dropped_columns", [])
+            for col_info in drop_cols:
+                col_name = col_info if isinstance(col_info, str) else col_info.get("name", "")
+                pipeline.column_mappings = [
+                    m for m in pipeline.column_mappings if m.source_column != col_name
+                ]
+                alter_stmts.append(
+                    f'ALTER TABLE "{schema}"."{table}" DROP COLUMN IF EXISTS "{col_name}"'
+                )
+
+        # Execute ALTER statements on the actual target table
+        if alter_stmts:
+            try:
+                tgt_params = {
+                    "host": pipeline.target_host, "port": pipeline.target_port,
+                    "database": pipeline.target_database,
+                    "user": pipeline.target_user, "password": pipeline.target_password,
+                    "default_schema": pipeline.target_schema,
+                }
+                if config and config.has_encryption_key:
+                    tgt_params = decrypt_dict(tgt_params, config.encryption_key, CREDENTIAL_FIELDS)
+                target = await registry.get_target(pipeline.target_connector_id, tgt_params)
+                for stmt in alter_stmts:
+                    await target.execute_sql(stmt)
+                if hasattr(target, "close"):
+                    await target.close()
+                log.info("Applied %d ALTER statement(s) to target table for proposal %s",
+                         len(alter_stmts), proposal.proposal_id[:8])
+            except Exception as e:
+                log.error("Failed to ALTER target table for proposal %s: %s",
+                          proposal.proposal_id[:8], e)
+
         pipeline.version += 1
         proposal.contract_version_after = pipeline.version
         await store.save_pipeline(pipeline)

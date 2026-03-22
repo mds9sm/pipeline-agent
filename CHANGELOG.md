@@ -63,6 +63,27 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ---
 
+### Build 29c: Schema Drift ALTER TABLE Fix — 2026-03-22 (Claude Opus 4.6)
+
+**Fix schema drift auto-apply and approval to ALTER the actual target table, not just update column mappings in metadata.**
+
+#### Fixed
+- **`_auto_apply_schema_changes` in `monitor/engine.py`**: Now executes `ALTER TABLE ... ADD COLUMN` and `ALTER COLUMN ... TYPE` on the target table after updating column mappings. Previously only updated the pipeline contract in PostgreSQL, causing COPY to fail with "extra data after last expected column" when new source columns appeared.
+- **`_apply_approved_proposal` in `api/server.py`**: Complete rewrite of schema change application logic:
+  - `ADD_COLUMN`: Re-profiles source to get ColumnMapping objects, appends to pipeline, ALTERs target table. Previously tried `proposed_state.get("column_mappings", [])` which was always empty (proposals store `new_columns` not `column_mappings`), wiping all column mappings.
+  - `ALTER_COLUMN_TYPE`: Updates mapping types and ALTERs column type on target.
+  - `DROP_COLUMN`: Removes from mappings and DROPs column on target.
+- **`_apply_proposal` now receives `config`** for credential decryption when building target connection params.
+
+#### Added
+- **`schema_change_policy` on pipeline creation** (`api/server.py`): `CreatePipelineRequest` now accepts `schema_change_policy` dict, applied after pipeline creation.
+- **demo-ecommerce-orders uses `propose` policy**: New columns, dropped columns, and type changes all require approval instead of auto-applying. Prevents the exact failure that triggered this fix.
+
+#### Root Cause
+Schema drift detection (monitor) correctly identified new columns from MySQL source and auto-added them to the pipeline's `column_mappings` in PostgreSQL. But the actual target table was never ALTERed. On next extract, the CSV included all columns (matching updated mappings), but `COPY ... FROM STDIN CSV HEADER` failed because the target table schema was stale.
+
+---
+
 ### Build 29: Native SQL Transforms — 2026-03-21 (Claude Opus 4.6)
 
 **Replace dbt with native SQL transforms in pipelines — ref(), var(), 4 materialization strategies, AI generation, column lineage, and a full transform catalog.**

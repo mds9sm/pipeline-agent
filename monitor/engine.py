@@ -370,6 +370,41 @@ class MonitorEngine:
                         mapping.is_nullable = nc["to_nullable"]
                         break
 
+        # ── ALTER the actual target table ──────────────────────────────
+        try:
+            tgt_params = self._target_params(pipeline)
+            target = await self.registry.get_target(
+                pipeline.target_connector_id, tgt_params,
+            )
+            schema = pipeline.target_schema or "raw"
+            table = pipeline.target_table
+            alter_stmts = []
+            if new_columns:
+                for col_info in new_columns:
+                    col_name = col_info["name"]
+                    if col_name in live_cols:
+                        m = live_cols[col_name]
+                        alter_stmts.append(
+                            f'ALTER TABLE "{schema}"."{table}" '
+                            f'ADD COLUMN IF NOT EXISTS "{m.target_column}" {m.target_type}'
+                        )
+            if safe_type_changes:
+                for tc in safe_type_changes:
+                    col_name = tc["column"]
+                    if col_name in live_cols:
+                        m = live_cols[col_name]
+                        alter_stmts.append(
+                            f'ALTER TABLE "{schema}"."{table}" '
+                            f'ALTER COLUMN "{m.target_column}" TYPE {m.target_type}'
+                        )
+            for stmt in alter_stmts:
+                await target.execute_sql(stmt)
+            if hasattr(target, "close"):
+                await target.close()
+            log.info("Applied %d ALTER statement(s) to target table", len(alter_stmts))
+        except Exception as e:
+            log.error("Failed to ALTER target table for %s: %s", pipeline.pipeline_id, e)
+
         changes_desc = []
         if new_columns:
             changes_desc.append(f"{len(new_columns)} new column(s): {[c['name'] for c in new_columns]}")

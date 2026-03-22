@@ -563,6 +563,8 @@ async def _create_pipeline_via_api(
         "tags": {"environment": "demo"},
         "auto_approve_additive": True,
     }
+    if "schema_change_policy" in cfg:
+        payload["schema_change_policy"] = cfg["schema_change_policy"]
     try:
         r = await client.post(
             f"{base_url}/api/pipelines", json=payload, headers=headers, timeout=30.0,
@@ -778,6 +780,13 @@ def _build_demo_pipelines(mysql_cfg: dict, mongo_cfg: dict, stripe_url: str) -> 
             "target_table": "demo_orders",
             "refresh_type": "full",
             "schedule_cron": "0 * * * *",
+            "schema_change_policy": {
+                "on_new_column": "propose",
+                "on_dropped_column": "propose",
+                "on_type_change": "propose",
+                "on_nullable_change": "auto_accept",
+                "propagate_to_downstream": True,
+            },
         },
         {
             "pipeline_name": "demo-ecommerce-customers",
