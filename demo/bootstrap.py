@@ -385,7 +385,9 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
     """
     existing = await store.list_pipelines()
     if existing:
-        log.info("Pipelines already exist (%d), skipping demo bootstrap.", len(existing))
+        log.info("Pipelines already exist (%d), skipping pipeline bootstrap.", len(existing))
+        # Still bootstrap transforms if they don't exist yet
+        await _bootstrap_demo_transforms(store, existing)
         return
 
     _tgt = _target_config()
