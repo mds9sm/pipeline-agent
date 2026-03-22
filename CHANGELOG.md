@@ -31,6 +31,38 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ## [Unreleased]
 
+### Build 29b: Transform UI & Environment Promotion — 2026-03-22 (Claude Opus 4.6)
+
+**Inline transform SQL editing with approval flow, searchable dependency picker, and GitOps-driven environment promotion model.**
+
+#### Added
+- **StepDAGSection UI component** (`ui/App.jsx`):
+  - Pipeline detail view shows all steps grouped by dependency layers
+  - Transform steps display full SQL, materialization, refs, variables, approval status
+  - Inline SQL editor: edit → validate → save (resets approval to pending) → approve
+  - Description and materialization type editable alongside SQL
+  - Non-transform steps show type badges and config summaries
+
+- **Searchable dependency picker** (`ui/App.jsx`):
+  - Replaces raw `window.prompt` for pipeline ID with searchable dropdown
+  - Filters by pipeline name, source table, or pipeline ID
+  - Excludes self and already-added upstream dependencies
+  - Two-step flow: select pipeline → review → Save Dependency
+  - Shows pipeline name, ID prefix, and status pill for each option
+
+- **Environment promotion model** (documentation):
+  - GitOps-driven promotion: dev instance → git branch → PR review → merge → stage/prod sync
+  - Three-instance architecture with branch-per-environment
+  - Transform approval flow feeds into PR diffs
+  - Pipeline changelog provides audit trail in git history
+
+#### Key Design Decisions
+- **Transform SQL requires approval; pipeline settings do not** — SQL changes affect data output (structural), settings are operational. Both tracked in changelog.
+- **Dependencies save with confirmation, no approval gate** — Dependencies are scheduling metadata, not data-affecting. Confirm step prevents accidental clicks.
+- **GitOps promotion over single-instance environment tags** — Separate instances per environment with git as the promotion mechanism. Safer isolation, natural PR review workflow, rollback = git revert.
+
+---
+
 ### Build 29: Native SQL Transforms — 2026-03-21 (Claude Opus 4.6)
 
 **Replace dbt with native SQL transforms in pipelines — ref(), var(), 4 materialization strategies, AI generation, column lineage, and a full transform catalog.**

@@ -49,6 +49,7 @@ Ships with 8 seed connectors (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebo
 4. **Hooks reference run context** — Template variables (`{{watermark_after}}`, `{{run_id}}`) enable dynamic post-promotion logic.
 5. **Agent proposes, human approves topology** — Two-tier autonomy extends to pipeline design: agent designs multi-pipeline solutions, human approves before creation.
 6. **Idempotent by default** — Merge over append, watermark-bounded over full scan. Safe to re-run.
+7. **GitOps-driven promotion** — Changes flow dev → staging → prod via git branches and PR review. Transform SQL requires approval; pipeline settings are tracked in changelog. Rollback = git revert.
 
 ## Architecture (single process, 4 async loops)
 

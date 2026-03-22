@@ -131,6 +131,25 @@ The git history preserves both versions, so nothing is lost.
 
 ---
 
+## Environment Promotion
+
+The GitOps repo enables a branch-per-environment promotion model:
+
+```
+development ──PR──▶ staging ──PR──▶ main (production)
+```
+
+1. Dev instance auto-commits to `development` branch
+2. PR from `development` → `staging` shows all pipeline, transform, and dependency changes
+3. Staging instance syncs and validates
+4. PR from `staging` → `main` promotes to production
+
+Transform SQL edits appear in PRs with their approval status. Pipeline setting changes appear with their changelog reason.
+
+See [Multi-Environment Setup](/docs/advanced/multi-environment) for full details.
+
+---
+
 ## Backup with GitOps
 
 The GitOps repo serves as a continuous backup:

@@ -858,6 +858,8 @@ class PipelineChangeType(str, Enum):
     STRATEGY_CHANGED = "strategy_changed"
     QUALITY_CONFIG_CHANGED = "quality_config_changed"
     SCHEDULE_CHANGED = "schedule_changed"
+    TRANSFORM_UPDATED = "transform_updated"
+    TRANSFORM_APPROVED = "transform_approved"
 
 
 @dataclass

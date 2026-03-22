@@ -555,6 +555,83 @@ function StepDAGSection({ steps, pipelineId }) {
 }
 
 // ---------------------------------------------------------------------------
+// ConnectorCodeSection — shows source/target connector code for ingestion DAGs
+// ---------------------------------------------------------------------------
+
+function ConnectorCodeSection({ sourceConnectorId, targetConnectorId }) {
+  const [connectors, setConnectors] = useState({});
+  const [expanded, setExpanded] = useState({});
+
+  useEffect(() => {
+    const ids = [
+      sourceConnectorId && { key: "source", id: sourceConnectorId },
+      targetConnectorId && { key: "target", id: targetConnectorId },
+    ].filter(Boolean);
+    if (ids.length === 0) return;
+    Promise.all(
+      ids.map((item) =>
+        api("GET", `/api/connectors/${item.id}`)
+          .then((c) => ({ key: item.key, connector: c }))
+          .catch(() => null)
+      )
+    ).then((results) => {
+      const map = {};
+      results.filter(Boolean).forEach((r) => { map[r.key] = r.connector; });
+      setConnectors(map);
+    });
+  }, [sourceConnectorId, targetConnectorId]);
+
+  if (!connectors.source && !connectors.target) return null;
+
+  const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
+
+  function ConnectorPanel({ label, conn, connKey }) {
+    if (!conn) return null;
+    const isExp = expanded[connKey];
+    const roleColor = connKey === "source" ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700";
+    return (
+      <div className="border border-stone-300 rounded-lg bg-white">
+        <div className="flex items-center gap-2 px-3 py-2 cursor-pointer" onClick={() => toggle(connKey)}>
+          <span className={"text-[10px] font-bold px-1.5 py-0.5 rounded " + roleColor}>{label}</span>
+          <span className="text-xs font-medium text-stone-700">{conn.name}</span>
+          <Pill label={conn.connector_type} color="purple" />
+          <Pill label={conn.db_type} color="stone" />
+          {conn.interface_version && <span className="text-[10px] text-stone-400">v{conn.interface_version}</span>}
+          <span className="ml-auto text-[10px] text-stone-400">{isExp ? "collapse" : "expand"}</span>
+        </div>
+        {isExp && (
+          <div className="border-t border-stone-200 px-3 py-2 space-y-2">
+            {conn.dependencies && conn.dependencies.length > 0 && (
+              <div className="text-[10px] text-stone-400">
+                dependencies: {conn.dependencies.join(", ")}
+              </div>
+            )}
+            <pre className="text-xs bg-stone-900 text-green-300 rounded p-3 overflow-x-auto whitespace-pre-wrap max-h-96 overflow-y-auto">{conn.code}</pre>
+          </div>
+        )}
+        {!isExp && (
+          <div className="border-t border-stone-200 px-3 py-1.5">
+            <div className="text-[10px] text-stone-500 truncate">
+              {(conn.code || "").split("\n").find((l) => l.trim().startsWith("class ")) || `${(conn.code || "").split("\n").length} lines`}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-stone-50 border border-stone-200 rounded-lg px-4 py-3">
+      <div className="text-xs font-semibold text-stone-500 mb-3">Connector Code</div>
+      <div className="space-y-2">
+        <ConnectorPanel label="Source" conn={connectors.source} connKey="source" />
+        <ConnectorPanel label="Target" conn={connectors.target} connKey="target" />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Login component
 // ---------------------------------------------------------------------------
 
@@ -1155,13 +1232,19 @@ function PipelinesView({ tierFilter, searchQuery }) {
     setPipelines((ps) => ps.map((p) => (p.pipeline_id === id ? { ...p, status: "active" } : p)));
   }
 
+  const [depPicker, setDepPicker] = useState(null); // { pipelineId, search, selected }
+
   async function addDep(pipelineId) {
-    const depId = window.prompt("Enter upstream pipeline ID to depend on:");
-    if (!depId) return;
+    setDepPicker({ pipelineId, search: "", selected: null });
+  }
+
+  async function confirmDep() {
+    if (!depPicker || !depPicker.selected) return;
     try {
-      await api("POST", `/api/pipelines/${pipelineId}/dependencies`, { depends_on_id: depId });
-      const d = await api("GET", `/api/pipelines/${pipelineId}`);
+      await api("POST", `/api/pipelines/${depPicker.pipelineId}/dependencies`, { depends_on_id: depPicker.selected.pipeline_id });
+      const d = await api("GET", `/api/pipelines/${depPicker.pipelineId}`);
       setDetail(d);
+      setDepPicker(null);
     } catch (e) { window.alert("Failed: " + (e.message || e)); }
   }
 
@@ -1276,7 +1359,67 @@ function PipelinesView({ tierFilter, searchQuery }) {
                             <button onClick={() => removeDep(detail.pipeline_id, d.dependency_id)} className="text-red-400 hover:text-red-600 ml-auto text-[10px]">Remove</button>
                           </div>
                         )) : <div className="text-xs text-stone-300">No upstream dependencies</div>}
-                        <button onClick={() => addDep(detail.pipeline_id)} className="text-[10px] text-blue-500 hover:text-blue-700 mt-1">+ Add dependency</button>
+                        {depPicker && depPicker.pipelineId === detail.pipeline_id ? (
+                          <div className="mt-1 border border-blue-300 rounded bg-white p-2 space-y-1">
+                            <div className="flex items-center gap-2">
+                              <input
+                                autoFocus
+                                className="flex-1 text-xs border border-stone-300 rounded px-2 py-1"
+                                placeholder="Search pipelines..."
+                                value={depPicker.search}
+                                onChange={(e) => setDepPicker({ ...depPicker, search: e.target.value })}
+                              />
+                              <button onClick={() => setDepPicker(null)} className="text-[10px] text-stone-400 hover:text-stone-600">Cancel</button>
+                            </div>
+                            {depPicker.selected && (
+                              <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded px-2 py-1.5">
+                                <span className="text-xs font-medium text-blue-800">{depPicker.selected.pipeline_name}</span>
+                                <span className="text-[10px] text-blue-500 font-mono">{depPicker.selected.pipeline_id.slice(0, 8)}</span>
+                                <button onClick={() => setDepPicker({ ...depPicker, selected: null })} className="text-[10px] text-blue-400 hover:text-blue-600 ml-auto">Change</button>
+                                <button onClick={confirmDep} className="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white hover:bg-blue-700">Save Dependency</button>
+                              </div>
+                            )}
+                            {!depPicker.selected && (
+                              <div className="max-h-40 overflow-y-auto space-y-0.5">
+                                {pipelines
+                                  .filter((p) => {
+                                    if (p.pipeline_id === detail.pipeline_id) return false;
+                                    const existing = (detail.dependencies.upstream || []).map((d) => d.depends_on_id);
+                                    if (existing.includes(p.pipeline_id)) return false;
+                                    if (!depPicker.search) return true;
+                                    const q = depPicker.search.toLowerCase();
+                                    return (p.pipeline_name || "").toLowerCase().includes(q)
+                                      || (p.source_table || "").toLowerCase().includes(q)
+                                      || (p.pipeline_id || "").toLowerCase().includes(q);
+                                  })
+                                  .map((p) => (
+                                    <button
+                                      key={p.pipeline_id}
+                                      onClick={() => setDepPicker({ ...depPicker, selected: p })}
+                                      className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-blue-50 flex items-center gap-2 border border-transparent hover:border-blue-200"
+                                    >
+                                      <span className="font-medium text-stone-700">{p.pipeline_name}</span>
+                                      <span className="text-[10px] text-stone-400 font-mono">{p.pipeline_id.slice(0, 8)}</span>
+                                      {p.status && <Pill label={p.status} color={p.status === "active" ? "green" : "stone"} />}
+                                    </button>
+                                  ))
+                                }
+                                {pipelines.filter((p) => {
+                                  if (p.pipeline_id === detail.pipeline_id) return false;
+                                  const existing = (detail.dependencies.upstream || []).map((d) => d.depends_on_id);
+                                  if (existing.includes(p.pipeline_id)) return false;
+                                  if (!depPicker.search) return true;
+                                  const q = depPicker.search.toLowerCase();
+                                  return (p.pipeline_name || "").toLowerCase().includes(q) || (p.pipeline_id || "").toLowerCase().includes(q);
+                                }).length === 0 && (
+                                  <div className="text-[10px] text-stone-400 px-2 py-1">No matching pipelines</div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <button onClick={() => addDep(detail.pipeline_id)} className="text-[10px] text-blue-500 hover:text-blue-700 mt-1">+ Add dependency</button>
+                        )}
                       </div>
                       <div>
                         <div className="text-[10px] text-stone-400 mb-1 uppercase tracking-wider">Downstream</div>
@@ -1305,6 +1448,14 @@ function PipelinesView({ tierFilter, searchQuery }) {
                 {/* ---- Step DAG / Transforms (Build 29) ---- */}
                 {!editForm && (detail.steps || []).length > 0 && (
                   <StepDAGSection steps={detail.steps} pipelineId={detail.pipeline_id} />
+                )}
+
+                {/* ---- Connector Code (Build 29b) ---- */}
+                {!editForm && (detail.source_connector_id || detail.target_connector_id) && (
+                  <ConnectorCodeSection
+                    sourceConnectorId={detail.source_connector_id}
+                    targetConnectorId={detail.target_connector_id}
+                  />
                 )}
 
                 {/* ---- Post-Promotion Hooks (Build 13) ---- */}

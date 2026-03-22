@@ -2836,6 +2836,14 @@ def create_app(
             detail=f"Added dependency on {upstream.pipeline_name}",
             reasoning=req.notes or "",
         ))
+        await _log_pipeline_change(
+            pipeline_id=pipeline_id,
+            pipeline_name=p.pipeline_name,
+            change_type=PipelineChangeType.DEPENDENCY_ADDED,
+            changed_fields={"depends_on_id": req.depends_on_id, "depends_on_name": upstream.pipeline_name},
+            caller=caller,
+            context=f"Added upstream dependency on {upstream.pipeline_name}",
+        )
         return {"dependency_id": dep.dependency_id}
 
     @app.get("/api/pipelines/{pipeline_id}/dependencies")
@@ -2871,6 +2879,7 @@ def create_app(
         caller: dict = Depends(auth_dep),
     ):
         require_role(caller, "admin", "operator")
+        p = await store.get_pipeline(pipeline_id)
         await store.delete_dependency(dependency_id)
         await store.save_decision(DecisionLog(
             pipeline_id=pipeline_id,
@@ -2878,6 +2887,15 @@ def create_app(
             detail=f"Removed dependency {dependency_id}",
             reasoning="",
         ))
+        if p:
+            await _log_pipeline_change(
+                pipeline_id=pipeline_id,
+                pipeline_name=p.pipeline_name,
+                change_type=PipelineChangeType.DEPENDENCY_REMOVED,
+                changed_fields={"dependency_id": dependency_id},
+                caller=caller,
+                context=f"Removed upstream dependency",
+            )
         return {"status": "deleted"}
 
     # -----------------------------------------------------------------------
@@ -4882,6 +4900,22 @@ def create_app(
         t.version += 1
         t.updated_at = now_iso()
         await store.save_sql_transform(t)
+
+        # Write to pipeline changelog if transform is linked to a pipeline
+        if t.pipeline_id:
+            is_approval = changed == ["approved"] and t.approved
+            change_type = PipelineChangeType.TRANSFORM_APPROVED if is_approval else PipelineChangeType.TRANSFORM_UPDATED
+            pipeline = await store.get_pipeline(t.pipeline_id)
+            p_name = pipeline.pipeline_name if pipeline else t.pipeline_id[:8]
+            await _log_pipeline_change(
+                pipeline_id=t.pipeline_id,
+                pipeline_name=p_name,
+                change_type=change_type,
+                changed_fields={"transform_name": t.transform_name, "version": t.version, "changed": changed},
+                caller=caller,
+                context=f"Transform {t.transform_name} v{t.version}",
+            )
+
         return {"transform_id": transform_id, "version": t.version, "changed": changed}
 
     @app.delete("/api/transforms/{transform_id}")
