@@ -79,8 +79,23 @@ Format: Each entry records what changed, why, and test results at the time of th
 - **`schema_change_policy` on pipeline creation** (`api/server.py`): `CreatePipelineRequest` now accepts `schema_change_policy` dict, applied after pipeline creation.
 - **demo-ecommerce-orders uses `propose` policy**: New columns, dropped columns, and type changes all require approval instead of auto-applying. Prevents the exact failure that triggered this fix.
 
+#### Added
+- **Pre-extract schema drift check** (`agent/autonomous.py`): Before extraction, the runner now profiles the source and compares against pipeline column_mappings. If new columns are detected:
+  - `auto_add` policy: appends mappings AND ALTERs target table immediately, then proceeds
+  - `propose` policy: creates a proposal, halts the run (status=HALTED), awaits approval
+  - `ignore` policy: proceeds without changes
+  - Runs in both legacy and step-DAG execution paths
+  - Failures in schema check are logged as warnings but don't block the run
+
 #### Root Cause
 Schema drift detection (monitor) correctly identified new columns from MySQL source and auto-added them to the pipeline's `column_mappings` in PostgreSQL. But the actual target table was never ALTERed. On next extract, the CSV included all columns (matching updated mappings), but `COPY ... FROM STDIN CSV HEADER` failed because the target table schema was stale.
+
+#### Architecture Decision
+Schema drift detection moved from monitor-only (5-minute background tick) to **run-time** (pre-extract check). The monitor still runs for continuous observability, but the critical path — catching drift before it causes a COPY failure — now happens at the point of execution. This means:
+- No more 5-minute delay between drift detection and action
+- Drift is caught exactly when it matters (before extraction)
+- The approval proposal is created in the run context, not as a background surprise
+- The run halts cleanly with HALTED status, not FAILED with a cryptic COPY error
 
 ---
 

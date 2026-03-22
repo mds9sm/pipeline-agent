@@ -15,11 +15,13 @@ from config import Config
 from contracts.models import (
     PipelineContract, RunRecord, GateRecord, ColumnLineage,
     ErrorBudget, AlertRecord, SchemaVersion,
+    ContractChangeProposal, ChangeType, TriggerType, ProposalStatus,
     StepDefinition, StepExecution, StepType, StepStatus,
     RunStatus, GateDecision, RunMode, ConnectorStatus, AlertSeverity,
     CleanupOwnership,
     now_iso, new_id,
 )
+from dataclasses import asdict
 from contracts.store import Store
 from connectors.registry import ConnectorRegistry
 from staging.local import LocalStagingManager
@@ -87,6 +89,101 @@ class PipelineRunner:
         })
         self._step_t0 = _time.time()
 
+    async def _pre_extract_schema_check(
+        self,
+        contract: PipelineContract,
+        run: RunRecord,
+        source,
+        target,
+    ) -> str:
+        """Compare source schema against pipeline column_mappings before extraction.
+
+        Returns:
+            "ok"      — no drift, proceed with extraction
+            "applied" — drift detected and auto-applied (target ALTERed)
+            "halted"  — drift detected, proposal created, run halted for approval
+        """
+        try:
+            profile = await source.profile_table(
+                contract.source_schema, contract.source_table,
+            )
+            live_cols = {m.source_column: m for m in profile.columns}
+            existing_cols = {m.source_column for m in contract.column_mappings}
+
+            new_columns = [
+                {"name": name} for name in live_cols
+                if name not in existing_cols
+            ]
+            if not new_columns:
+                self._log_step(run, "schema_check", "no drift detected")
+                return "ok"
+
+            new_names = [c["name"] for c in new_columns]
+            policy = contract.get_schema_policy()
+            log.info("Pre-extract drift: %d new column(s) %s, policy=%s",
+                     len(new_columns), new_names, policy.on_new_column)
+
+            if policy.on_new_column == "ignore":
+                self._log_step(run, "schema_check", f"ignored {len(new_columns)} new column(s)")
+                return "ok"
+
+            if policy.on_new_column == "auto_add":
+                # Append mappings and ALTER target table
+                schema = contract.target_schema or "raw"
+                table = contract.target_table
+                for col_info in new_columns:
+                    col_name = col_info["name"]
+                    if col_name in live_cols:
+                        m = live_cols[col_name]
+                        contract.column_mappings.append(m)
+                        await target.execute_sql(
+                            f'ALTER TABLE "{schema}"."{table}" '
+                            f'ADD COLUMN IF NOT EXISTS "{m.target_column}" {m.target_type}'
+                        )
+                contract.version += 1
+                contract.updated_at = now_iso()
+                await self.store.save_pipeline(contract)
+                sv = SchemaVersion(
+                    pipeline_id=contract.pipeline_id,
+                    version=contract.version,
+                    column_mappings=contract.column_mappings,
+                    change_summary=f"Pre-extract auto-add: {new_names}",
+                    change_type="add_column",
+                    applied_by="runner",
+                )
+                await self.store.save_schema_version(sv)
+                self._log_step(run, "schema_check", f"auto-added {len(new_columns)} column(s): {new_names}")
+                return "applied"
+
+            # policy.on_new_column == "propose"
+            proposal = ContractChangeProposal(
+                pipeline_id=contract.pipeline_id,
+                trigger_type=TriggerType.SCHEMA_DRIFT,
+                trigger_detail={"new_columns": new_columns, "detected_at": "pre_extract"},
+                change_type=ChangeType.ADD_COLUMN,
+                current_state={"column_mappings": [asdict(m) for m in contract.column_mappings]},
+                proposed_state={"new_columns": new_columns},
+                reasoning=f"Source has {len(new_columns)} new column(s) not in target: {new_names}. Detected at run time before extraction.",
+                confidence=0.9,
+                contract_version_before=contract.version,
+            )
+            await self.store.save_proposal(proposal)
+
+            # Halt the run — needs human approval
+            run.status = RunStatus.HALTED
+            run.error = f"Schema drift: {len(new_columns)} new column(s) need approval: {new_names}"
+            run.completed_at = now_iso()
+            await self.store.save_run(run)
+            self._log_step(run, "schema_check", f"HALTED — {len(new_columns)} new column(s) need approval", "halted")
+            log.warning("Run %s halted: schema drift requires approval", run.run_id[:8])
+            return "halted"
+
+        except Exception as e:
+            # Don't block the run if schema check fails — log and proceed
+            log.warning("Pre-extract schema check failed for %s: %s", contract.pipeline_id, e)
+            self._log_step(run, "schema_check", f"check failed: {e}", "warn")
+            return "ok"
+
     async def _execute_inner(
         self,
         contract: PipelineContract,
@@ -132,6 +229,14 @@ class PipelineRunner:
             # Ensure target table exists
             await target.create_table_if_not_exists(contract)
             self._log_step(run, "connectors", f"source={contract.source_connector_id[:8]}, target={contract.target_connector_id[:8]}")
+
+            # Pre-extract schema drift check
+            drift_result = await self._pre_extract_schema_check(
+                contract, run, source, target,
+            )
+            if drift_result == "halted":
+                # Run halted pending approval — not an error, just needs human review
+                return run
 
             # 2. EXTRACTING
             run.status = RunStatus.EXTRACTING
@@ -1073,6 +1178,15 @@ class PipelineRunner:
     async def _step_extract(self, step_def, ctx, run, contract):
         """Extract data from source."""
         source = ctx["source"]
+        target = ctx["target"]
+
+        # Pre-extract schema drift check
+        drift_result = await self._pre_extract_schema_check(
+            contract, run, source, target,
+        )
+        if drift_result == "halted":
+            raise RuntimeError("Schema drift: new columns need approval before extraction")
+
         run.status = RunStatus.EXTRACTING
         run.watermark_before = contract.last_watermark
         await self.store.save_run(run)
