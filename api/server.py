@@ -4872,6 +4872,9 @@ def create_app(
         if "approved" in body:
             t.approved = body["approved"]
             changed.append("approved")
+        if "pipeline_id" in body:
+            t.pipeline_id = body["pipeline_id"]
+            changed.append("pipeline_id")
 
         if not changed:
             return {"transform_id": transform_id, "message": "No changes"}
@@ -5202,8 +5205,14 @@ async def _resolve_pipeline(query: str, store: Store):
 
 
 def _parse_step_dicts(raw_steps: list[dict]) -> list:
-    """Parse step dicts from API request into StepDefinition list."""
+    """Parse step dicts from API request into StepDefinition list.
+
+    Supports `depends_on_names` for name-based dependency resolution
+    in addition to `depends_on` with explicit step IDs.
+    """
+    # First pass: create steps and build name->id map
     result = []
+    name_to_id: dict[str, str] = {}
     for s in raw_steps:
         d = dict(s)
         if "step_id" not in d or not d["step_id"]:
@@ -5218,8 +5227,22 @@ def _parse_step_dicts(raw_steps: list[dict]) -> list:
             d["depends_on"] = []
         if "config" not in d:
             d["config"] = {}
-        result.append(StepDefinition(**d))
-    return result
+        name_to_id[d.get("step_name", "")] = d["step_id"]
+        # Stash name deps for second pass
+        d["_depends_on_names"] = d.pop("depends_on_names", [])
+        result.append(d)
+
+    # Second pass: resolve name-based dependencies to IDs
+    parsed = []
+    for d in result:
+        name_deps = d.pop("_depends_on_names", [])
+        if name_deps:
+            for name in name_deps:
+                dep_id = name_to_id.get(name)
+                if dep_id and dep_id not in d["depends_on"]:
+                    d["depends_on"].append(dep_id)
+        parsed.append(StepDefinition(**d))
+    return parsed
 
 
 def _connector_detail(c) -> dict:

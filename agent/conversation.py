@@ -297,8 +297,8 @@ class ConversationManager:
         """
         schema_name = strategy.get("source_schema", "")
         table_name = strategy.get("source_table", "")
-        target_table = f"{schema_name}_{table_name}"
-        pipeline_name = f"{schema_name}.{table_name}"
+        target_table = strategy.get("target_table") or f"{schema_name}_{table_name}"
+        pipeline_name = strategy.get("pipeline_name") or f"{schema_name}.{table_name}"
 
         # Build column mappings from strategy or profile
         mappings: list[ColumnMapping] = []

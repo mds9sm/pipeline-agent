@@ -262,17 +262,13 @@ async def main():
         await registry.load_all_active()
         log.info("  Connectors loaded.")
 
-        # 7b. Bootstrap demo pipelines (first startup only)
-        from demo.bootstrap import bootstrap_demo_pipelines
-        await bootstrap_demo_pipelines(store, registry, runner)
-
-        # 7c. Recover stale runs from prior crash
+        # 7b. Recover stale runs from prior crash
         await _recover_stale_runs(store)
 
         pipelines = await store.list_pipelines(status="active")
         log.info("  Active pipelines: %d", len(pipelines))
 
-        # 7d. Initialize GitOps repo
+        # 7c. Initialize GitOps repo
         gitops = GitOpsRepo(
             config.pipeline_repo_path,
             branch=config.pipeline_repo_branch,
@@ -319,11 +315,22 @@ async def main():
         )
         server = uvicorn.Server(uvi_config)
 
+        # 10. Demo bootstrap runs as background task after server is healthy
+        from demo.bootstrap import bootstrap_demo_pipelines
+
+        async def _demo_bootstrap_task():
+            """One-shot task: bootstrap demo pipelines via API, then exit."""
+            try:
+                await bootstrap_demo_pipelines(port=config.api_port)
+            except Exception as e:
+                log.error("Demo bootstrap failed: %s", e, exc_info=True)
+
         await asyncio.gather(
             server.serve(),
             scheduler.run_forever(),
             monitor.run_forever(),
             observability_loop(config, store, agent, gitops=gitops),
+            _demo_bootstrap_task(),
         )
 
     finally:

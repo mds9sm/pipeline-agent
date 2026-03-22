@@ -139,6 +139,9 @@ class ContractStore:
         scp_json = json.dumps(asdict(p.schema_change_policy)) if p.schema_change_policy else json.dumps({})
         hooks_json = json.dumps([asdict(h) for h in p.post_promotion_hooks])
         steps_json = json.dumps([asdict(s) for s in p.steps])
+        # FK constraints: empty string violates REFERENCES, use NULL instead
+        source_cid = p.source_connector_id or None
+        target_cid = p.target_connector_id or None
         await self.pool.execute("""
             INSERT INTO pipelines (
                 pipeline_id, pipeline_name, version, created_at, updated_at,
@@ -215,9 +218,9 @@ class ContractStore:
         """,
             p.pipeline_id, p.pipeline_name, p.version, p.created_at, p.updated_at,
             p.status.value, p.environment,
-            p.source_connector_id, p.source_host, p.source_port, p.source_database,
+            source_cid, p.source_host, p.source_port, p.source_database,
             p.source_schema, p.source_table, p.source_user, p.source_password,
-            p.target_connector_id, p.target_host, p.target_port, p.target_database,
+            target_cid, p.target_host, p.target_port, p.target_database,
             p.target_user, p.target_password,
             p.target_schema, p.target_table,
             json.dumps(p.target_options),
@@ -1496,6 +1499,7 @@ class ContractStore:
                 column_lineage=EXCLUDED.column_lineage,
                 version=EXCLUDED.version,
                 approved=EXCLUDED.approved,
+                pipeline_id=EXCLUDED.pipeline_id,
                 updated_at=EXCLUDED.updated_at
         """,
             t.transform_id, t.transform_name, t.description, t.sql,
