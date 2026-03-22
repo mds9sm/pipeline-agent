@@ -42,11 +42,15 @@ class QualityGate:
     """
     Orchestrates seven quality checks against a staging table and returns a
     GateRecord with a PROMOTE / PROMOTE_WITH_WARNING / HALT decision.
+
+    The agent makes the final decision — checks provide signals, the agent
+    reasons about whether to promote, warn, or halt based on context.
     """
 
-    def __init__(self, store: ContractStore, config: Config):
+    def __init__(self, store: ContractStore, config: Config, agent=None):
         self.store = store
         self.config = config
+        self.agent = agent  # AgentCore — drives the gate decision
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -81,32 +85,33 @@ class QualityGate:
 
         gate.checks = checks
 
-        # First-run leniency: if no prior complete runs, downgrade FAILs to WARNs
+        # Determine if this is the first run (no prior complete runs)
         prior_runs = await self.store.list_runs(contract.pipeline_id, limit=5)
         is_first_run = not any(
             r.run_id != run.run_id and r.status == RunStatus.COMPLETE
             for r in prior_runs
         )
-        if is_first_run:
-            for c in checks:
-                if c.status == CheckStatus.FAIL:
-                    c.status = CheckStatus.WARN
-                    c.detail = f"[First run - auto-downgraded] {c.detail}"
 
-        # ---- decision logic ----
-        any_fail = any(c.status == CheckStatus.FAIL for c in checks)
-        any_warn = any(c.status == CheckStatus.WARN for c in checks)
-
-        if any_fail:
-            gate.decision = GateDecision.HALT
-        elif any_warn:
-            gate.decision = (
-                GateDecision.PROMOTE_WITH_WARNING
-                if qc.promote_on_warn
-                else GateDecision.HALT
-            )
+        # ---- Agent-driven decision ----
+        # The agent receives all check results and decides based on context
+        if self.agent:
+            try:
+                agent_decision = await self.agent.decide_quality_gate(
+                    contract, checks, is_first_run,
+                )
+                decision_str = agent_decision.get("decision", "halt")
+                if decision_str == "promote":
+                    gate.decision = GateDecision.PROMOTE
+                elif decision_str == "promote_with_warning":
+                    gate.decision = GateDecision.PROMOTE_WITH_WARNING
+                else:
+                    gate.decision = GateDecision.HALT
+                gate.agent_reasoning = agent_decision.get("reasoning", "")
+            except Exception as e:
+                log.warning("Agent gate decision failed, using fallback: %s", e)
+                gate.decision = self._fallback_decision(checks, is_first_run, qc)
         else:
-            gate.decision = GateDecision.PROMOTE
+            gate.decision = self._fallback_decision(checks, is_first_run, qc)
 
         gate.evaluated_at = now_iso()
 
@@ -132,6 +137,33 @@ class QualityGate:
             )
 
         return gate
+
+    # ------------------------------------------------------------------
+    # Fallback decision (when agent unavailable)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fallback_decision(checks, is_first_run, qc) -> GateDecision:
+        """Threshold-based fallback when agent is unavailable."""
+        if is_first_run:
+            # First run leniency: downgrade FAILs to WARNs
+            for c in checks:
+                if c.status == CheckStatus.FAIL:
+                    c.status = CheckStatus.WARN
+                    c.detail = f"[First run - auto-downgraded] {c.detail}"
+
+        any_fail = any(c.status == CheckStatus.FAIL for c in checks)
+        any_warn = any(c.status == CheckStatus.WARN for c in checks)
+
+        if any_fail:
+            return GateDecision.HALT
+        if any_warn:
+            return (
+                GateDecision.PROMOTE_WITH_WARNING
+                if qc.promote_on_warn
+                else GateDecision.HALT
+            )
+        return GateDecision.PROMOTE
 
     # ------------------------------------------------------------------
     # Helpers

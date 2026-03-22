@@ -624,53 +624,640 @@ Rules:
         }
 
     # ------------------------------------------------------------------
-    # reason_about_quality
+    # Agentic quality gate decision (Tier 1A)
     # ------------------------------------------------------------------
 
-    async def reason_about_quality(
+    async def decide_quality_gate(
         self,
         contract: PipelineContract,
         checks: list[CheckResult],
-        decision: str,
-    ) -> str:
-        """Generate natural language explanation of gate results."""
-        if not self.has_api:
-            failed = [c for c in checks if c.status.value == "fail"]
-            warned = [c for c in checks if c.status.value == "warn"]
-            parts = [f"Gate decision: {decision}."]
-            if failed:
-                parts.append(f"Failed checks: {[c.check_name for c in failed]}.")
-            if warned:
-                parts.append(f"Warning checks: {[c.check_name for c in warned]}.")
-            return " ".join(parts)
+        is_first_run: bool = False,
+    ) -> dict:
+        """Agent decides PROMOTE / PROMOTE_WITH_WARNING / HALT based on check results.
 
+        The 7 quality checks provide signals; the agent makes the decision with
+        contextual reasoning about whether failures are acceptable.
+
+        Returns dict with:
+            decision: "promote" | "promote_with_warning" | "halt"
+            reasoning: why this decision was made
+            root_cause: what likely caused failures/warnings
+            recommended_action: what the team should do
+            risk_assessment: risk of promoting despite warnings
+        """
         checks_summary = "\n".join(
-            f"- {c.check_name}: {c.status.value} -- {c.detail}"
+            f"- {c.check_name}: {c.status.value} — {c.detail}"
             for c in checks
         )
-        user_prompt = f"""
-Pipeline: {contract.pipeline_name}
-Gate decision: {decision}
+        failed = [c for c in checks if c.status.value == "fail"]
+        warned = [c for c in checks if c.status.value == "warn"]
+
+        if not self.has_api:
+            return self._rule_based_gate_decision(contract, checks, is_first_run)
+
+        user_prompt = f"""You are the quality gate decision maker for pipeline "{contract.pipeline_name}".
+
+Pipeline context:
+- Tier: {contract.tier} (1=critical, 2=standard, 3=development)
+- Refresh type: {contract.refresh_type.value if hasattr(contract.refresh_type, 'value') else contract.refresh_type}
+- Is first run: {is_first_run}
+- Baseline row count: {contract.baseline_row_count or 'none (new pipeline)'}
+
 Quality check results:
 {checks_summary}
 
-Provide a concise (2-4 sentence) natural language analysis:
-1. What failed or warned and the likely root cause
-2. What action the data engineering team should take
-3. Whether this looks like a source issue, pipeline issue, or expected behavior
+Based on these results, decide whether to:
+- **promote**: All checks pass, data is safe to use
+- **promote_with_warning**: Minor issues detected but data is usable (e.g., small volume variance, slight null rate increase on non-critical columns)
+- **halt**: Serious quality issues that would corrupt downstream data or violate data contracts
 
-Respond with plain text (no JSON).
+Respond with JSON:
+{{
+  "decision": "promote" | "promote_with_warning" | "halt",
+  "reasoning": "2-3 sentences explaining why you made this decision",
+  "root_cause": "likely cause of any failures/warnings",
+  "recommended_action": "what the team should do next",
+  "risk_assessment": "risk of promoting despite any warnings (low/medium/high)"
+}}
+
+Decision guidelines:
+- First runs with only WARN results should usually promote (establishing baselines)
+- Tier 1 pipelines should be more conservative (halt on warnings)
+- Volume z-score warnings alone rarely justify halting
+- PK uniqueness failures are almost always halt-worthy
+- Schema consistency failures are always halt-worthy
+- Null rate spikes on primary key columns are halt-worthy
+- Count reconciliation failures suggest data loss — usually halt
 """
         try:
-            return await self._call_claude(
+            text = await self._call_claude(
                 self._system_prompt(), user_prompt,
                 pipeline_id=contract.pipeline_id,
-                operation="reason_about_quality",
-                temperature=0.2,
+                operation="decide_quality_gate",
+                temperature=0.1,
             )
+            result = self._extract_json(text)
+            if "decision" not in result:
+                return self._rule_based_gate_decision(contract, checks, is_first_run)
+            return result
         except Exception as e:
-            log.warning("Claude API error in reason_about_quality: %s", e)
-            return f"Gate decision: {decision}. API reasoning unavailable."
+            log.warning("Claude API error in decide_quality_gate: %s. Using fallback.", e)
+            return self._rule_based_gate_decision(contract, checks, is_first_run)
+
+    def _rule_based_gate_decision(self, contract, checks, is_first_run) -> dict:
+        """Fallback: threshold-based gate decision when API is unavailable."""
+        failed = [c for c in checks if c.status.value == "fail"]
+        warned = [c for c in checks if c.status.value == "warn"]
+
+        if is_first_run and not failed:
+            return {
+                "decision": "promote_with_warning" if warned else "promote",
+                "reasoning": "First run — establishing baselines. Warnings are expected.",
+                "root_cause": "No prior baselines to compare against",
+                "recommended_action": "Monitor subsequent runs for consistency",
+                "risk_assessment": "low",
+            }
+
+        if failed:
+            return {
+                "decision": "halt",
+                "reasoning": f"Failed checks: {[c.check_name for c in failed]}. Data quality below threshold.",
+                "root_cause": "; ".join(c.detail for c in failed),
+                "recommended_action": "Investigate failed checks and re-run",
+                "risk_assessment": "high",
+            }
+
+        if warned:
+            qc = contract.quality_config
+            decision = "promote_with_warning" if qc.promote_on_warn else "halt"
+            return {
+                "decision": decision,
+                "reasoning": f"Warning checks: {[c.check_name for c in warned]}. {'Promoting per policy.' if decision == 'promote_with_warning' else 'Halting per policy.'}",
+                "root_cause": "; ".join(c.detail for c in warned),
+                "recommended_action": "Review warning details for data quality trends",
+                "risk_assessment": "medium",
+            }
+
+        return {
+            "decision": "promote",
+            "reasoning": "All quality checks passed.",
+            "root_cause": "None — all checks healthy",
+            "recommended_action": "No action needed",
+            "risk_assessment": "low",
+        }
+
+    # ------------------------------------------------------------------
+    # Agentic error budget diagnosis (Tier 1B)
+    # ------------------------------------------------------------------
+
+    async def diagnose_error_budget(
+        self,
+        contract: PipelineContract,
+        budget_info: dict,
+        recent_runs: list,
+    ) -> dict:
+        """Agent diagnoses why error budget is exhausted and recommends recovery.
+
+        Returns dict with:
+            diagnosis: what's causing failures
+            pattern: transient | persistent | degrading
+            recommended_actions: list of specific actions
+            should_pause: whether to pause the pipeline
+            estimated_recovery: when it might self-heal (or "manual intervention needed")
+        """
+        run_summary = "\n".join(
+            f"- {r.started_at}: {r.status.value if hasattr(r.status, 'value') else r.status}"
+            f"{' — ' + r.error if r.error else ''}"
+            for r in recent_runs[:10]
+        )
+
+        if not self.has_api:
+            return self._rule_based_budget_diagnosis(budget_info, recent_runs)
+
+        user_prompt = f"""Pipeline "{contract.pipeline_name}" has exhausted its error budget.
+
+Error budget status:
+- Success rate: {budget_info.get('success_rate', 0):.1%}
+- Threshold: {budget_info.get('threshold', 0.9):.0%}
+- Window: {budget_info.get('window_days', 7)} days
+- Total runs: {budget_info.get('total_runs', 0)}, Failed: {budget_info.get('failed_runs', 0)}
+
+Recent runs (newest first):
+{run_summary}
+
+Pipeline context:
+- Tier: {contract.tier}
+- Schedule: {contract.schedule_cron}
+- Source: {contract.source_schema}.{contract.source_table}
+- Refresh type: {contract.refresh_type.value if hasattr(contract.refresh_type, 'value') else contract.refresh_type}
+
+Diagnose the failure pattern and recommend recovery actions.
+Respond with JSON:
+{{
+  "diagnosis": "root cause analysis",
+  "pattern": "transient|persistent|degrading",
+  "recommended_actions": ["action 1", "action 2"],
+  "should_pause": true/false,
+  "estimated_recovery": "description or 'manual intervention needed'"
+}}
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=contract.pipeline_id,
+                operation="diagnose_error_budget",
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("diagnose_error_budget Claude error: %s", e)
+            return self._rule_based_budget_diagnosis(budget_info, recent_runs)
+
+    def _rule_based_budget_diagnosis(self, budget_info, recent_runs) -> dict:
+        errors = [r.error for r in recent_runs if r.error]
+        unique_errors = list(set(errors[:5]))
+        is_same_error = len(unique_errors) == 1 and len(errors) > 1
+
+        return {
+            "diagnosis": f"{'Same error repeating' if is_same_error else 'Multiple failure types'}: {unique_errors[:2]}",
+            "pattern": "persistent" if is_same_error else "degrading",
+            "recommended_actions": [
+                "Investigate most recent error",
+                "Check source system availability",
+                "Review connector logs",
+            ],
+            "should_pause": budget_info.get("failed_runs", 0) > 5,
+            "estimated_recovery": "manual intervention needed",
+        }
+
+    # ------------------------------------------------------------------
+    # Agentic freshness reasoning (Tier 1C)
+    # ------------------------------------------------------------------
+
+    async def reason_about_freshness(
+        self,
+        pipeline_name: str,
+        pipeline_id: str,
+        tier: int,
+        staleness_minutes: float,
+        sla_warn: float,
+        sla_critical: float,
+        schedule_cron: str,
+        recent_run_errors: list,
+        downstream_count: int,
+    ) -> dict:
+        """Agent reasons about freshness SLA violations — is the SLA realistic?
+        Is this a one-off or degradation? What severity is appropriate?
+
+        Returns dict with:
+            severity: "critical" | "warning" | "info"
+            is_sla_realistic: whether the SLA makes sense for the schedule
+            reasoning: contextual explanation
+            recommended_action: what to do
+            should_alert: whether to fire an alert at all
+        """
+        if not self.has_api:
+            return self._rule_based_freshness(
+                staleness_minutes, sla_warn, sla_critical, schedule_cron,
+            )
+
+        user_prompt = f"""Pipeline "{pipeline_name}" has a freshness SLA violation.
+
+Freshness status:
+- Current staleness: {staleness_minutes:.0f} minutes
+- SLA warning threshold: {sla_warn} minutes
+- SLA critical threshold: {sla_critical} minutes
+- Pipeline schedule: {schedule_cron}
+- Pipeline tier: {tier} (1=critical, 2=standard, 3=dev)
+- Downstream dependents: {downstream_count}
+- Recent errors: {recent_run_errors[:3] if recent_run_errors else 'none'}
+
+Evaluate this freshness violation and respond with JSON:
+{{
+  "severity": "critical" | "warning" | "info",
+  "is_sla_realistic": true/false,
+  "reasoning": "contextual explanation — is the SLA achievable given the schedule? Is this a one-off delay or trend?",
+  "recommended_action": "what to do about it",
+  "should_alert": true/false,
+  "sla_recommendation": "if SLA is unrealistic, suggest a better threshold"
+}}
+
+Consider:
+- If schedule is every 4 hours but SLA warning is 1 hour, the SLA is impossible
+- If there are recent errors, staleness may be caused by a known issue
+- Tier 3 (dev) pipelines rarely need critical alerts for freshness
+- If downstream_count is 0, impact is limited
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=pipeline_id,
+                operation="reason_about_freshness",
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("reason_about_freshness Claude error: %s", e)
+            return self._rule_based_freshness(
+                staleness_minutes, sla_warn, sla_critical, schedule_cron,
+            )
+
+    def _rule_based_freshness(self, staleness, sla_warn, sla_critical, schedule_cron) -> dict:
+        if staleness > sla_critical:
+            severity = "critical"
+        elif staleness > sla_warn:
+            severity = "warning"
+        else:
+            severity = "info"
+        return {
+            "severity": severity,
+            "is_sla_realistic": True,
+            "reasoning": f"Staleness {staleness:.0f}m vs SLA warn={sla_warn}m, critical={sla_critical}m",
+            "recommended_action": "Investigate pipeline run status",
+            "should_alert": severity != "info",
+            "sla_recommendation": None,
+        }
+
+    # ------------------------------------------------------------------
+    # Agentic run failure diagnosis (Tier 2A)
+    # ------------------------------------------------------------------
+
+    async def diagnose_run_failure(
+        self,
+        contract: PipelineContract,
+        run_error: str,
+        execution_log: list,
+    ) -> dict:
+        """Agent diagnoses why a run failed and recommends recovery action.
+
+        Returns dict with:
+            root_cause: what went wrong
+            category: connector | source | target | network | schema | config | unknown
+            is_transient: whether a retry is likely to succeed
+            recommended_action: specific action to take
+            should_retry: whether to automatically retry
+            should_alert: whether this needs human attention
+        """
+        log_summary = "\n".join(
+            f"- [{e.get('step', '?')}] {e.get('status', '?')}: {e.get('detail', '')}"
+            for e in (execution_log or [])[-8:]
+        )
+
+        if not self.has_api:
+            return self._rule_based_failure_diagnosis(run_error)
+
+        user_prompt = f"""Pipeline "{contract.pipeline_name}" run failed.
+
+Error: {run_error}
+
+Execution log (last steps):
+{log_summary}
+
+Pipeline context:
+- Source: {contract.source_schema}.{contract.source_table} via connector {contract.source_connector_id[:8]}
+- Target: {contract.target_schema}.{contract.target_table} via connector {contract.target_connector_id[:8]}
+- Refresh type: {contract.refresh_type.value if hasattr(contract.refresh_type, 'value') else contract.refresh_type}
+- Tier: {contract.tier}
+
+Diagnose this failure and recommend next steps.
+Respond with JSON:
+{{
+  "root_cause": "specific diagnosis of what went wrong",
+  "category": "connector|source|target|network|schema|config|resource|unknown",
+  "is_transient": true/false,
+  "recommended_action": "specific action to take",
+  "should_retry": true/false,
+  "should_alert": true/false
+}}
+
+Transient examples: connection timeout, temporary lock, rate limit
+Persistent examples: schema mismatch, missing table, authentication failure, disk full
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=contract.pipeline_id,
+                operation="diagnose_run_failure",
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("diagnose_run_failure Claude error: %s", e)
+            return self._rule_based_failure_diagnosis(run_error)
+
+    def _rule_based_failure_diagnosis(self, error: str) -> dict:
+        error_lower = (error or "").lower()
+        if any(w in error_lower for w in ("timeout", "timed out", "connection reset")):
+            return {"root_cause": error, "category": "network", "is_transient": True,
+                    "recommended_action": "Retry — likely transient network issue",
+                    "should_retry": True, "should_alert": False}
+        if any(w in error_lower for w in ("permission", "authentication", "access denied", "password")):
+            return {"root_cause": error, "category": "config", "is_transient": False,
+                    "recommended_action": "Check credentials and permissions",
+                    "should_retry": False, "should_alert": True}
+        if any(w in error_lower for w in ("no such table", "relation", "does not exist", "column")):
+            return {"root_cause": error, "category": "schema", "is_transient": False,
+                    "recommended_action": "Schema mismatch — review source and target table definitions",
+                    "should_retry": False, "should_alert": True}
+        if any(w in error_lower for w in ("disk", "space", "no space")):
+            return {"root_cause": error, "category": "resource", "is_transient": False,
+                    "recommended_action": "Free disk space or increase storage",
+                    "should_retry": False, "should_alert": True}
+        return {"root_cause": error, "category": "unknown", "is_transient": False,
+                "recommended_action": "Investigate error manually",
+                "should_retry": False, "should_alert": True}
+
+    # ------------------------------------------------------------------
+    # Agentic preflight reasoning (Tier 2B)
+    # ------------------------------------------------------------------
+
+    async def reason_about_preflight_failure(
+        self,
+        contract: PipelineContract,
+        failure_reason: str,
+        context: dict,
+    ) -> dict:
+        """Agent reasons about why preflight failed and what to do.
+
+        Returns dict with:
+            diagnosis: what's wrong
+            recommended_action: specific steps to fix
+            can_auto_resolve: whether the platform can fix this automatically
+            auto_resolve_action: what to do if auto-resolvable
+        """
+        if not self.has_api:
+            return {
+                "diagnosis": failure_reason,
+                "recommended_action": "Investigate and resolve the preflight issue",
+                "can_auto_resolve": False,
+                "auto_resolve_action": None,
+            }
+
+        user_prompt = f"""Pipeline "{contract.pipeline_name}" failed preflight checks.
+
+Failure reason: {failure_reason}
+
+Context:
+{json.dumps(context, indent=2, default=str)}
+
+Pipeline:
+- Schedule: {contract.schedule_cron}
+- Tier: {contract.tier}
+- Source: {contract.source_schema}.{contract.source_table}
+
+What's wrong and what should we do? Can the platform auto-resolve this?
+Respond with JSON:
+{{
+  "diagnosis": "what's actually wrong",
+  "recommended_action": "specific steps to fix this",
+  "can_auto_resolve": true/false,
+  "auto_resolve_action": "what to do automatically, or null"
+}}
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=contract.pipeline_id,
+                operation="reason_about_preflight",
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("reason_about_preflight Claude error: %s", e)
+            return {
+                "diagnosis": failure_reason,
+                "recommended_action": "Investigate and resolve the preflight issue",
+                "can_auto_resolve": False,
+                "auto_resolve_action": None,
+            }
+
+    # ------------------------------------------------------------------
+    # Agentic contract violation assessment (Tier 2C)
+    # ------------------------------------------------------------------
+
+    async def assess_contract_violation(
+        self,
+        violation_detail: str,
+        violation_type: str,
+        producer_name: str,
+        consumer_name: str,
+        producer_tier: int,
+        contract_info: dict,
+    ) -> dict:
+        """Agent assesses impact of a data contract violation.
+
+        Returns dict with:
+            severity: "critical" | "warning" | "info"
+            impact_assessment: how this affects the consumer
+            recommended_action: what to do
+            is_actionable: whether the team should act now vs. monitor
+        """
+        if not self.has_api:
+            severity = "critical" if producer_tier == 1 else "warning"
+            return {
+                "severity": severity,
+                "impact_assessment": f"Contract violation between {producer_name} and {consumer_name}: {violation_detail}",
+                "recommended_action": "Investigate the violation and update contract or fix producer",
+                "is_actionable": True,
+            }
+
+        user_prompt = f"""A data contract violation was detected.
+
+Violation:
+- Type: {violation_type}
+- Detail: {violation_detail}
+- Producer pipeline: {producer_name} (tier {producer_tier})
+- Consumer pipeline: {consumer_name}
+
+Contract terms:
+{json.dumps(contract_info, indent=2, default=str)}
+
+Assess the impact and recommend action.
+Respond with JSON:
+{{
+  "severity": "critical|warning|info",
+  "impact_assessment": "how this affects the consumer pipeline and downstream data",
+  "recommended_action": "specific steps to resolve",
+  "is_actionable": true/false
+}}
+
+Consider:
+- Freshness SLA violations on tier 1 producers with active consumers are critical
+- Missing columns that are actually used by the consumer are critical
+- Missing columns that are optional or unused are info-level
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                operation="assess_contract_violation",
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("assess_contract_violation Claude error: %s", e)
+            severity = "critical" if producer_tier == 1 else "warning"
+            return {
+                "severity": severity,
+                "impact_assessment": violation_detail,
+                "recommended_action": "Investigate the violation",
+                "is_actionable": True,
+            }
+
+    # ------------------------------------------------------------------
+    # Agentic anomaly threshold setting (Tier 2D)
+    # ------------------------------------------------------------------
+
+    async def evaluate_anomaly_signals(
+        self,
+        pipeline_name: str,
+        pipeline_id: str,
+        tier: int,
+        schedule_cron: str,
+        volume_history: list,
+        recent_failures: list,
+        budget_info: dict | None,
+    ) -> dict:
+        """Agent evaluates whether observed signals are truly anomalous
+        given the pipeline's history and context.
+
+        Instead of hardcoded thresholds (30% deviation, 2 failures),
+        the agent reasons about what's normal for THIS pipeline.
+
+        Returns dict with:
+            is_anomalous: whether this pipeline has real anomalies
+            signals: list of confirmed anomaly signals with severity
+            reasoning: why these are or aren't anomalies
+        """
+        vol_text = ""
+        if volume_history:
+            counts = [v.get("rows_extracted", 0) for v in volume_history[:10]]
+            vol_text = f"Volume history (recent→old): {counts}"
+
+        fail_text = ""
+        if recent_failures:
+            fail_text = f"Recent failures: {len(recent_failures)} in 24h — {[f.error[:80] for f in recent_failures[:3]]}"
+
+        budget_text = ""
+        if budget_info:
+            budget_text = f"Error budget: {budget_info.get('success_rate', 1):.1%} success, {budget_info.get('budget_remaining', 1):.3f} remaining"
+
+        if not self.has_api:
+            return self._rule_based_anomaly_evaluation(
+                volume_history, recent_failures, budget_info, tier,
+            )
+
+        user_prompt = f"""Evaluate whether pipeline "{pipeline_name}" (tier {tier}, schedule: {schedule_cron}) shows real anomalies.
+
+{vol_text}
+{fail_text}
+{budget_text}
+
+Consider:
+- Is the volume pattern normal for this pipeline's history? (weekday/weekend patterns, growth trends)
+- Are failures transient (one-off) or persistent?
+- Does the error budget reflect a real problem or just a few unlucky runs?
+
+Respond with JSON:
+{{
+  "is_anomalous": true/false,
+  "signals": [
+    {{
+      "type": "volume_drop|volume_spike|repeated_failure|error_budget_low",
+      "severity": "critical|warning|info",
+      "observation": "what was observed",
+      "is_expected": true/false,
+      "reasoning": "why this is or isn't a concern"
+    }}
+  ],
+  "reasoning": "overall assessment for this pipeline"
+}}
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=pipeline_id,
+                operation="evaluate_anomaly_signals",
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("evaluate_anomaly_signals Claude error: %s", e)
+            return self._rule_based_anomaly_evaluation(
+                volume_history, recent_failures, budget_info, tier,
+            )
+
+    def _rule_based_anomaly_evaluation(self, volume_history, recent_failures, budget_info, tier) -> dict:
+        signals = []
+        if volume_history and len(volume_history) >= 3:
+            counts = [v.get("rows_extracted", 0) for v in volume_history[:10]]
+            avg = sum(counts) / len(counts) if counts else 0
+            latest = counts[0] if counts else 0
+            if avg > 0:
+                deviation = abs(latest - avg) / avg
+                if deviation > 0.3:
+                    direction = "drop" if latest < avg else "spike"
+                    signals.append({
+                        "type": f"volume_{direction}",
+                        "severity": "critical" if tier == 1 and deviation > 0.5 else "warning",
+                        "observation": f"{direction}: {latest} vs avg {avg:.0f} ({deviation:.0%} deviation)",
+                        "is_expected": False,
+                        "reasoning": "Rule-based detection",
+                    })
+        if recent_failures and len(recent_failures) >= 2:
+            signals.append({
+                "type": "repeated_failure",
+                "severity": "critical" if tier == 1 else "warning",
+                "observation": f"{len(recent_failures)} failures in 24h",
+                "is_expected": False,
+                "reasoning": "Multiple failures suggest a persistent issue",
+            })
+        if budget_info and budget_info.get("budget_remaining", 1) < 0.05 and budget_info.get("total_runs", 0) > 0:
+            signals.append({
+                "type": "error_budget_low",
+                "severity": "critical",
+                "observation": f"Budget nearly exhausted: {budget_info.get('success_rate', 0):.1%} success",
+                "is_expected": False,
+                "reasoning": "Error budget below 5% remaining",
+            })
+        return {
+            "is_anomalous": len(signals) > 0,
+            "signals": signals,
+            "reasoning": f"{len(signals)} anomaly signal(s) detected" if signals else "No anomalies",
+        }
 
     # ------------------------------------------------------------------
     # generate_connector
@@ -1883,63 +2470,78 @@ Respond with JSON:
         }
 
     async def reason_about_anomalies(self) -> dict:
-        """Platform-wide anomaly detection with contextual reasoning."""
+        """Platform-wide anomaly detection with per-pipeline agent evaluation.
+
+        Instead of hardcoded thresholds (30% deviation, 2 failures), the agent
+        evaluates each pipeline's signals in context to determine what's truly
+        anomalous vs. normal variation.
+        """
         from datetime import datetime, timezone
 
         pipelines = await self.store.list_pipelines(status="active")
         recent_failures = await self.store.list_recent_failures(hours=24)
 
-        # Pre-filter: only include pipelines with anomalous signals
-        anomalous = []
+        # Gather raw signals per pipeline — no hardcoded threshold filtering
+        all_anomalies = []
+        candidates = []
         for p in pipelines:
-            signals = []
             volume = await self.store.get_volume_history(p.pipeline_id, limit=10)
-
-            # Volume anomaly: >30% deviation from average
-            if len(volume) >= 3:
-                counts = [v.get("rows_extracted", 0) for v in volume]
-                avg = sum(counts) / len(counts) if counts else 0
-                latest = counts[0] if counts else 0
-                if avg > 0:
-                    deviation = abs(latest - avg) / avg
-                    if deviation > 0.3:
-                        direction = "drop" if latest < avg else "spike"
-                        signals.append({
-                            "type": f"volume_{direction}",
-                            "latest": latest,
-                            "average": round(avg, 1),
-                            "deviation_pct": round(deviation * 100, 1),
-                        })
-
-            # Recent failures for this pipeline
             p_failures = [f for f in recent_failures if f.pipeline_id == p.pipeline_id]
-            if len(p_failures) >= 2:
-                signals.append({
-                    "type": "repeated_failure",
-                    "count": len(p_failures),
-                    "errors": list(set(f.error or "unknown" for f in p_failures[:3])),
-                })
-
-            # Error budget
             budget = await self.store.get_error_budget(p.pipeline_id)
-            if budget and budget.budget_remaining < 0.05 and budget.total_runs > 0:
-                signals.append({
-                    "type": "error_budget_low",
+
+            # Only send to agent if there's ANY signal to evaluate
+            has_signal = (
+                (len(volume) >= 3) or
+                (len(p_failures) >= 1) or
+                (budget and budget.budget_remaining < 0.1 and budget.total_runs > 0)
+            )
+            if not has_signal:
+                continue
+
+            budget_info = None
+            if budget:
+                budget_info = {
                     "success_rate": budget.success_rate,
-                    "remaining": budget.budget_remaining,
-                })
+                    "budget_remaining": budget.budget_remaining,
+                    "total_runs": budget.total_runs,
+                }
 
-            if signals:
-                anomalous.append({
-                    "pipeline_id": p.pipeline_id,
-                    "pipeline_name": p.pipeline_name,
-                    "tier": p.tier,
-                    "schedule_cron": p.schedule_cron,
-                    "signals": signals,
-                })
+            candidates.append({
+                "pipeline": p,
+                "volume": volume,
+                "failures": p_failures,
+                "budget_info": budget_info,
+            })
 
-        # Short-circuit if nothing anomalous — skip Claude call
-        if not anomalous:
+        # Agent evaluates each candidate — determines what's truly anomalous
+        for candidate in candidates[:20]:  # Cap at 20
+            p = candidate["pipeline"]
+            try:
+                evaluation = await self.evaluate_anomaly_signals(
+                    pipeline_name=p.pipeline_name,
+                    pipeline_id=p.pipeline_id,
+                    tier=p.tier,
+                    schedule_cron=p.schedule_cron,
+                    volume_history=candidate["volume"],
+                    recent_failures=candidate["failures"],
+                    budget_info=candidate["budget_info"],
+                )
+                if evaluation.get("is_anomalous"):
+                    for signal in evaluation.get("signals", []):
+                        all_anomalies.append({
+                            "pipeline_id": p.pipeline_id,
+                            "pipeline_name": p.pipeline_name,
+                            "anomaly_type": signal.get("type", "unknown"),
+                            "severity": signal.get("severity", "warning"),
+                            "observation": signal.get("observation", ""),
+                            "reasoning": signal.get("reasoning", ""),
+                            "is_expected": signal.get("is_expected", False),
+                            "recommended_action": "Review based on agent assessment",
+                        })
+            except Exception as e:
+                log.warning("Anomaly evaluation failed for %s: %s", p.pipeline_name, e)
+
+        if not all_anomalies:
             return {
                 "anomalies": [],
                 "cross_pipeline_patterns": [],
@@ -1947,98 +2549,38 @@ Respond with JSON:
                 "summary": f"All {len(pipelines)} active pipelines are operating normally. No anomalies detected.",
             }
 
-        if not self.has_api:
-            return self._rule_based_anomalies(pipelines, anomalous, recent_failures)
-
-        now = datetime.now(timezone.utc)
-        anomaly_text = ""
-        for a in anomalous[:20]:  # Cap at 20 to manage context
-            anomaly_text += f"\n  {a['pipeline_name']} (tier {a['tier']}, schedule: {a['schedule_cron']}):\n"
-            for s in a["signals"]:
-                if s["type"].startswith("volume_"):
-                    anomaly_text += f"    - {s['type']}: latest={s['latest']}, avg={s['average']}, deviation={s['deviation_pct']}%\n"
-                elif s["type"] == "repeated_failure":
-                    anomaly_text += f"    - {s['count']} failures in 24h: {', '.join(s['errors'][:2])}\n"
-                elif s["type"] == "error_budget_low":
-                    anomaly_text += f"    - Error budget low: {s['success_rate']:.1%} success, {s['remaining']:.3f} remaining\n"
-
-        user_prompt = f"""Analyze these anomalies across the data platform and provide contextual reasoning.
-Today is {now.strftime('%Y-%m-%d')}, {now.strftime('%A')}.
-
-Platform summary:
-- Active pipelines: {len(pipelines)}
-- Pipelines with anomalies: {len(anomalous)}
-- Total failures (24h): {len(recent_failures)}
-
-Anomalies detected:
+        # Cross-pipeline pattern analysis (uses LLM if available)
+        cross_patterns = []
+        if self.has_api and len(all_anomalies) > 1:
+            try:
+                now = datetime.now(timezone.utc)
+                anomaly_text = "\n".join(
+                    f"- {a['pipeline_name']}: {a['anomaly_type']} ({a['severity']}) — {a['observation']}"
+                    for a in all_anomalies[:15]
+                )
+                pattern_prompt = f"""Given these {len(all_anomalies)} anomalies across the platform (today is {now.strftime('%A %Y-%m-%d')}):
 {anomaly_text}
 
-Consider:
-- Is the anomaly expected for this day/time (weekends, month-end, holidays)?
-- Are multiple pipelines failing for the same root cause (shared source, same connector)?
-- Is this a gradual degradation or a sudden change?
-
-Respond with JSON:
-{{
-  "anomalies": [
-    {{
-      "pipeline_id": "...",
-      "pipeline_name": "...",
-      "anomaly_type": "volume_drop|volume_spike|repeated_failure|error_budget_low",
-      "severity": "critical|warning|info",
-      "observation": "what was observed",
-      "reasoning": "contextual explanation",
-      "is_expected": true/false,
-      "recommended_action": "what to do"
-    }}
-  ],
-  "cross_pipeline_patterns": ["correlated patterns across pipelines"],
-  "platform_health": "healthy|degraded|critical",
-  "summary": "2-3 sentence overall assessment"
-}}"""
-
-        try:
-            text = await self._call_claude(
-                self._system_prompt(), user_prompt,
-                operation="reason_about_anomalies",
-                temperature=0.3,
-            )
-            return self._extract_json(text)
-        except Exception as e:
-            log.warning("reason_about_anomalies Claude error: %s. Using rule-based fallback.", e)
-            return self._rule_based_anomalies(pipelines, anomalous, recent_failures)
-
-    def _rule_based_anomalies(self, pipelines, anomalous, recent_failures) -> dict:
-        """Heuristic anomaly assessment."""
-        anomalies = []
-        for a in anomalous:
-            for s in a["signals"]:
-                severity = "warning"
-                if a["tier"] == 1 or s["type"] == "error_budget_low":
-                    severity = "critical"
-                anomalies.append({
-                    "pipeline_id": a["pipeline_id"],
-                    "pipeline_name": a["pipeline_name"],
-                    "anomaly_type": s["type"],
-                    "severity": severity,
-                    "observation": json.dumps(s),
-                    "reasoning": "Rule-based detection — no contextual reasoning available without API key",
-                    "is_expected": False,
-                    "recommended_action": "Investigate manually",
-                })
-
-        health = "healthy"
-        if any(a["severity"] == "critical" for a in anomalies):
-            health = "critical"
-        elif anomalies:
-            health = "degraded"
+Are there cross-pipeline patterns? (shared source, same connector type, same schedule, correlated failures)
+Respond with JSON: {{"cross_pipeline_patterns": ["pattern 1", ...], "platform_health": "healthy|degraded|critical", "summary": "2-3 sentence assessment"}}"""
+                pattern_result = self._extract_json(
+                    await self._call_claude(self._system_prompt(), pattern_prompt, operation="cross_pipeline_patterns")
+                )
+                cross_patterns = pattern_result.get("cross_pipeline_patterns", [])
+                health = pattern_result.get("platform_health", "degraded")
+                summary = pattern_result.get("summary", "")
+            except Exception:
+                health = "critical" if any(a["severity"] == "critical" for a in all_anomalies) else "degraded"
+                summary = f"{len(all_anomalies)} anomalies across {len(set(a['pipeline_id'] for a in all_anomalies))} pipelines."
+        else:
+            health = "critical" if any(a["severity"] == "critical" for a in all_anomalies) else "degraded"
+            summary = f"{len(all_anomalies)} anomalies detected. {len(recent_failures)} failures in last 24h."
 
         return {
-            "anomalies": anomalies,
-            "cross_pipeline_patterns": [],
+            "anomalies": all_anomalies,
+            "cross_pipeline_patterns": cross_patterns,
             "platform_health": health,
-            "summary": f"{len(anomalous)} of {len(pipelines)} active pipelines show anomalies. "
-                       f"{len(recent_failures)} failures in last 24h.",
+            "summary": summary,
         }
 
     # ------------------------------------------------------------------

@@ -619,11 +619,39 @@ class MonitorEngine:
                     staleness = float("inf")
                 last_record = None
 
-            # Determine status
-            if staleness == float("inf"):
+            # Agent reasons about freshness — determines severity and whether to alert
+            downstream = await self.store.list_dependents(pipeline.pipeline_id)
+            recent_runs = await self.store.list_runs(pipeline.pipeline_id, limit=3)
+            recent_errors = [r.error for r in recent_runs if r.error]
+
+            freshness_assessment = {}
+            try:
+                freshness_assessment = await self.agent.reason_about_freshness(
+                    pipeline_name=pipeline.pipeline_name,
+                    pipeline_id=pipeline.pipeline_id,
+                    tier=pipeline.tier,
+                    staleness_minutes=min(staleness, 99999),
+                    sla_warn=sla_warn,
+                    sla_critical=sla_critical,
+                    schedule_cron=pipeline.schedule_cron,
+                    recent_run_errors=recent_errors,
+                    downstream_count=len(downstream),
+                )
+            except Exception as e:
+                log.warning("Agent freshness reasoning failed: %s", e)
+
+            # Use agent's severity assessment, fall back to threshold-based
+            agent_severity = freshness_assessment.get("severity", "")
+            if agent_severity == "critical":
                 status = FreshnessStatus.CRITICAL
                 sla_met = False
-            elif staleness > sla_critical:
+            elif agent_severity == "warning":
+                status = FreshnessStatus.WARNING
+                sla_met = False
+            elif agent_severity == "info":
+                status = FreshnessStatus.FRESH
+                sla_met = staleness <= sla_warn
+            elif staleness == float("inf") or staleness > sla_critical:
                 status = FreshnessStatus.CRITICAL
                 sla_met = False
             elif staleness > sla_warn:
@@ -645,7 +673,8 @@ class MonitorEngine:
             )
             await self.store.save_freshness(snapshot)
 
-            if status in (FreshnessStatus.WARNING, FreshnessStatus.CRITICAL):
+            should_alert = freshness_assessment.get("should_alert", status in (FreshnessStatus.WARNING, FreshnessStatus.CRITICAL))
+            if should_alert:
                 digest_only = tier_cfg.get("digest_only", False)
                 severity = (
                     AlertSeverity.CRITICAL
@@ -660,26 +689,27 @@ class MonitorEngine:
                     "staleness_minutes": round(min(staleness, 99999), 1),
                     "sla_warn_minutes": sla_warn,
                     "sla_critical_minutes": sla_critical,
+                    "agent_reasoning": freshness_assessment.get("reasoning", ""),
+                    "is_sla_realistic": freshness_assessment.get("is_sla_realistic", True),
+                    "sla_recommendation": freshness_assessment.get("sla_recommendation"),
                 }
 
-                # Generate narrative (Build 26)
-                downstream = await self.store.list_dependents(pipeline.pipeline_id)
-                recent_runs = await self.store.list_runs(pipeline.pipeline_id, limit=3)
-                recent_errors = [r.error for r in recent_runs if r.error]
-                try:
-                    narrative = await self.agent.generate_anomaly_narrative(
-                        pipeline_name=pipeline.pipeline_name,
-                        alert_summary=alert_summary,
-                        alert_detail=alert_detail,
-                        severity=severity.value,
-                        tier=pipeline.tier,
-                        downstream_count=len(downstream),
-                        recent_run_errors=recent_errors,
-                        freshness_info={"staleness_minutes": round(min(staleness, 99999), 1)},
-                        schedule_cron=pipeline.schedule_cron,
-                    )
-                except Exception:
-                    narrative = ""
+                narrative = freshness_assessment.get("reasoning", "")
+                if not narrative:
+                    try:
+                        narrative = await self.agent.generate_anomaly_narrative(
+                            pipeline_name=pipeline.pipeline_name,
+                            alert_summary=alert_summary,
+                            alert_detail=alert_detail,
+                            severity=severity.value,
+                            tier=pipeline.tier,
+                            downstream_count=len(downstream),
+                            recent_run_errors=recent_errors,
+                            freshness_info={"staleness_minutes": round(min(staleness, 99999), 1)},
+                            schedule_cron=pipeline.schedule_cron,
+                        )
+                    except Exception:
+                        narrative = ""
 
                 alert = AlertRecord(
                     severity=severity,
@@ -768,22 +798,50 @@ class MonitorEngine:
             contract.status = DataContractStatus.VIOLATED
             contract.last_violation_at = now_iso()
             contract.violation_count += len(violations)
-            # Create alerts
+
             consumer = await self.store.get_pipeline(
                 contract.consumer_pipeline_id,
             )
+            consumer_name = consumer.pipeline_name if consumer else contract.consumer_pipeline_id
+
+            # Agent assesses each violation's impact
             for v in violations:
+                v_type = v.violation_type.value if hasattr(v.violation_type, "value") else v.violation_type
+                assessment = {}
+                try:
+                    assessment = await self.agent.assess_contract_violation(
+                        violation_detail=v.detail,
+                        violation_type=v_type,
+                        producer_name=producer.pipeline_name,
+                        consumer_name=consumer_name,
+                        producer_tier=producer.tier,
+                        contract_info={
+                            "freshness_sla_minutes": getattr(contract, "freshness_sla_minutes", None),
+                            "required_columns": getattr(contract, "required_columns", []),
+                        },
+                    )
+                except Exception as e:
+                    log.warning("Agent contract violation assessment failed: %s", e)
+
+                # Use agent's severity, fall back to WARNING
+                agent_severity = assessment.get("severity", "warning")
+                severity = AlertSeverity.CRITICAL if agent_severity == "critical" else AlertSeverity.WARNING
+
                 alert = AlertRecord(
-                    severity=AlertSeverity.WARNING,
+                    severity=severity,
                     tier=producer.tier,
                     pipeline_id=contract.producer_pipeline_id,
                     pipeline_name=producer.pipeline_name,
                     summary=f"Data contract violation: {v.detail}",
                     detail={
                         "contract_id": contract.contract_id,
-                        "consumer": consumer.pipeline_name if consumer else contract.consumer_pipeline_id,
-                        "violation_type": v.violation_type.value if hasattr(v.violation_type, "value") else v.violation_type,
+                        "consumer": consumer_name,
+                        "violation_type": v_type,
+                        "impact_assessment": assessment.get("impact_assessment", ""),
+                        "recommended_action": assessment.get("recommended_action", ""),
+                        "is_actionable": assessment.get("is_actionable", True),
                     },
+                    narrative=assessment.get("impact_assessment", ""),
                 )
                 await self.store.save_alert(alert)
                 await self._dispatch_alert(alert, producer)

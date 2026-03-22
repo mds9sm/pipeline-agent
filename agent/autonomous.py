@@ -404,6 +404,29 @@ class PipelineRunner:
             run.error = str(e)
             run.status = RunStatus.FAILED
             run.completed_at = now_iso()
+
+            # Agent diagnoses the failure and recommends action
+            diagnosis = {}
+            if self.agent:
+                try:
+                    diagnosis = await self.agent.diagnose_run_failure(
+                        contract, str(e), run.execution_log or [],
+                    )
+                    diag_detail = (
+                        f"Category: {diagnosis.get('category', 'unknown')}. "
+                        f"{diagnosis.get('root_cause', '')} "
+                        f"Action: {diagnosis.get('recommended_action', '')}"
+                    )
+                    self._log_step(run, "agent_diagnosis", diag_detail)
+                    # Enrich run error with agent diagnosis
+                    run.error = (
+                        f"{str(e)} | Agent: {diagnosis.get('root_cause', '')} "
+                        f"[{diagnosis.get('category', 'unknown')}] "
+                        f"→ {diagnosis.get('recommended_action', '')}"
+                    )
+                except Exception as diag_err:
+                    log.warning("Agent failure diagnosis error: %s", diag_err)
+
             await self.store.save_run(run)
 
             # Try to clean up staging table in target
@@ -415,6 +438,27 @@ class PipelineRunner:
                 await target.drop_staging(contract, run)
             except Exception:
                 pass
+
+            # Create alert if agent says this needs attention
+            if diagnosis.get("should_alert", True):
+                try:
+                    alert = AlertRecord(
+                        severity=AlertSeverity.CRITICAL if contract.tier == 1 else AlertSeverity.WARNING,
+                        tier=contract.tier,
+                        pipeline_id=contract.pipeline_id,
+                        pipeline_name=contract.pipeline_name,
+                        summary=f"Run failed: {diagnosis.get('root_cause', str(e)[:100])}",
+                        detail={
+                            "error": str(e),
+                            "category": diagnosis.get("category", "unknown"),
+                            "is_transient": diagnosis.get("is_transient", False),
+                            "recommended_action": diagnosis.get("recommended_action", ""),
+                        },
+                        narrative=diagnosis.get("root_cause", ""),
+                    )
+                    await self.store.save_alert(alert)
+                except Exception:
+                    pass
 
             # Update error budget even on failure
             await self._update_error_budget(contract, run)
@@ -430,68 +474,87 @@ class PipelineRunner:
         contract: PipelineContract,
         run: RunRecord,
     ) -> bool:
-        """Returns False if run should be skipped."""
+        """Returns False if run should be skipped. Agent reasons about failures."""
+
+        failure_reason = None
+        context = {}
+
         # Check pending halt proposals
         if await self.store.has_pending_halt_proposal(contract.pipeline_id):
-            log.warning("Skipping -- pending halt proposal.")
-            run.status = RunStatus.FAILED
-            run.error = "Skipped: pending halt proposal requires approval."
-            run.completed_at = now_iso()
-            await self.store.save_run(run)
-            return False
+            failure_reason = "Pending halt proposal requires approval before running."
+            context["blocker"] = "halt_proposal"
 
         # Check disk space
-        has_space, used_pct = self.staging.check_disk_space(
-            self.config.max_disk_pct,
-        )
-        if not has_space:
-            log.error(
-                "Insufficient disk space: %.0f%% used.", used_pct * 100,
+        if not failure_reason:
+            has_space, used_pct = self.staging.check_disk_space(
+                self.config.max_disk_pct,
             )
-            run.status = RunStatus.FAILED
-            run.error = f"Insufficient disk space: {used_pct:.0%} used."
-            run.completed_at = now_iso()
-            await self.store.save_run(run)
-            return False
+            if not has_space:
+                failure_reason = f"Insufficient disk space: {used_pct:.0%} used."
+                context["blocker"] = "disk_space"
+                context["disk_used_pct"] = round(used_pct * 100, 1)
 
         # Check upstream dependencies
-        deps = await self.store.list_dependencies(contract.pipeline_id)
-        for dep in deps:
-            last_run = await self.store.get_last_successful_run(dep.depends_on_id)
-            if last_run is None:
-                upstream = await self.store.get_pipeline(dep.depends_on_id)
-                name = upstream.pipeline_name if upstream else dep.depends_on_id
-                log.warning("Upstream %s has no successful run yet.", name)
-                run.status = RunStatus.FAILED
-                run.error = (
-                    f"Upstream pipeline {name} has not completed successfully."
-                )
-                run.completed_at = now_iso()
-                await self.store.save_run(run)
-                return False
+        if not failure_reason:
+            deps = await self.store.list_dependencies(contract.pipeline_id)
+            for dep in deps:
+                last_run = await self.store.get_last_successful_run(dep.depends_on_id)
+                if last_run is None:
+                    upstream = await self.store.get_pipeline(dep.depends_on_id)
+                    name = upstream.pipeline_name if upstream else dep.depends_on_id
+                    failure_reason = f"Upstream pipeline {name} has not completed successfully."
+                    context["blocker"] = "upstream_dependency"
+                    context["upstream_pipeline"] = name
+                    context["upstream_id"] = dep.depends_on_id
+                    break
 
         # Validate connectors are active
-        src_connector = None
-        tgt_connector = None
-        connectors = await self.store.list_connectors()
-        for c in connectors:
-            if c.connector_id == contract.source_connector_id:
-                src_connector = c
-            if c.connector_id == contract.target_connector_id:
-                tgt_connector = c
+        if not failure_reason:
+            src_connector = None
+            tgt_connector = None
+            connectors = await self.store.list_connectors()
+            for c in connectors:
+                if c.connector_id == contract.source_connector_id:
+                    src_connector = c
+                if c.connector_id == contract.target_connector_id:
+                    tgt_connector = c
 
-        for conn_record, label in [
-            (src_connector, "source"),
-            (tgt_connector, "target"),
-        ]:
-            if not conn_record or conn_record.status != ConnectorStatus.ACTIVE:
-                run.status = RunStatus.FAILED
-                run.error = f"{label.capitalize()} connector is not active."
-                run.completed_at = now_iso()
-                await self.store.save_run(run)
-                return False
+            for conn_record, label in [
+                (src_connector, "source"),
+                (tgt_connector, "target"),
+            ]:
+                if not conn_record or conn_record.status != ConnectorStatus.ACTIVE:
+                    failure_reason = f"{label.capitalize()} connector is not active."
+                    context["blocker"] = "connector_inactive"
+                    context["connector_label"] = label
+                    break
 
-        return True
+        if not failure_reason:
+            return True
+
+        # Agent reasons about the preflight failure
+        if self.agent:
+            try:
+                assessment = await self.agent.reason_about_preflight_failure(
+                    contract, failure_reason, context,
+                )
+                enriched_error = (
+                    f"{failure_reason} | Agent: {assessment.get('diagnosis', '')} "
+                    f"→ {assessment.get('recommended_action', '')}"
+                )
+                self._log_step(run, "preflight_diagnosis", enriched_error)
+                run.error = enriched_error
+            except Exception as e:
+                log.warning("Agent preflight reasoning failed: %s", e)
+                run.error = failure_reason
+        else:
+            run.error = failure_reason
+
+        log.warning("Preflight failed: %s", failure_reason)
+        run.status = RunStatus.FAILED
+        run.completed_at = now_iso()
+        await self.store.save_run(run)
+        return False
 
     # ------------------------------------------------------------------
     # Halt handling
@@ -593,31 +656,56 @@ class PipelineRunner:
 
             await self.store.save_error_budget(budget)
 
-            # Create CRITICAL alert if budget just became exhausted
+            # Agent diagnoses when budget becomes exhausted
             if budget.escalated and not was_escalated:
+                budget_info = {
+                    "success_rate": success_rate,
+                    "threshold": budget.budget_threshold,
+                    "total_runs": total_runs,
+                    "failed_runs": failed_runs,
+                    "window_days": budget.window_days,
+                }
+
+                # Agent diagnosis
+                diagnosis = {}
+                if self.agent:
+                    try:
+                        diagnosis = await self.agent.diagnose_error_budget(
+                            contract, budget_info, runs,
+                        )
+                    except Exception as e:
+                        log.warning("Agent budget diagnosis failed: %s", e)
+
+                summary = (
+                    f"Error budget exhausted: {success_rate:.1%} success rate "
+                    f"over {budget.window_days}d window "
+                    f"(threshold: {budget.budget_threshold:.0%}). "
+                    f"{failed_runs}/{total_runs} runs failed."
+                )
+                if diagnosis.get("diagnosis"):
+                    summary += f" Agent diagnosis: {diagnosis['diagnosis']}"
+
                 alert = AlertRecord(
                     severity=AlertSeverity.CRITICAL,
                     tier=contract.tier,
                     pipeline_id=contract.pipeline_id,
                     pipeline_name=contract.pipeline_name,
-                    summary=(
-                        f"Error budget exhausted: {success_rate:.1%} success rate "
-                        f"over {budget.window_days}d window "
-                        f"(threshold: {budget.budget_threshold:.0%}). "
-                        f"{failed_runs}/{total_runs} runs failed."
-                    ),
+                    summary=summary,
                     detail={
-                        "success_rate": success_rate,
-                        "threshold": budget.budget_threshold,
-                        "total_runs": total_runs,
-                        "failed_runs": failed_runs,
-                        "window_days": budget.window_days,
+                        **budget_info,
+                        "agent_diagnosis": diagnosis.get("diagnosis", ""),
+                        "failure_pattern": diagnosis.get("pattern", "unknown"),
+                        "recommended_actions": diagnosis.get("recommended_actions", []),
+                        "should_pause": diagnosis.get("should_pause", False),
+                        "estimated_recovery": diagnosis.get("estimated_recovery", ""),
                     },
+                    narrative=diagnosis.get("diagnosis", ""),
                 )
                 await self.store.save_alert(alert)
                 log.error(
-                    "Error budget EXHAUSTED: %.1f%% success (%d/%d runs)",
+                    "Error budget EXHAUSTED: %.1f%% success (%d/%d runs). Pattern: %s",
                     success_rate * 100, successful_runs, total_runs,
+                    diagnosis.get("pattern", "unknown"),
                 )
 
         except Exception as e:

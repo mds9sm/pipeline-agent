@@ -24,12 +24,72 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 26 | Data catalog, semantic tags, trust scores | **Done** | Search/browse catalog, AI-inferred tags, business context, trust scores, alert narratives |
 | 27 | MCP server | **Done** | Expose DAPOS to AI agents via Model Context Protocol (resources, tools, prompts) |
 | 29 | Native SQL transforms | **Done** | Replace dbt with in-pipeline SQL transforms — ref(), var(), materialization, AI generation |
-| 30 | Dashboard / metrics layer | Planned | Lightweight KPI definitions on catalog tables |
+| 30 | Fully agentic failure detection & quality | **Done** | Agent decides quality gate, diagnoses failures, reasons about freshness/anomalies/contracts |
+| 31 | Dashboard / metrics layer | Planned | Lightweight KPI definitions on catalog tables |
 | 28 | Context API enrichment | Planned | Auto-context on pipeline runs, cross-pipeline context propagation |
 
 ---
 
 ## [Unreleased]
+
+### Build 30: Fully Agentic Failure Detection & Quality — 2026-03-22 (Claude Opus 4.6)
+
+**Replace hardcoded threshold logic with agent reasoning across all failure detection and data quality systems. The agent IS the decision maker — checks provide signals, the agent decides.**
+
+#### Tier 1: Agent drives decisions (was: agent explains after the fact)
+
+- **Agentic quality gate** (`quality/gate.py`, `agent/core.py`):
+  - 7 quality checks still run as signal producers
+  - Agent receives all check results + pipeline context (tier, first run, refresh type, baselines)
+  - Agent decides PROMOTE / PROMOTE_WITH_WARNING / HALT with reasoning
+  - `GateRecord.agent_reasoning` populated with the agent's decision rationale
+  - Fallback to threshold-based logic when API unavailable
+
+- **Agentic error budget diagnosis** (`agent/autonomous.py`, `agent/core.py`):
+  - When error budget exhausted, agent analyzes recent run history
+  - Diagnoses failure pattern: transient vs. persistent vs. degrading
+  - Recommends specific recovery actions (retry, investigate, pause)
+  - Alert includes agent diagnosis, pattern classification, and recovery steps
+
+- **Agentic freshness alerting** (`monitor/engine.py`, `agent/core.py`):
+  - Agent evaluates freshness SLA violations with schedule context
+  - Determines if SLA is realistic (e.g., hourly SLA on daily schedule = impossible)
+  - Decides severity and whether to alert at all
+  - Can recommend SLA adjustments when thresholds are misconfigured
+
+#### Tier 2: Agent now involved (was: no agent at all)
+
+- **Agentic run failure diagnosis** (`agent/autonomous.py`, `agent/core.py`):
+  - On run failure, agent analyzes error + execution log
+  - Classifies: connector / source / target / network / schema / config / resource
+  - Determines if transient (retry-worthy) or persistent (needs intervention)
+  - Run error enriched with agent diagnosis and recommended action
+  - Alert created only if agent says human attention needed
+
+- **Agentic preflight reasoning** (`agent/autonomous.py`, `agent/core.py`):
+  - Preflight checks still run (disk, upstream deps, connectors)
+  - On failure, agent reasons about WHY and recommends next steps
+  - Run error enriched: "Upstream X not ready | Agent: X scheduled for 8am, current time is 7:30 → wait for next schedule tick"
+
+- **Agentic contract violation assessment** (`monitor/engine.py`, `agent/core.py`):
+  - Agent evaluates impact of data contract violations
+  - Assesses severity based on producer tier, consumer criticality, violation type
+  - Missing optional columns → info; missing critical columns → critical
+  - Alert severity driven by agent assessment, not hardcoded WARNING
+
+- **Agentic anomaly thresholds** (`agent/core.py`):
+  - Removed hardcoded 30% volume deviation, 2-failure, 5%-budget thresholds
+  - Agent evaluates each pipeline's signals in context of its history
+  - Per-pipeline reasoning: "This pipeline always drops volume on weekends — expected"
+  - Cross-pipeline pattern analysis: correlated failures, shared source issues
+
+#### Architecture
+- `QualityGate` now receives `agent` parameter for decision-making
+- `PipelineRunner` passes `agent` for failure diagnosis, preflight, and error budget
+- Every agentic method has a `_rule_based_*` fallback for when API key is unavailable
+- Agent methods: `decide_quality_gate`, `diagnose_error_budget`, `reason_about_freshness`, `diagnose_run_failure`, `reason_about_preflight_failure`, `assess_contract_violation`, `evaluate_anomaly_signals`
+
+---
 
 ### Build 29b: Transform UI & Environment Promotion — 2026-03-22 (Claude Opus 4.6)
 

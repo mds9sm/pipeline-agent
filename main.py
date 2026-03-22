@@ -250,7 +250,7 @@ async def main():
         # 6. Build all components with dependency injection
         registry = ConnectorRegistry(store, config)
         agent = AgentCore(config, store)
-        gate = QualityGate(store, config)
+        gate = QualityGate(store, config, agent)
         staging_mgr = LocalStagingManager(config.data_dir)
         runner = PipelineRunner(config, store, registry, gate, staging_mgr, agent)
         conversation = ConversationManager(config, store, registry, agent)
