@@ -33,6 +33,7 @@ from contracts.models import (
     DataContractStatus, CleanupOwnership, ContractViolationType,
     PipelineChangeLog, PipelineChangeType, RegisteredSource,
     StepDefinition, StepType, CheckStatus,
+    SqlTransform, MaterializationType,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -4746,6 +4747,303 @@ def create_app(
         p.trust_weights = None
         await store.save_pipeline(p)
         return {"pipeline_id": p.pipeline_id, "weights": _TRUST_WEIGHTS, "message": "Reset to defaults"}
+
+    # -----------------------------------------------------------------------
+    # SQL Transforms (Build 29)
+    # -----------------------------------------------------------------------
+
+    @app.post("/api/transforms")
+    async def create_transform(
+        request: Request,
+        body: dict = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Create a new SQL transform in the catalog."""
+        require_role(caller, "admin", "operator")
+        name = body.get("transform_name", "").strip()
+        sql = body.get("sql", "").strip()
+        if not name:
+            raise HTTPException(400, "transform_name is required")
+        if not sql:
+            raise HTTPException(400, "sql is required")
+
+        mat = body.get("materialization", "table")
+        try:
+            mat_enum = MaterializationType(mat)
+        except ValueError:
+            raise HTTPException(400, f"Invalid materialization: {mat}")
+
+        t = SqlTransform(
+            transform_name=name,
+            sql=sql,
+            description=body.get("description", ""),
+            materialization=mat_enum,
+            target_schema=body.get("target_schema", "analytics"),
+            target_table=body.get("target_table", name),
+            variables=body.get("variables", {}),
+            refs=body.get("refs", []),
+            pipeline_id=body.get("pipeline_id", ""),
+            created_by=caller.get("username", "api"),
+            approved=body.get("approved", False),
+        )
+        await store.save_sql_transform(t)
+        return {"transform_id": t.transform_id, "transform_name": t.transform_name, "status": "created"}
+
+    @app.get("/api/transforms")
+    async def list_transforms(
+        request: Request,
+        pipeline_id: str = Query(""),
+        caller: dict = Depends(auth_dep),
+    ):
+        """List all SQL transforms, optionally filtered by pipeline."""
+        transforms = await store.list_sql_transforms(pipeline_id)
+        return [
+            {
+                "transform_id": t.transform_id,
+                "transform_name": t.transform_name,
+                "description": t.description,
+                "materialization": t.materialization.value if hasattr(t.materialization, "value") else t.materialization,
+                "target_schema": t.target_schema,
+                "target_table": t.target_table,
+                "version": t.version,
+                "approved": t.approved,
+                "pipeline_id": t.pipeline_id,
+                "refs": t.refs,
+                "created_by": t.created_by,
+                "created_at": t.created_at,
+                "updated_at": t.updated_at,
+            }
+            for t in transforms
+        ]
+
+    @app.get("/api/transforms/{transform_id}")
+    async def get_transform(
+        request: Request,
+        transform_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get a transform by ID."""
+        t = await store.get_sql_transform(transform_id)
+        if not t:
+            raise HTTPException(404, "Transform not found")
+        from dataclasses import asdict as _asdict
+        result = _asdict(t)
+        result["materialization"] = t.materialization.value if hasattr(t.materialization, "value") else t.materialization
+        return result
+
+    @app.patch("/api/transforms/{transform_id}")
+    async def update_transform(
+        request: Request,
+        transform_id: str,
+        body: dict = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Update a transform's SQL or config."""
+        require_role(caller, "admin", "operator")
+        t = await store.get_sql_transform(transform_id)
+        if not t:
+            raise HTTPException(404, "Transform not found")
+
+        changed = []
+        if "sql" in body:
+            t.sql = body["sql"]
+            changed.append("sql")
+        if "description" in body:
+            t.description = body["description"]
+            changed.append("description")
+        if "materialization" in body:
+            try:
+                t.materialization = MaterializationType(body["materialization"])
+            except ValueError:
+                raise HTTPException(400, f"Invalid materialization: {body['materialization']}")
+            changed.append("materialization")
+        if "target_schema" in body:
+            t.target_schema = body["target_schema"]
+            changed.append("target_schema")
+        if "target_table" in body:
+            t.target_table = body["target_table"]
+            changed.append("target_table")
+        if "variables" in body:
+            t.variables = body["variables"]
+            changed.append("variables")
+        if "refs" in body:
+            t.refs = body["refs"]
+            changed.append("refs")
+        if "approved" in body:
+            t.approved = body["approved"]
+            changed.append("approved")
+
+        if not changed:
+            return {"transform_id": transform_id, "message": "No changes"}
+
+        t.version += 1
+        t.updated_at = now_iso()
+        await store.save_sql_transform(t)
+        return {"transform_id": transform_id, "version": t.version, "changed": changed}
+
+    @app.delete("/api/transforms/{transform_id}")
+    async def delete_transform(
+        request: Request,
+        transform_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Delete a transform."""
+        require_role(caller, "admin")
+        t = await store.get_sql_transform(transform_id)
+        if not t:
+            raise HTTPException(404, "Transform not found")
+        await store.delete_sql_transform(transform_id)
+        return {"transform_id": transform_id, "status": "deleted"}
+
+    @app.post("/api/transforms/{transform_id}/validate")
+    async def validate_transform(
+        request: Request,
+        transform_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Dry-run EXPLAIN of a transform's SQL."""
+        from transforms.engine import resolve_refs, resolve_vars, validate_sql
+        t = await store.get_sql_transform(transform_id)
+        if not t:
+            raise HTTPException(404, "Transform not found")
+
+        # Resolve refs and vars for validation
+        resolved, refs = await resolve_refs(t.sql, store, t.pipeline_id)
+        resolved = resolve_vars(resolved, t.variables)
+
+        # Need a target engine to run EXPLAIN
+        pipeline = await store.get_pipeline(t.pipeline_id) if t.pipeline_id else None
+        if not pipeline:
+            # Try to find any active pipeline for target connection
+            pipelines = await store.list_pipelines()
+            pipeline = pipelines[0] if pipelines else None
+        if not pipeline:
+            raise HTTPException(400, "No pipeline available for SQL validation")
+
+        try:
+            target = await registry.get_target(pipeline)
+            result = await validate_sql(target, resolved)
+            return {"transform_id": transform_id, "resolved_sql": resolved, "refs": refs, **result}
+        except Exception as e:
+            return {"transform_id": transform_id, "valid": False, "error": str(e)}
+
+    @app.post("/api/transforms/{transform_id}/preview")
+    async def preview_transform(
+        request: Request,
+        transform_id: str,
+        limit: int = Query(10, ge=1, le=100),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Execute transform SQL with LIMIT and return sample rows."""
+        from transforms.engine import resolve_refs, resolve_vars, preview_sql
+        t = await store.get_sql_transform(transform_id)
+        if not t:
+            raise HTTPException(404, "Transform not found")
+
+        resolved, refs = await resolve_refs(t.sql, store, t.pipeline_id)
+        resolved = resolve_vars(resolved, t.variables)
+
+        pipeline = await store.get_pipeline(t.pipeline_id) if t.pipeline_id else None
+        if not pipeline:
+            pipelines = await store.list_pipelines()
+            pipeline = pipelines[0] if pipelines else None
+        if not pipeline:
+            raise HTTPException(400, "No pipeline available for SQL preview")
+
+        try:
+            target = await registry.get_target(pipeline)
+            result = await preview_sql(target, resolved, limit=limit)
+            return {"transform_id": transform_id, "resolved_sql": resolved, **result}
+        except Exception as e:
+            return {"transform_id": transform_id, "error": str(e), "rows": []}
+
+    @app.post("/api/transforms/generate")
+    @limiter.limit("10/minute")
+    async def generate_transform(
+        request: Request,
+        body: dict = Body(...),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Generate SQL transform from natural language description using AI."""
+        require_role(caller, "admin", "operator")
+        description = body.get("description", "").strip()
+        if not description:
+            raise HTTPException(400, "description is required")
+
+        pipeline_id = body.get("pipeline_id", "")
+        materialization = body.get("materialization", "table")
+        target_table = body.get("target_table", "")
+
+        # Gather available tables from pipelines
+        pipelines = await store.list_pipelines()
+        available_tables = []
+        for p in pipelines:
+            cols = [{"name": c.source_column, "type": c.target_type or "text"} for c in (p.column_mappings or [])]
+            available_tables.append({
+                "schema": p.target_schema or "public",
+                "table": p.target_table,
+                "columns": cols,
+            })
+
+        # Also include existing transforms
+        transforms = await store.list_sql_transforms()
+        for t in transforms:
+            available_tables.append({
+                "schema": t.target_schema or "analytics",
+                "table": t.target_table or t.transform_name,
+                "columns": [],
+            })
+
+        result = await agent.generate_transform_sql(
+            description=description,
+            available_tables=available_tables,
+            materialization=materialization,
+            target_table=target_table,
+        )
+
+        # Auto-create the transform in catalog
+        t = SqlTransform(
+            transform_name=result.get("target_table", target_table or "generated_transform"),
+            sql=result.get("sql", ""),
+            description=result.get("description", description),
+            materialization=MaterializationType(materialization),
+            target_table=result.get("target_table", target_table),
+            variables=result.get("variables", {}),
+            refs=result.get("refs", []),
+            pipeline_id=pipeline_id,
+            created_by="agent",
+            approved=False,
+        )
+        await store.save_sql_transform(t)
+
+        return {
+            "transform_id": t.transform_id,
+            "transform_name": t.transform_name,
+            "sql": t.sql,
+            "description": t.description,
+            "materialization": materialization,
+            "refs": t.refs,
+            "variables": t.variables,
+            "approved": False,
+            "message": "Transform generated. Approve before use in pipelines.",
+        }
+
+    @app.get("/api/transforms/{transform_id}/lineage")
+    async def transform_lineage(
+        request: Request,
+        transform_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Get parsed column lineage for a transform."""
+        from transforms.engine import resolve_refs, resolve_vars, parse_column_lineage
+        t = await store.get_sql_transform(transform_id)
+        if not t:
+            raise HTTPException(404, "Transform not found")
+
+        resolved, refs = await resolve_refs(t.sql, store, t.pipeline_id)
+        resolved = resolve_vars(resolved, t.variables)
+        lineage = parse_column_lineage(resolved, t.target_table or t.transform_name, refs)
+        return {"transform_id": transform_id, "lineage": lineage, "refs": refs}
 
     # -----------------------------------------------------------------------
     # Serve static UI

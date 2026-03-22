@@ -26,6 +26,7 @@
 | [Observability](concepts/observability.md) | Freshness, alerts, error budgets, anomaly reasoning |
 | [Data Catalog](concepts/data-catalog.md) | Search, trust scores, semantic tags, business context |
 | [Anomaly Narratives](concepts/anomaly-narratives.md) | AI-generated alert explanations |
+| [SQL Transforms](concepts/transforms.md) | Native SQL transforms replacing dbt — ref(), var(), materialization |
 
 ## Operations
 

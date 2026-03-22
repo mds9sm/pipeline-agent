@@ -22,7 +22,7 @@ Ships with 8 seed connectors (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebo
 - **Orchestration** — Pipeline DAGs with dependency-triggered execution, error budgets, cron + event-driven scheduling. *(Implemented)*
 - **Quality & Observability** — 7-check quality gate, schema drift detection, freshness monitoring, alerting. *(Implemented)*
 - **Post-promotion hooks** — SQL-based computed metadata after each pipeline run (XCom-style). *(Implemented)*
-- **Transforms** — Native SQL transforms within pipelines, replacing dbt macros. *(Planned)*
+- **Transforms** — Native SQL transforms with ref(), var(), 4 materialization strategies, AI generation. *(Implemented)*
 - **Composable pipeline steps** — Pipeline as a DAG of steps (extract, transform, gate, promote, cleanup) instead of fixed flow. *(Implemented)*
 - **Data contracts** — Formalized producer/consumer relationships between pipelines with cleanup policies and retention. *(Implemented)*
 - **DAG visualization** — UI-visible pipeline dependency graph with execution status. *(Implemented)*
@@ -90,7 +90,8 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `ui/App.jsx` | React 18 SPA (CDN, no build) - 11 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Settings, Sources, Docs |
 | `gitops/repo.py` | Separate git repo manager for pipeline YAML + connector code versioning |
 | `cli/__main__.py` | CLI interface — 14 commands, token caching, fuzzy pipeline resolution |
-| `mcp_server.py` | MCP server — 9 resources, 13 tools, 3 prompts; exposes DAPOS to AI agents via Model Context Protocol |
+| `transforms/engine.py` | SQL transform engine — ref/var resolution, materialization, validation, lineage parsing |
+| `mcp_server.py` | MCP server — 11 resources, 17 tools, 3 prompts; exposes DAPOS to AI agents via Model Context Protocol |
 | `docs/` | Structured documentation — quickstart, architecture, concepts, API/CLI reference |
 
 ## Critical Design Constraints
@@ -190,6 +191,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Agent diagnostics | 8 | diagnose (200+404), impact (200+404), anomalies, chat routing x3 (Build 24) |
 | Data catalog & AI enablement | 15 | search, query, detail, trust, columns, stats, semantic tags (get/infer/override), context questions, context save, trust weights (set/reset), alert narratives (field+generate) (Build 26) |
 | MCP server | 3 | server import, resource listing, tool listing (Build 27) |
+| SQL transforms | 9 | CRUD (create, list, get, update, delete), lineage, AI generate, chat routing x2 (Build 29) |
 
 ### Adding New Tests
 

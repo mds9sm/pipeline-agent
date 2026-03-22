@@ -2546,6 +2546,153 @@ fi
 fi # --api (Build 27)
 
 # ============================================================================
+# SQL Transforms (Build 29)
+# ============================================================================
+
+if [[ "$TEST_MODE" == "all" || "$TEST_MODE" == "--api" ]]; then
+
+section "SQL Transforms (Build 29)"
+
+# Test 1: Create a transform
+echo -n "  Create transform... "
+TRANSFORM_CREATE=$(curl -s -X POST "$API_URL/api/transforms" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "transform_name": "test_daily_orders",
+        "sql": "SELECT DATE(created_at) as order_date, COUNT(*) as order_count, SUM(total) as revenue FROM demo_orders GROUP BY DATE(created_at)",
+        "materialization": "table",
+        "target_schema": "analytics",
+        "target_table": "daily_orders",
+        "description": "Daily order count and revenue"
+    }')
+if echo "$TRANSFORM_CREATE" | jq -e '.transform_id' > /dev/null 2>&1; then
+    TRANSFORM_ID=$(echo "$TRANSFORM_CREATE" | jq -r '.transform_id')
+    pass "Transform created: $TRANSFORM_ID"
+else
+    fail "Transform creation failed: $TRANSFORM_CREATE"
+    TRANSFORM_ID=""
+fi
+
+# Test 2: List transforms
+echo -n "  List transforms... "
+TRANSFORM_LIST=$(curl -s "$API_URL/api/transforms" \
+    -H "Authorization: Bearer $TOKEN")
+if echo "$TRANSFORM_LIST" | jq -e '.[0].transform_name' > /dev/null 2>&1; then
+    T_COUNT=$(echo "$TRANSFORM_LIST" | jq '. | length')
+    pass "Listed $T_COUNT transforms"
+else
+    fail "Transform list failed: $TRANSFORM_LIST"
+fi
+
+# Test 3: Get transform detail
+if [ -n "$TRANSFORM_ID" ]; then
+    echo -n "  Get transform detail... "
+    TRANSFORM_DETAIL=$(curl -s "$API_URL/api/transforms/$TRANSFORM_ID" \
+        -H "Authorization: Bearer $TOKEN")
+    if echo "$TRANSFORM_DETAIL" | jq -e '.sql' > /dev/null 2>&1; then
+        pass "Transform detail includes SQL"
+    else
+        fail "Transform detail failed: $TRANSFORM_DETAIL"
+    fi
+fi
+
+# Test 4: Update transform
+if [ -n "$TRANSFORM_ID" ]; then
+    echo -n "  Update transform... "
+    TRANSFORM_UPDATE=$(curl -s -X PATCH "$API_URL/api/transforms/$TRANSFORM_ID" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"description": "Updated daily order summary", "approved": true}')
+    if echo "$TRANSFORM_UPDATE" | jq -e '.version' > /dev/null 2>&1; then
+        NEW_VER=$(echo "$TRANSFORM_UPDATE" | jq -r '.version')
+        pass "Transform updated to v$NEW_VER"
+    else
+        fail "Transform update failed: $TRANSFORM_UPDATE"
+    fi
+fi
+
+# Test 5: Transform lineage
+if [ -n "$TRANSFORM_ID" ]; then
+    echo -n "  Transform lineage... "
+    TRANSFORM_LIN=$(curl -s "$API_URL/api/transforms/$TRANSFORM_ID/lineage" \
+        -H "Authorization: Bearer $TOKEN")
+    if echo "$TRANSFORM_LIN" | jq -e '.lineage' > /dev/null 2>&1; then
+        L_COUNT=$(echo "$TRANSFORM_LIN" | jq '.lineage | length')
+        pass "Lineage: $L_COUNT entries"
+    else
+        fail "Transform lineage failed: $TRANSFORM_LIN"
+    fi
+fi
+
+# Test 6: Generate transform (AI)
+echo -n "  Generate transform (AI)... "
+TRANSFORM_GEN=$(curl -s -X POST "$API_URL/api/transforms/generate" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"description": "Monthly revenue summary from orders", "materialization": "table", "target_table": "monthly_revenue"}' \
+    --max-time 60)
+if echo "$TRANSFORM_GEN" | jq -e '.transform_id' > /dev/null 2>&1; then
+    GEN_ID=$(echo "$TRANSFORM_GEN" | jq -r '.transform_id')
+    pass "Generated transform: $GEN_ID"
+    # Cleanup generated transform
+    curl -s -X DELETE "$API_URL/api/transforms/$GEN_ID" \
+        -H "Authorization: Bearer $TOKEN" > /dev/null 2>&1
+else
+    warn "Transform generation returned: $(echo "$TRANSFORM_GEN" | head -c 200)"
+fi
+
+# Test 7: Delete transform
+if [ -n "$TRANSFORM_ID" ]; then
+    echo -n "  Delete transform... "
+    TRANSFORM_DEL=$(curl -s -X DELETE "$API_URL/api/transforms/$TRANSFORM_ID" \
+        -H "Authorization: Bearer $TOKEN")
+    if echo "$TRANSFORM_DEL" | jq -e '.status' > /dev/null 2>&1; then
+        pass "Transform deleted"
+    else
+        fail "Transform delete failed: $TRANSFORM_DEL"
+    fi
+fi
+
+# Test 8: Chat routing — generate transform
+echo -n "  Chat routing: generate transform... "
+CHAT_TRANSFORM=$(curl -s -X POST "$API_URL/api/chat" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"message": "create a transform for daily revenue from orders"}' \
+    --max-time 30)
+if echo "$CHAT_TRANSFORM" | jq -e '.action' > /dev/null 2>&1; then
+    ROUTED=$(echo "$CHAT_TRANSFORM" | jq -r '.action')
+    if [ "$ROUTED" = "generate_transform" ]; then
+        pass "Routed to generate_transform"
+    else
+        warn "Routed to $ROUTED (expected generate_transform)"
+    fi
+else
+    warn "Chat routing: $(echo "$CHAT_TRANSFORM" | head -c 200)"
+fi
+
+# Test 9: Chat routing — list transforms
+echo -n "  Chat routing: list transforms... "
+CHAT_LIST=$(curl -s -X POST "$API_URL/api/chat" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"message": "list all transforms"}' \
+    --max-time 15)
+if echo "$CHAT_LIST" | jq -e '.action' > /dev/null 2>&1; then
+    ROUTED=$(echo "$CHAT_LIST" | jq -r '.action')
+    if [ "$ROUTED" = "list_transforms" ]; then
+        pass "Routed to list_transforms"
+    else
+        warn "Routed to $ROUTED (expected list_transforms)"
+    fi
+else
+    warn "Chat routing: $(echo "$CHAT_LIST" | head -c 200)"
+fi
+
+fi # --api (Build 29)
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -2609,6 +2756,7 @@ echo "  - Step DAG: steps definition, validate, cycle detection, preview, PATCH 
 echo "  - Agent diagnostics: diagnose, impact, anomalies, chat routing (Build 24)"
 echo "  - Data catalog: search, detail, trust, columns, stats, semantic tags, context, weights (Build 26)"
 echo "  - MCP server: import, resources, tools (Build 27)"
+echo "  - SQL transforms: CRUD, lineage, generate, chat routing (Build 29)"
 echo "  - GitOps API: status, log, diff, pipeline history, restore dry-run (Build 23)"
 echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21)"
 echo "  - Interaction audit: list, export (Build 21)"

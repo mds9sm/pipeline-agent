@@ -23,10 +23,70 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 25 | In-app documentation & CLI | **Done** | Docs served in UI, 14-command CLI, structured docs directory |
 | 26 | Data catalog, semantic tags, trust scores | **Done** | Search/browse catalog, AI-inferred tags, business context, trust scores, alert narratives |
 | 27 | MCP server | **Done** | Expose DAPOS to AI agents via Model Context Protocol (resources, tools, prompts) |
+| 29 | Native SQL transforms | **Done** | Replace dbt with in-pipeline SQL transforms — ref(), var(), materialization, AI generation |
+| 30 | Dashboard / metrics layer | Planned | Lightweight KPI definitions on catalog tables |
+| 28 | Context API enrichment | Planned | Auto-context on pipeline runs, cross-pipeline context propagation |
 
 ---
 
 ## [Unreleased]
+
+### Build 29: Native SQL Transforms — 2026-03-21 (Claude Opus 4.6)
+
+**Replace dbt with native SQL transforms in pipelines — ref(), var(), 4 materialization strategies, AI generation, column lineage, and a full transform catalog.**
+
+#### Added
+- **Transform engine** (`transforms/engine.py`):
+  - `{{ ref('table_name') }}` resolution: looks up transforms by name, then pipelines by target_table, then passthrough
+  - `{{ var('key') }}` resolution: step variables > pipeline tags
+  - 4 materialization strategies: TABLE (drop+create), VIEW (create or replace), INCREMENTAL (delete+insert on unique key), EPHEMERAL (not materialized)
+  - SQL validation via `EXPLAIN (FORMAT JSON)` dry-run
+  - SQL preview with LIMIT (sample rows without materializing)
+  - Column lineage parsing from SELECT clause (best-effort regex)
+
+- **Transform catalog** (`contracts/models.py`, `contracts/store.py`):
+  - `SqlTransform` dataclass: versioned, approval-gated, pipeline-linked
+  - `MaterializationType` enum: table, view, incremental, ephemeral
+  - `sql_transforms` PostgreSQL table with CRUD methods
+  - `ChangeType.NEW_TRANSFORM` / `UPDATE_TRANSFORM` for approval workflow
+
+- **Transform API** (`api/server.py`, 9 endpoints):
+  - `POST /api/transforms` — create transform
+  - `GET /api/transforms` — list (filter by pipeline_id)
+  - `GET /api/transforms/{id}` — detail with full SQL
+  - `PATCH /api/transforms/{id}` — update SQL/config (bumps version)
+  - `DELETE /api/transforms/{id}` — delete
+  - `POST /api/transforms/{id}/validate` — dry-run EXPLAIN
+  - `POST /api/transforms/{id}/preview` — sample rows
+  - `POST /api/transforms/generate` — AI-generate from description
+  - `GET /api/transforms/{id}/lineage` — parsed column lineage
+
+- **Agent SQL generation** (`agent/core.py`):
+  - `generate_transform_sql()` — Claude generates SQL from natural language + available table schemas
+  - Rule-based fallback when no API key
+  - Chat routing: "create transform", "generate transform", "sql transform", "list transforms"
+
+- **Step DAG integration** (`agent/autonomous.py`):
+  - `_step_transform` rewritten: supports catalog transforms (by transform_id) or inline SQL
+  - Full ref/var/template resolution pipeline
+  - Column lineage auto-tracked after transform execution
+  - Transform outputs added to step context for downstream steps
+
+- **MCP integration** (`mcp_server.py`):
+  - 2 resources: `dapos://transforms`, `dapos://transforms/{id}`
+  - 4 tools: `list_transforms`, `create_transform`, `generate_transform`, `validate_transform`
+
+- **Documentation** (`docs/concepts/transforms.md`):
+  - Full reference: materialization types, ref/var syntax, API endpoints, step DAG integration
+
+- **Tests** (`test-pipeline-agent.sh`): 9 tests — CRUD (create, list, get, update, delete), lineage, AI generation, chat routing x2
+
+#### Key Design Decisions
+- **No Jinja2 dependency** — `ref()` and `var()` use simple regex, consistent with existing `_render_hook_sql` approach. Keeps security surface small.
+- **Transforms are stored separately, not inline** — Enables reuse across pipelines and independent versioning. Step config references by `transform_id` or includes inline SQL.
+- **Two-tier autonomy for AI-generated transforms** — Agent generates SQL, but `approved: false` until human approves. Prevents untested SQL from executing.
+- **Column lineage is best-effort** — Regex heuristics for simple cases. Agent can enrich for complex joins/subqueries.
+- **No new abstract methods on TargetEngine** — Transforms use existing `execute_sql()`. No changes needed to connector interface.
 
 ### Build 27: MCP Server — 2026-03-21 (Claude Opus 4.6)
 

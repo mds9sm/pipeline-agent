@@ -1085,19 +1085,84 @@ class PipelineRunner:
         }
 
     async def _step_transform(self, step_def, ctx, run, contract):
-        """Execute SQL transform against target."""
-        target = ctx["target"]
-        sql = step_def.config.get("sql", "")
-        if not sql:
-            raise ValueError("Transform step requires 'sql' in config")
+        """Execute SQL transform against target with ref/var resolution and materialization."""
+        from transforms.engine import resolve_refs, resolve_vars, execute_materialization, parse_column_lineage
+        from contracts.models import ColumnLineage
 
+        target = ctx["target"]
+        config = step_def.config
+
+        # Resolve SQL source: catalog transform or inline
+        transform_id = config.get("transform_id")
+        if transform_id:
+            transform = await self.store.get_sql_transform(transform_id)
+            if not transform:
+                raise ValueError(f"Transform {transform_id} not found in catalog")
+            sql = transform.sql
+            materialization = transform.materialization
+            if hasattr(materialization, "value"):
+                materialization = materialization.value
+            target_schema = transform.target_schema
+            target_table = transform.target_table or transform.transform_name
+            variables = {**transform.variables, **config.get("variables", {})}
+        else:
+            sql = config.get("sql", "")
+            materialization = config.get("materialization", "table")
+            target_schema = config.get("target_schema", contract.target_schema or "public")
+            target_table = config.get("target_table", "")
+            variables = config.get("variables", {})
+
+        if not sql:
+            raise ValueError("Transform step requires 'sql' in config or a valid transform_id")
+
+        # Phase 1: resolve {{ ref('...') }}
+        resolved_sql, refs = await resolve_refs(sql, self.store, contract.pipeline_id)
+
+        # Phase 2: resolve {{ var('...') }}
+        resolved_sql = resolve_vars(resolved_sql, variables, getattr(contract, "tags", None) or {})
+
+        # Phase 3: resolve {{ template_vars }} (existing hook variables)
         upstream_run = ctx.get("upstream_run")
-        rendered = self._render_hook_sql(sql, contract, run, upstream_run)
-        rows = await target.execute_sql(rendered, step_def.timeout_seconds or 300)
-        return {
-            "rows_affected": len(rows) if rows else 0,
-            "sql": rendered,
+        resolved_sql = self._render_hook_sql(resolved_sql, contract, run, upstream_run)
+
+        # Phase 4: execute materialization
+        timeout = step_def.timeout_seconds or 300
+        unique_key = config.get("unique_key", [])
+        result = await execute_materialization(
+            target, materialization, target_schema, target_table,
+            resolved_sql, unique_key=unique_key, timeout=timeout,
+        )
+
+        # Phase 5: track column lineage (best-effort)
+        if target_table and refs:
+            try:
+                lineage_entries = parse_column_lineage(resolved_sql, target_table, refs)
+                for entry in lineage_entries:
+                    cl = ColumnLineage(
+                        source_pipeline_id=contract.pipeline_id,
+                        source_schema=entry.get("source_schema", contract.target_schema or "public"),
+                        source_table=entry["source_table"],
+                        source_column=entry["source_column"],
+                        target_pipeline_id=contract.pipeline_id,
+                        target_schema=target_schema,
+                        target_table=target_table,
+                        target_column=entry["target_column"],
+                        transformation=entry.get("transformation", "sql_transform"),
+                    )
+                    await self.store.save_column_lineage(cl)
+            except Exception as e:
+                log.warning("Could not save transform lineage: %s", e)
+
+        # Store output in step context for downstream steps
+        ctx.setdefault("transform_outputs", {})[step_def.step_name] = {
+            "schema": target_schema,
+            "table": target_table,
+            "materialization": materialization,
         }
+
+        result["sql"] = resolved_sql
+        result["refs"] = refs
+        return result
 
     async def _step_quality_gate(self, step_def, ctx, run, contract):
         """Run quality gate checks."""

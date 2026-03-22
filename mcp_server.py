@@ -495,6 +495,126 @@ def get_business_context(pipeline_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MCP Resources & Tools — SQL Transforms (Build 29)
+# ---------------------------------------------------------------------------
+
+@mcp.resource("dapos://transforms")
+def transforms_list() -> str:
+    """All SQL transforms with materialization type, version, and approval status."""
+    items = _api("GET", "/api/transforms")
+    if not items:
+        return "No SQL transforms defined yet."
+    lines = [f"# SQL Transforms — {len(items)} total\n"]
+    for t in items:
+        approved = "approved" if t.get("approved") else "pending"
+        lines.append(
+            f"- **{t['transform_name']}** ({t.get('materialization', '?')}, v{t.get('version', 1)}, {approved})\n"
+            f"  Target: {t.get('target_schema', '?')}.{t.get('target_table', '?')} | "
+            f"Refs: {', '.join(t.get('refs', [])) or 'none'} | Pipeline: {t.get('pipeline_id', 'unlinked')[:8] or 'unlinked'}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.resource("dapos://transforms/{transform_id}")
+def transform_detail(transform_id: str) -> str:
+    """Full transform definition including SQL, lineage, and metadata."""
+    result = _api("GET", f"/api/transforms/{transform_id}")
+    return _fmt(result)
+
+
+@mcp.tool()
+def list_transforms(pipeline_id: str = "") -> str:
+    """List all SQL transforms, optionally filtered by pipeline.
+
+    Args:
+        pipeline_id: Optional pipeline ID to filter by
+    """
+    params = {}
+    if pipeline_id:
+        params["pipeline_id"] = pipeline_id
+    items = _api("GET", "/api/transforms", params=params)
+    if not items:
+        return "No SQL transforms found."
+    lines = [f"Found {len(items)} transforms:\n"]
+    for t in items:
+        approved = "approved" if t.get("approved") else "pending approval"
+        lines.append(
+            f"- {t['transform_name']} ({t.get('materialization', '?')}, {approved}) "
+            f"-> {t.get('target_schema', '?')}.{t.get('target_table', '?')}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def create_transform(
+    name: str,
+    sql: str,
+    materialization: str = "table",
+    description: str = "",
+    target_schema: str = "analytics",
+    target_table: str = "",
+    pipeline_id: str = "",
+) -> str:
+    """Create a new SQL transform in the DAPOS catalog.
+
+    Args:
+        name: Transform name (e.g., 'daily_revenue')
+        sql: SQL query using {{ ref('table') }} for table references
+        materialization: How to materialize: table, view, incremental, ephemeral
+        description: What this transform does
+        target_schema: Output schema (default: analytics)
+        target_table: Output table name (defaults to transform name)
+        pipeline_id: Optional pipeline to link this transform to
+    """
+    result = _api("POST", "/api/transforms", data={
+        "transform_name": name,
+        "sql": sql,
+        "materialization": materialization,
+        "description": description,
+        "target_schema": target_schema,
+        "target_table": target_table or name,
+        "pipeline_id": pipeline_id,
+    })
+    return f"Transform '{name}' created (ID: {result.get('transform_id', '?')}). Needs approval before use."
+
+
+@mcp.tool()
+def generate_transform(description: str, target_table: str = "", materialization: str = "table") -> str:
+    """Generate SQL transform from a natural language description using AI.
+
+    Args:
+        description: What the transform should do (e.g., 'daily revenue summary from orders')
+        target_table: Desired output table name
+        materialization: How to materialize: table, view, incremental, ephemeral
+    """
+    result = _api("POST", "/api/transforms/generate", data={
+        "description": description,
+        "target_table": target_table,
+        "materialization": materialization,
+    })
+    return (
+        f"Generated transform '{result.get('transform_name', '?')}':\n\n"
+        f"```sql\n{result.get('sql', '')}\n```\n\n"
+        f"Refs: {', '.join(result.get('refs', []))}\n"
+        f"Status: {result.get('message', 'pending approval')}"
+    )
+
+
+@mcp.tool()
+def validate_transform(transform_id: str) -> str:
+    """Validate transform SQL with dry-run EXPLAIN plan.
+
+    Args:
+        transform_id: Transform ID to validate
+    """
+    result = _api("POST", f"/api/transforms/{transform_id}/validate")
+    if result.get("valid"):
+        return f"Transform is valid.\nResolved SQL:\n{result.get('resolved_sql', '')}\nRefs: {result.get('refs', [])}"
+    else:
+        return f"Transform validation failed: {result.get('error', 'unknown error')}"
+
+
+# ---------------------------------------------------------------------------
 # MCP Prompts — reusable prompt templates
 # ---------------------------------------------------------------------------
 

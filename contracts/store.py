@@ -18,7 +18,7 @@ from contracts.models import (
     ErrorBudget, ColumnLineage, AgentCostLog, ConnectorMigration, User,
     PipelineMetadata, SchemaChangePolicy, PostPromotionHook,
     DataContract, ContractViolation, ChatInteraction, PipelineChangeLog,
-    PipelineChangeType, RegisteredSource,
+    PipelineChangeType, RegisteredSource, SqlTransform, MaterializationType,
     ColumnMapping, QualityConfig, CheckResult,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
@@ -1472,6 +1472,71 @@ class ContractStore:
                     queue.append((dep.pipeline_id, depth + 1))
         return result
 
+    # ==================================================================
+    # SQL Transforms (Build 29)
+    # ==================================================================
+
+    async def save_sql_transform(self, t) -> None:
+        from contracts.models import SqlTransform
+        await self.pool.execute("""
+            INSERT INTO sql_transforms (
+                transform_id, transform_name, description, sql, materialization,
+                target_schema, target_table, variables, refs, column_lineage,
+                version, created_by, approved, pipeline_id, created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            ON CONFLICT (transform_id) DO UPDATE SET
+                transform_name=EXCLUDED.transform_name,
+                description=EXCLUDED.description,
+                sql=EXCLUDED.sql,
+                materialization=EXCLUDED.materialization,
+                target_schema=EXCLUDED.target_schema,
+                target_table=EXCLUDED.target_table,
+                variables=EXCLUDED.variables,
+                refs=EXCLUDED.refs,
+                column_lineage=EXCLUDED.column_lineage,
+                version=EXCLUDED.version,
+                approved=EXCLUDED.approved,
+                updated_at=EXCLUDED.updated_at
+        """,
+            t.transform_id, t.transform_name, t.description, t.sql,
+            t.materialization.value if hasattr(t.materialization, 'value') else t.materialization,
+            t.target_schema, t.target_table or t.transform_name,
+            json.dumps(t.variables), json.dumps(t.refs), json.dumps(t.column_lineage),
+            t.version, t.created_by, t.approved, t.pipeline_id,
+            t.created_at, t.updated_at,
+        )
+
+    async def get_sql_transform(self, transform_id: str):
+        row = await self.pool.fetchrow(
+            "SELECT * FROM sql_transforms WHERE transform_id = $1", transform_id
+        )
+        return _row_to_sql_transform(row) if row else None
+
+    async def get_sql_transform_by_name(self, name: str):
+        row = await self.pool.fetchrow(
+            "SELECT * FROM sql_transforms WHERE transform_name = $1 ORDER BY version DESC LIMIT 1", name
+        )
+        return _row_to_sql_transform(row) if row else None
+
+    async def list_sql_transforms(self, pipeline_id: str = "") -> list:
+        if pipeline_id:
+            rows = await self.pool.fetch(
+                "SELECT * FROM sql_transforms WHERE pipeline_id = $1 ORDER BY transform_name", pipeline_id
+            )
+        else:
+            rows = await self.pool.fetch("SELECT * FROM sql_transforms ORDER BY transform_name")
+        return [_row_to_sql_transform(r) for r in rows]
+
+    async def delete_sql_transform(self, transform_id: str) -> None:
+        await self.pool.execute("DELETE FROM sql_transforms WHERE transform_id = $1", transform_id)
+
+    async def get_pipeline_by_target_table(self, target_table: str):
+        """Look up a pipeline by its target table name (used for ref() resolution)."""
+        row = await self.pool.fetchrow(
+            "SELECT * FROM pipelines WHERE target_table = $1 LIMIT 1", target_table
+        )
+        return self._row_to_pipeline(row) if row else None
+
 
 # ======================================================================
 # Row-to-model helpers (module-level, stateless)
@@ -1890,6 +1955,32 @@ def _row_to_pipeline_change(row: asyncpg.Record) -> PipelineChangeLog:
     )
 
 
+def _row_to_sql_transform(row: asyncpg.Record) -> SqlTransform:
+    mat = row.get("materialization", "table")
+    try:
+        mat = MaterializationType(mat)
+    except ValueError:
+        mat = MaterializationType.TABLE
+    return SqlTransform(
+        transform_id=row["transform_id"],
+        transform_name=row["transform_name"],
+        description=row.get("description", ""),
+        sql=row.get("sql", ""),
+        materialization=mat,
+        target_schema=row.get("target_schema", "analytics"),
+        target_table=row.get("target_table", ""),
+        variables=json.loads(row["variables"]) if row.get("variables") else {},
+        refs=json.loads(row["refs"]) if row.get("refs") else [],
+        column_lineage=json.loads(row["column_lineage"]) if row.get("column_lineage") else [],
+        version=row.get("version", 1),
+        created_by=row.get("created_by", "agent"),
+        approved=row.get("approved", False),
+        pipeline_id=row.get("pipeline_id", ""),
+        created_at=row.get("created_at", ""),
+        updated_at=row.get("updated_at", ""),
+    )
+
+
 # ======================================================================
 # DDL for create_tables() -- dev/test convenience
 # ======================================================================
@@ -2278,7 +2369,28 @@ CREATE TABLE IF NOT EXISTS step_executions (
     elapsed_ms INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS sql_transforms (
+    transform_id TEXT PRIMARY KEY,
+    transform_name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    sql TEXT NOT NULL DEFAULT '',
+    materialization TEXT NOT NULL DEFAULT 'table',
+    target_schema TEXT NOT NULL DEFAULT 'analytics',
+    target_table TEXT NOT NULL DEFAULT '',
+    variables JSONB NOT NULL DEFAULT '{}',
+    refs JSONB NOT NULL DEFAULT '[]',
+    column_lineage JSONB NOT NULL DEFAULT '[]',
+    version INT NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL DEFAULT 'agent',
+    approved BOOLEAN NOT NULL DEFAULT FALSE,
+    pipeline_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_sql_transforms_pipeline ON sql_transforms(pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_sql_transforms_name ON sql_transforms(transform_name);
 CREATE INDEX IF NOT EXISTS idx_step_executions_run ON step_executions(run_id);
 CREATE INDEX IF NOT EXISTS idx_step_executions_pipeline ON step_executions(pipeline_id);
 CREATE INDEX IF NOT EXISTS idx_chat_interactions_session ON chat_interactions(session_id, created_at DESC);

@@ -1122,6 +1122,26 @@ Respond with JSON:
                 "response_text": "Resuming pipeline...",
             }
 
+        # SQL Transforms (Build 29)
+        if any(kw in text_lower for kw in (
+            "create transform", "generate transform", "sql transform",
+            "new transform", "build transform", "add transform",
+            "create a view", "create a table as",
+        )):
+            return {
+                "action": "generate_transform",
+                "params": {"description": user_text},
+                "response_text": "Generating SQL transform...",
+            }
+        if any(kw in text_lower for kw in (
+            "list transform", "show transform", "my transform", "all transform",
+        )):
+            return {
+                "action": "list_transforms",
+                "params": {},
+                "response_text": "Listing transforms...",
+            }
+
         # Design topology (Build 20)
         if any(kw in text_lower for kw in (
             "design", "architect", "topology", "multi-pipeline",
@@ -2269,3 +2289,91 @@ Respond with JSON only:
                 "allow_custom": False,
             },
         ]
+
+    # ------------------------------------------------------------------
+    # generate_transform_sql (Build 29)
+    # ------------------------------------------------------------------
+
+    async def generate_transform_sql(
+        self,
+        description: str,
+        available_tables: list[dict],
+        materialization: str = "table",
+        target_table: str = "",
+    ) -> dict:
+        """Generate SQL transform from natural language description.
+
+        Args:
+            description: What the transform should do
+            available_tables: List of {schema, table, columns: [{name, type}]}
+            materialization: table, view, incremental, ephemeral
+            target_table: Desired output table name
+
+        Returns dict with sql, target_table, description, refs, variables.
+        """
+        tables_desc = []
+        for t in available_tables[:20]:
+            cols = ", ".join(
+                f"{c['name']} ({c.get('type', '?')})"
+                for c in (t.get("columns") or [])[:30]
+            )
+            tables_desc.append(f"  - {t.get('schema', 'public')}.{t['table']}: {cols}")
+
+        tables_text = "\n".join(tables_desc) if tables_desc else "  (no tables available)"
+
+        prompt = f"""Generate a SQL transform for PostgreSQL based on this description:
+
+Description: {description}
+
+Available tables (use {{{{ ref('table_name') }}}} to reference them):
+{tables_text}
+
+Materialization: {materialization}
+{f'Target table name: {target_table}' if target_table else 'Suggest a good target table name.'}
+
+Respond with ONLY a JSON object (no markdown):
+{{
+    "sql": "SELECT ... FROM {{{{ ref('table_name') }}}} ...",
+    "target_table": "output_table_name",
+    "description": "Brief description of what this transform does",
+    "refs": ["table_name1", "table_name2"],
+    "variables": {{}},
+    "unique_key": []
+}}
+
+Rules:
+- Use {{{{ ref('table') }}}} syntax to reference source tables (not raw table names)
+- Use {{{{ var('key') }}}} for configurable parameters
+- For incremental, include a unique_key array
+- Write clean, well-commented SQL
+- Use CTEs for clarity on complex transforms"""
+
+        if not self.has_api:
+            return self._fallback_transform_sql(description, target_table)
+
+        try:
+            resp = await self._call_claude(prompt, max_tokens=2000)
+            text = resp.get("text", "") if isinstance(resp, dict) else str(resp)
+            # Extract JSON from response
+            text = text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            result = json.loads(text)
+            if "sql" in result:
+                return result
+        except Exception as e:
+            log.warning("Transform SQL generation failed: %s", e)
+
+        return self._fallback_transform_sql(description, target_table)
+
+    def _fallback_transform_sql(self, description: str, target_table: str = "") -> dict:
+        """Simple fallback when no API key available."""
+        name = target_table or "transform_output"
+        return {
+            "sql": f"-- TODO: Implement transform\n-- Description: {description}\nSELECT 1 AS placeholder",
+            "target_table": name,
+            "description": description,
+            "refs": [],
+            "variables": {},
+            "unique_key": [],
+        }

@@ -101,6 +101,15 @@ class ChangeType(str, Enum):
     REMOVE_TABLE = "remove_table"
     NEW_CONNECTOR = "new_connector"
     UPDATE_CONNECTOR = "update_connector"
+    NEW_TRANSFORM = "new_transform"
+    UPDATE_TRANSFORM = "update_transform"
+
+
+class MaterializationType(str, Enum):
+    TABLE = "table"
+    VIEW = "view"
+    INCREMENTAL = "incremental"
+    EPHEMERAL = "ephemeral"
 
 
 class ConnectorStatus(str, Enum):
@@ -931,3 +940,28 @@ class ExtractResult:
     staging_size_bytes: int
     batch_count: int
     manifest: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Build 29: SQL Transforms
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SqlTransform:
+    """Versioned SQL transform definition. Stored in sql_transforms table."""
+    transform_id: str = field(default_factory=new_id)
+    transform_name: str = ""
+    description: str = ""
+    sql: str = ""
+    materialization: MaterializationType = MaterializationType.TABLE
+    target_schema: str = "analytics"
+    target_table: str = ""
+    variables: dict = field(default_factory=dict)
+    refs: list = field(default_factory=list)
+    column_lineage: list = field(default_factory=list)
+    version: int = 1
+    created_by: str = "agent"
+    approved: bool = False
+    pipeline_id: str = ""
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
