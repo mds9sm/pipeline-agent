@@ -23,10 +23,12 @@ Ships with 8 seed connectors (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebo
 - **Quality & Observability** — 7-check quality gate, schema drift detection, freshness monitoring, alerting. *(Implemented)*
 - **Post-promotion hooks** — SQL-based computed metadata after each pipeline run (XCom-style). *(Implemented)*
 - **Transforms** — Native SQL transforms within pipelines, replacing dbt macros. *(Planned)*
-- **Composable pipeline steps** — Pipeline as a DAG of steps (extract, transform, gate, promote, cleanup) instead of fixed flow. *(Planned)*
-- **Data contracts** — Formalized producer/consumer relationships between pipelines with cleanup policies and retention. *(Planned)*
-- **DAG visualization** — UI-visible pipeline dependency graph with execution status. *(Planned)*
-- **Agent topology reasoning** — User describes a business problem, agent designs multi-pipeline architecture with the right patterns (consume-and-merge, fan-in, SCD, etc.). *(Planned)*
+- **Composable pipeline steps** — Pipeline as a DAG of steps (extract, transform, gate, promote, cleanup) instead of fixed flow. *(Implemented)*
+- **Data contracts** — Formalized producer/consumer relationships between pipelines with cleanup policies and retention. *(Implemented)*
+- **DAG visualization** — UI-visible pipeline dependency graph with execution status. *(Implemented)*
+- **Agent topology reasoning** — User describes a business problem, agent designs multi-pipeline architecture with the right patterns (consume-and-merge, fan-in, SCD, etc.). *(Implemented)*
+- **Data catalog & AI enablement** — Built-in catalog with trust scores, semantic tags, business context, anomaly narratives. *(Implemented)*
+- **MCP server** — Expose DAPOS to AI agents via Model Context Protocol (9 resources, 13 tools, 3 prompts). *(Implemented)*
 
 **Key patterns the platform must support:**
 | Pattern | Example |
@@ -75,7 +77,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `contracts/store.py` | PostgreSQL CRUD via asyncpg for all entities |
 | `connectors/registry.py` | exec()-based connector loader, validator, hot-reloader |
 | `connectors/seeds.py` | 8 seed connectors as string constants (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebook Insights sources + PostgreSQL, Redshift targets) |
-| `demo/bootstrap.py` | Auto-creates 4 demo pipelines on first startup with source profiling |
+| `demo/bootstrap.py` | Auto-creates 4 demo pipelines on first startup with source profiling, semantic tags, business context, trust weights |
 | `demo/mock-api/app.py` | Mock Stripe, Google Ads, Facebook Insights API service |
 | `source/base.py` | Abstract SourceEngine interface (INTERFACE_VERSION = "1.0") |
 | `target/base.py` | Abstract TargetEngine interface (INTERFACE_VERSION = "1.0") |
@@ -88,6 +90,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `ui/App.jsx` | React 18 SPA (CDN, no build) - 11 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Settings, Sources, Docs |
 | `gitops/repo.py` | Separate git repo manager for pipeline YAML + connector code versioning |
 | `cli/__main__.py` | CLI interface — 14 commands, token caching, fuzzy pipeline resolution |
+| `mcp_server.py` | MCP server — 9 resources, 13 tools, 3 prompts; exposes DAPOS to AI agents via Model Context Protocol |
 | `docs/` | Structured documentation — quickstart, architecture, concepts, API/CLI reference |
 
 ## Critical Design Constraints
@@ -186,6 +189,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Step DAG | 5 | steps definition, run steps, validate, preview, PATCH update (Build 18) |
 | Agent diagnostics | 8 | diagnose (200+404), impact (200+404), anomalies, chat routing x3 (Build 24) |
 | Data catalog & AI enablement | 15 | search, query, detail, trust, columns, stats, semantic tags (get/infer/override), context questions, context save, trust weights (set/reset), alert narratives (field+generate) (Build 26) |
+| MCP server | 3 | server import, resource listing, tool listing (Build 27) |
 
 ### Adding New Tests
 

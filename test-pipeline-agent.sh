@@ -2492,6 +2492,60 @@ fi # CAT_PID exists
 fi # --api (Build 26)
 
 # ============================================================================
+# MCP Server (Build 27)
+# ============================================================================
+
+if [[ "$TEST_MODE" == "all" || "$TEST_MODE" == "--api" ]]; then
+
+section "MCP Server (Build 27)"
+
+# Test 1: MCP server module imports cleanly
+echo -n "  MCP server imports... "
+MCP_IMPORT=$(python -c "from mcp_server import mcp; print(mcp.name)" 2>&1)
+if echo "$MCP_IMPORT" | grep -qi "DAPOS"; then
+    pass "MCP server imports OK (name=$MCP_IMPORT)"
+else
+    # mcp package may not be installed in test env
+    if echo "$MCP_IMPORT" | grep -qi "No module named"; then
+        skip "mcp package not installed"
+    else
+        fail "MCP server import failed: $MCP_IMPORT"
+    fi
+fi
+
+# Test 2: MCP server has expected resource count
+echo -n "  MCP resource count... "
+MCP_RES=$(python -c "
+from mcp_server import mcp
+resources = mcp._resource_manager._resources if hasattr(mcp, '_resource_manager') else {}
+print(len(resources))
+" 2>&1)
+if [[ "$MCP_RES" =~ ^[0-9]+$ ]] && [ "$MCP_RES" -ge 7 ]; then
+    pass "MCP resources: $MCP_RES"
+elif echo "$MCP_RES" | grep -qi "No module named"; then
+    skip "mcp package not installed"
+else
+    warn "MCP resource count: $MCP_RES (expected >=7)"
+fi
+
+# Test 3: MCP server has expected tool count
+echo -n "  MCP tool count... "
+MCP_TOOLS=$(python -c "
+from mcp_server import mcp
+tools = mcp._tool_manager._tools if hasattr(mcp, '_tool_manager') else {}
+print(len(tools))
+" 2>&1)
+if [[ "$MCP_TOOLS" =~ ^[0-9]+$ ]] && [ "$MCP_TOOLS" -ge 10 ]; then
+    pass "MCP tools: $MCP_TOOLS"
+elif echo "$MCP_TOOLS" | grep -qi "No module named"; then
+    skip "mcp package not installed"
+else
+    warn "MCP tool count: $MCP_TOOLS (expected >=10)"
+fi
+
+fi # --api (Build 27)
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -2554,6 +2608,7 @@ echo "  - Source registry: register, list, get, update, discover, delete (Build 
 echo "  - Step DAG: steps definition, validate, cycle detection, preview, PATCH update (Build 18)"
 echo "  - Agent diagnostics: diagnose, impact, anomalies, chat routing (Build 24)"
 echo "  - Data catalog: search, detail, trust, columns, stats, semantic tags, context, weights (Build 26)"
+echo "  - MCP server: import, resources, tools (Build 27)"
 echo "  - GitOps API: status, log, diff, pipeline history, restore dry-run (Build 23)"
 echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21)"
 echo "  - Interaction audit: list, export (Build 21)"

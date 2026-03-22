@@ -186,6 +186,46 @@ Returns: anomaly descriptions, severity, and recommended actions (investigate, a
 
 ---
 
+## Anomaly Narratives
+
+When an alert fires, you can generate a human-readable narrative that explains the alert in context. Claude analyzes the alert details alongside recent runs, downstream dependencies, freshness state, and pipeline tier to produce actionable prose.
+
+### Generating a Narrative
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8100/api/observability/alerts/{alert_id}/narrative"
+```
+
+Returns:
+```json
+{
+  "alert_id": "alert-789",
+  "narrative": "The demo-ecommerce-orders pipeline has been failing for the last 2 runs due to a connection timeout to the source MySQL database. This is a Tier 1 pipeline with 3 downstream consumers. Current staleness is 45 minutes, exceeding the 30-minute SLA. Recommended action: check MySQL connectivity and disk space on demo-mysql.",
+  "pipeline_name": "demo-ecommerce-orders",
+  "severity": "critical"
+}
+```
+
+### Context Used
+
+The narrative draws from:
+- Alert summary, detail, and severity
+- Pipeline tier and schedule
+- Downstream dependency count
+- Last 3 run errors
+- Current freshness staleness and status
+
+### Cost
+
+Each narrative is one Claude API call, logged under `generate_anomaly_narrative`. The narrative is saved on the alert record, so subsequent reads do not require regeneration.
+
+Rate-limited to 10 requests per minute.
+
+For a full deep dive, see [Anomaly Narratives](anomaly-narratives.md).
+
+---
+
 ## Notification Policies
 
 Configure per-tier alert dispatch rules:

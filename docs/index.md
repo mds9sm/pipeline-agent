@@ -24,6 +24,8 @@
 | [Scheduling](concepts/scheduling.md) | Cron, event-driven, dependency graph, backfill |
 | [Data Contracts](concepts/data-contracts.md) | Producer/consumer relationships, SLA, cleanup guards |
 | [Observability](concepts/observability.md) | Freshness, alerts, error budgets, anomaly reasoning |
+| [Data Catalog](concepts/data-catalog.md) | Search, trust scores, semantic tags, business context |
+| [Anomaly Narratives](concepts/anomaly-narratives.md) | AI-generated alert explanations |
 
 ## Operations
 
@@ -52,8 +54,10 @@
 | [Post-Promotion Hooks](advanced/hooks.md) | SQL hooks with 34 template variables |
 | [Template Variables](advanced/template-variables.md) | Full reference for `{{variable}}` placeholders |
 | [Schema Drift](advanced/schema-drift.md) | Detection, policies, auto-remediation |
+| [Trust Scores](advanced/trust-scores.md) | Trust score formula, components, weight customization |
 | [Multi-Environment](advanced/multi-environment.md) | Branch-per-environment, connection parameterization |
 | [Disaster Recovery](advanced/disaster-recovery.md) | GitOps restore, crash recovery, stale run cleanup |
+| [MCP Server](advanced/mcp-server.md) | Expose DAPOS to AI agents via Model Context Protocol |
 
 ## Contributing
 

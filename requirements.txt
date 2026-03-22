@@ -30,3 +30,6 @@ croniter>=2.0.1
 
 # Serialization
 pyyaml>=6.0
+
+# MCP (Model Context Protocol)
+mcp>=1.26.0

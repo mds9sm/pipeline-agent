@@ -117,6 +117,47 @@ All endpoints require JWT authentication unless noted. Pass the token as `Author
 | GET | `/api/gitops/pipelines/{id}/history` | Per-pipeline history | viewer+ |
 | POST | `/api/gitops/restore` | Restore DB from repo (admin, dry-run default) | admin |
 
+## Data Catalog (Build 26)
+
+### Search & Browse
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| GET | `/api/catalog/search` | Search catalog (tables, columns, tags, context) | viewer+ |
+| GET | `/api/catalog/tables/{id}` | Full table detail (columns, lineage, trust, quality) | viewer+ |
+| GET | `/api/catalog/trust/{id}` | Trust score breakdown with weights | viewer+ |
+| GET | `/api/catalog/columns` | Search columns across all tables | viewer+ |
+| GET | `/api/catalog/stats` | Catalog-wide statistics | viewer+ |
+
+### Semantic Tags
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| GET | `/api/catalog/tables/{id}/tags` | Get semantic tags | viewer+ |
+| POST | `/api/catalog/tables/{id}/tags/infer` | AI-infer semantic tags | operator+ |
+| PUT | `/api/catalog/tables/{id}/tags` | Bulk set/override tags | operator+ |
+| PATCH | `/api/catalog/tables/{id}/tags/{column}` | Per-column tag override | operator+ |
+
+### Business Context
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| GET | `/api/catalog/tables/{id}/context/questions` | AI-generated context questions | viewer+ |
+| PUT | `/api/catalog/tables/{id}/context` | Save business context answers | operator+ |
+
+### Trust Weights
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| PUT | `/api/catalog/tables/{id}/trust-weights` | Set per-pipeline trust weights | operator+ |
+| DELETE | `/api/catalog/tables/{id}/trust-weights` | Reset to default weights | operator+ |
+
+### Alert Narratives
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| POST | `/api/observability/alerts/{id}/narrative` | Generate alert narrative via AI | viewer+ |
+
 ## System
 
 | Method | Endpoint | Auth? | Description |

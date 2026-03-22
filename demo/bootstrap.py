@@ -242,6 +242,70 @@ async def _seed_mongo(cfg: dict) -> bool:
 TARGET_CONNECTOR_NAME = "postgres-target-v1"
 TARGET_SCHEMA = "raw"
 
+# ---------------------------------------------------------------------------
+# Build 26: Semantic tags, business context, and trust weights for demo pipes
+# ---------------------------------------------------------------------------
+
+DEMO_SEMANTIC_TAGS = {
+    "demo-ecommerce-orders": {
+        "id": {"semantic_name": "order_id", "domain": "technical", "description": "Unique order identifier", "pii": False, "unit": None, "source": "ai"},
+        "customer_id": {"semantic_name": "customer_id", "domain": "identity", "description": "Reference to customer who placed the order", "pii": False, "unit": None, "source": "ai"},
+        "order_number": {"semantic_name": "order_number", "domain": "operations", "description": "Human-readable order reference number", "pii": False, "unit": None, "source": "ai"},
+        "status": {"semantic_name": "order_status", "domain": "operations", "description": "Current fulfillment status", "pii": False, "unit": None, "source": "ai"},
+        "subtotal": {"semantic_name": "order_subtotal", "domain": "finance", "description": "Order amount before tax and shipping", "pii": False, "unit": "USD", "source": "ai"},
+        "tax": {"semantic_name": "tax_amount", "domain": "finance", "description": "Tax charged on the order", "pii": False, "unit": "USD", "source": "ai"},
+        "total": {"semantic_name": "order_total", "domain": "finance", "description": "Total order amount including tax and shipping", "pii": False, "unit": "USD", "source": "ai"},
+        "created_at": {"semantic_name": "order_date", "domain": "temporal", "description": "When the order was placed", "pii": False, "unit": None, "source": "ai"},
+        "updated_at": {"semantic_name": "last_modified", "domain": "temporal", "description": "When the order was last updated", "pii": False, "unit": None, "source": "ai"},
+    },
+    "demo-ecommerce-customers": {
+        "id": {"semantic_name": "customer_id", "domain": "technical", "description": "Unique customer identifier", "pii": False, "unit": None, "source": "ai"},
+        "email": {"semantic_name": "customer_email", "domain": "identity", "description": "Customer email address", "pii": True, "unit": None, "source": "ai"},
+        "first_name": {"semantic_name": "first_name", "domain": "identity", "description": "Customer first name", "pii": True, "unit": None, "source": "ai"},
+        "last_name": {"semantic_name": "last_name", "domain": "identity", "description": "Customer last name", "pii": True, "unit": None, "source": "ai"},
+        "company": {"semantic_name": "company_name", "domain": "identity", "description": "Customer company or organization", "pii": False, "unit": None, "source": "ai"},
+        "tier": {"semantic_name": "customer_tier", "domain": "operations", "description": "Subscription tier (free/pro/enterprise)", "pii": False, "unit": None, "source": "ai"},
+        "created_at": {"semantic_name": "signup_date", "domain": "temporal", "description": "When the customer account was created", "pii": False, "unit": None, "source": "ai"},
+        "updated_at": {"semantic_name": "last_modified", "domain": "temporal", "description": "When the customer record was last updated", "pii": False, "unit": None, "source": "ai"},
+    },
+    "demo-analytics-events": {
+        "event_id": {"semantic_name": "event_id", "domain": "technical", "description": "Unique event identifier", "pii": False, "unit": None, "source": "ai"},
+        "event_type": {"semantic_name": "event_type", "domain": "product", "description": "Type of user interaction (page_view, click, purchase, etc.)", "pii": False, "unit": None, "source": "ai"},
+        "user_id": {"semantic_name": "user_id", "domain": "identity", "description": "Anonymous user identifier", "pii": False, "unit": None, "source": "ai"},
+        "page_url": {"semantic_name": "page_url", "domain": "product", "description": "Page where the event occurred", "pii": False, "unit": None, "source": "ai"},
+        "timestamp": {"semantic_name": "event_timestamp", "domain": "temporal", "description": "When the event occurred", "pii": False, "unit": None, "source": "ai"},
+        "browser": {"semantic_name": "browser_type", "domain": "technical", "description": "User browser", "pii": False, "unit": None, "source": "ai"},
+        "device": {"semantic_name": "device_type", "domain": "technical", "description": "Device category (desktop/mobile/tablet)", "pii": False, "unit": None, "source": "ai"},
+        "country": {"semantic_name": "user_country", "domain": "geography", "description": "User country code", "pii": False, "unit": None, "source": "ai"},
+        "campaign": {"semantic_name": "marketing_campaign", "domain": "marketing", "description": "Attribution campaign if any", "pii": False, "unit": None, "source": "ai"},
+    },
+}
+
+DEMO_BUSINESS_CONTEXT = {
+    "demo-ecommerce-orders": {
+        "business_process": "Order fulfillment and revenue tracking",
+        "consumers": "Finance team, executive dashboards, revenue forecasting models",
+        "criticality": "High — daily revenue reporting depends on this data",
+        "freshness_expectation": "Near real-time (< 1 hour)",
+    },
+    "demo-ecommerce-customers": {
+        "business_process": "Customer management and segmentation",
+        "consumers": "Marketing team, support team, customer analytics",
+        "criticality": "Medium — used for weekly segmentation and campaign targeting",
+        "freshness_expectation": "Daily",
+    },
+    "demo-analytics-events": {
+        "business_process": "Product analytics and user behavior tracking",
+        "consumers": "Product team, growth team, data science",
+        "criticality": "Medium — product decisions and A/B test analysis depend on this",
+        "freshness_expectation": "Near real-time (< 1 hour)",
+    },
+}
+
+DEMO_TRUST_WEIGHTS = {
+    "demo-ecommerce-orders": {"freshness": 0.40, "quality_gate": 0.25, "error_budget": 0.25, "schema_stability": 0.10},
+}
+
 
 def _build_demo_pipelines(mysql_cfg: dict, mongo_cfg: dict, stripe_url: str) -> list[dict]:
     """Build demo pipeline definitions from resolved source configs."""
@@ -425,6 +489,29 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
         log.info("Created demo pipeline: %s", cfg["pipeline_name"])
 
     log.info("Demo bootstrap complete: %d pipelines created.", created)
+
+    # --- Build 26: Attach semantic tags, business context, and trust weights ---
+    for contract in created_pipelines:
+        name = contract.pipeline_name
+        updated = False
+
+        if name in DEMO_SEMANTIC_TAGS:
+            contract.semantic_tags = DEMO_SEMANTIC_TAGS[name]
+            log.info("Set %d semantic tags on %s", len(DEMO_SEMANTIC_TAGS[name]), name)
+            updated = True
+
+        if name in DEMO_BUSINESS_CONTEXT:
+            contract.business_context = DEMO_BUSINESS_CONTEXT[name]
+            log.info("Set business context on %s: %s", name, DEMO_BUSINESS_CONTEXT[name].get("business_process", ""))
+            updated = True
+
+        if name in DEMO_TRUST_WEIGHTS:
+            contract.trust_weights = DEMO_TRUST_WEIGHTS[name]
+            log.info("Set custom trust weights on %s: %s", name, DEMO_TRUST_WEIGHTS[name])
+            updated = True
+
+        if updated:
+            await store.save_pipeline(contract)
 
     # Create demo notification policy (skip Slack webhook in cloud — no mock API)
     if created_pipelines:

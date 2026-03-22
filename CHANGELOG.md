@@ -20,10 +20,41 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 21 | Analyst experience layer | **Done** | Source registry, guided conversation, schedule parser, pipeline changelog, interaction audit |
 | 22 | Observability UX — execution logs, freshness charts, lineage consolidation | **Done** | Full pipeline execution visibility, time-series freshness, unified DAG+lineage view |
 | 23 | GitOps pipeline config versioning | **Done** | Separate git repo for pipeline YAML + connector code, auto-committed on every mutation |
+| 25 | In-app documentation & CLI | **Done** | Docs served in UI, 14-command CLI, structured docs directory |
+| 26 | Data catalog, semantic tags, trust scores | **Done** | Search/browse catalog, AI-inferred tags, business context, trust scores, alert narratives |
+| 27 | MCP server | **Done** | Expose DAPOS to AI agents via Model Context Protocol (resources, tools, prompts) |
 
 ---
 
 ## [Unreleased]
+
+### Build 27: MCP Server — 2026-03-21 (Claude Opus 4.6)
+
+**Expose DAPOS capabilities to AI agents via Model Context Protocol — enabling agent-to-agent discovery, querying, and operations.**
+
+#### Added
+- **MCP server** (`mcp_server.py`):
+  - 9 resources: `dapos://catalog`, `dapos://catalog/stats`, `dapos://pipelines`, `dapos://alerts`, `dapos://dag`, `dapos://anomalies`, `dapos://catalog/tables/{id}`, `dapos://pipelines/{id}`
+  - 13 tools: `search_catalog`, `search_columns`, `get_trust_score`, `get_semantic_tags`, `infer_tags`, `diagnose_pipeline`, `analyze_impact`, `trigger_pipeline`, `get_pipeline_runs`, `get_freshness`, `generate_narrative`, `design_topology`, `get_business_context`
+  - 3 prompts: `troubleshoot_pipeline`, `explore_catalog`, `assess_platform_health`
+  - Transports: stdio (Claude Desktop), SSE (web clients), streamable-http
+  - JWT-authenticated httpx client with token caching (same pattern as CLI)
+  - Config via `DAPOS_URL`, `DAPOS_USER`, `DAPOS_PASSWORD` env vars
+- **MCP documentation** (`docs/advanced/mcp-server.md`):
+  - Claude Desktop configuration (local + remote)
+  - Resource, tool, and prompt reference
+  - Architecture diagram
+- **MCP dependency** (`requirements.txt`): `mcp>=1.26.0`
+- **MCP tests** (`test-pipeline-agent.sh`): 3 smoke tests (import, resource count, tool count)
+
+#### Changed
+- Demo bootstrap now sets semantic tags, business context, and trust weights on demo pipelines at creation time
+- Documentation updated for Builds 25-26: data catalog, trust scores, anomaly narratives, deployment guide
+
+#### Key Design Decisions
+- **MCP over A2A** — MCP is the better fit for DAPOS's structured data query pattern (resources + tools). A2A is designed for multi-step task delegation between agents, which is overkill for catalog queries.
+- **REST API passthrough** — The MCP server is a thin translation layer over the existing REST API. No direct database access, same RBAC, same permissions.
+- **stdio default** — Most MCP clients (Claude Desktop, Cursor) use stdio transport. SSE and streamable-http available for web integrations.
 
 ### Build 25: In-App Documentation & CLI — 2026-03-21 (Claude Opus 4.6)
 
@@ -46,6 +77,59 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 #### Changed
 - Cache version bumped to v=37 in `index.html`
+
+### Build 26: Data Catalog, Semantic Tags, Trust Scores & Alert Narratives — 2026-03-21 (Claude Opus 4.6)
+
+**A built-in data catalog that surfaces table metadata, trust scores, AI-inferred semantic tags, business context, and alert narratives — replacing the need for external catalog tools like Atlan, DataHub, or Alation.**
+
+#### Added
+- **Data Catalog API** (`api/server.py`):
+  - `GET /api/catalog/search` — full-text search across tables, columns, tags, and business context with filters (source_type, status, tier, pagination)
+  - `GET /api/catalog/tables/{id}` — complete table detail: columns, lineage, freshness (current + 72h history), quality trend, error budget, trust breakdown, data contracts, recent runs
+  - `GET /api/catalog/trust/{id}` — trust score breakdown with component scores, weights, and recommendation
+  - `GET /api/catalog/columns` — cross-pipeline column search with table filter
+  - `GET /api/catalog/stats` — catalog-wide statistics: table/column counts, source type distribution, trust distribution
+
+- **Semantic Tags** (`api/server.py`, `agent/core.py`):
+  - `GET /api/catalog/tables/{id}/tags` — get all semantic tags for a pipeline's columns
+  - `POST /api/catalog/tables/{id}/tags/infer` — AI-infer semantic tags (domain, description, PII flag) via Claude; preserves user-overridden tags
+  - `PUT /api/catalog/tables/{id}/tags` — bulk set/override tags for multiple columns (marked `source=user`)
+  - `PATCH /api/catalog/tables/{id}/tags/{column}` — per-column tag override
+  - `PipelineContract.semantic_tags` field (dict) stores per-column tag metadata
+
+- **Business Context** (`api/server.py`, `agent/core.py`):
+  - `GET /api/catalog/tables/{id}/context/questions` — Claude generates targeted questions based on pipeline schema
+  - `PUT /api/catalog/tables/{id}/context` — save business context answers (auto-stamps `_last_updated`, `_updated_by`)
+  - `PipelineContract.business_context` field (dict) stores key-value context
+
+- **Trust Scores** (`api/server.py`):
+  - 4 weighted components: freshness (30%), quality gate (30%), error budget (25%), schema stability (15%)
+  - Components without data are excluded from denominator (partial data supported)
+  - Recommendations: >0.9 high, >0.7 good, >0.5 medium, <0.5 low
+  - `PUT /api/catalog/tables/{id}/trust-weights` — per-pipeline weight override (must sum to ~1.0)
+  - `DELETE /api/catalog/tables/{id}/trust-weights` — reset to global defaults
+
+- **Alert Narratives** (`api/server.py`, `agent/core.py`):
+  - `POST /api/observability/alerts/{id}/narrative` — Claude generates human-readable narrative from alert context, recent run errors, downstream count, freshness state
+  - Narrative saved on alert record for future reference
+  - `agent.generate_anomaly_narrative()` — structured prompt with pipeline tier, schedule, downstream impact
+
+- **Agent methods** (`agent/core.py`):
+  - `infer_semantic_tags()` — column-level tag inference from names, types, table context
+  - `generate_business_context_questions()` — targeted questions per pipeline
+  - `generate_anomaly_narrative()` — alert-to-prose conversion
+
+- **Documentation**:
+  - `docs/concepts/data-catalog.md` — full catalog API reference with curl examples
+  - `docs/advanced/trust-scores.md` — trust formula, component scoring, weight customization, worked examples
+  - `docs/concepts/anomaly-narratives.md` — narrative generation, context, cost
+
+#### Key Design Decisions
+- **Catalog is a read layer, not a separate store** — All catalog data derives from pipeline contracts and observability state already in PostgreSQL. No additional tables, no sync jobs, no external catalog service.
+- **AI-inferred tags never overwrite user tags** — User-provided tags (source=user) are preserved when re-running AI inference. This ensures human corrections are never lost.
+- **Trust scores handle partial data** — The weighted average only includes components that have data, so new pipelines still get meaningful scores even before all observability signals are established.
+- **Narratives are saved, not ephemeral** — Once generated, the narrative persists on the alert record. This avoids repeated LLM calls for the same alert.
+- **Semantic search includes business context** — The catalog search endpoint searches across business context answers and semantic tag text, not just technical metadata.
 
 ### Build 24: Agent Diagnostic & Reasoning Layer - 2026-03-21 (Claude Opus 4.6)
 
