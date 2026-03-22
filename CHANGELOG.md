@@ -32,6 +32,23 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 ## [Unreleased]
 
+### Build 30c: Runtime Agent Context — 2026-03-22 (Claude Opus 4.6)
+
+**Give the runtime agent full platform awareness. The system prompt was 4 generic lines — now it's a comprehensive platform context covering architecture, execution flow, two-tier autonomy, quality gate semantics, data patterns, and decision principles.**
+
+#### Changed
+- **Rich system prompt** (`agent/core.py`):
+  - Moved from inline 4-line string to module-level `_SYSTEM_PROMPT` constant (~1,250 tokens)
+  - Covers: DAPOS identity, 4-loop architecture, execution state machine, staging isolation
+  - Two-tier autonomy boundary (autonomous runtime vs propose-for-approval structural)
+  - All key concepts: connectors, refresh/load types, tiers, error budgets, contracts, schema drift policies, hooks, steps, transforms
+  - Quality gate: all 7 checks explained, agent's role as decision-maker (not just check executor)
+  - 8 supported data patterns (consume-and-merge, fan-in, SCD2, quarantine, etc.)
+  - 6 decision principles: idempotent-by-default, never delete unconsumed, conservative on quality, context over thresholds, downstream awareness, explain reasoning
+  - Cost: ~$0.004/call overhead (1,200 additional tokens vs old 50-token prompt)
+
+---
+
 ### Build 30b: Run Insights — 2026-03-22 (Claude Opus 4.6)
 
 **After every pipeline run, the agent analyzes results and generates actionable suggestions. Shown in the Activity view as an Insights card with one-click "Apply" buttons for configuration changes.**
