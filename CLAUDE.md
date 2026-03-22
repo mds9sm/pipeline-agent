@@ -79,7 +79,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `contracts/store.py` | PostgreSQL CRUD via asyncpg for all entities |
 | `connectors/registry.py` | exec()-based connector loader, validator, hot-reloader |
 | `connectors/seeds.py` | 8 seed connectors as string constants (MySQL, SQLite, MongoDB, Stripe, Google Ads, Facebook Insights sources + PostgreSQL, Redshift targets) |
-| `demo/bootstrap.py` | Auto-creates 4 demo pipelines on first startup with source profiling, semantic tags, business context, trust weights |
+| `demo/bootstrap.py` | Auto-creates 4 demo pipelines on first startup with source profiling, semantic tags, business context, trust weights, demo metrics (via chat + REST) |
 | `demo/mock-api/app.py` | Mock Stripe, Google Ads, Facebook Insights API service |
 | `source/base.py` | Abstract SourceEngine interface (INTERFACE_VERSION = "1.0") |
 | `target/base.py` | Abstract TargetEngine interface (INTERFACE_VERSION = "1.0") |

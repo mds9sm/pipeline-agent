@@ -76,6 +76,11 @@ Format: Each entry records what changed, why, and test results at the time of th
 
 #### Changed
 - `ui/index.html` — cache bust v=47 → v=48
+- **Demo bootstrap** (`demo/bootstrap.py`):
+  - `_bootstrap_demo_metrics()` — creates demo metrics via REST API + chat interaction
+  - Agent suggests metrics for orders pipeline via chat, then creates 3 predefined metrics (total_orders, avg_order_value, unique_customers) with agent-generated SQL
+  - Validates via chat by asking agent about metric trends
+  - Idempotent: skips if metrics already exist
 
 ---
 
