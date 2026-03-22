@@ -1056,3 +1056,62 @@ class BusinessKnowledge:
     custom_instructions: str = ""          # additional agent instructions from user
     updated_at: str = field(default_factory=now_iso)
     updated_by: str = ""
+
+
+# ── Build 34: Airflow Migration ──
+
+class MigrationStatus(str, Enum):
+    UPLOADING = "uploading"
+    PARSING = "parsing"
+    ANALYZING = "analyzing"
+    REVIEW = "review"
+    APPROVED = "approved"
+    EXECUTING = "executing"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    REJECTED = "rejected"
+
+
+@dataclass
+class ParsedAirflowDag:
+    """In-memory representation of one parsed Airflow DAG file."""
+    dag_id: str = ""
+    file_path: str = ""
+    schedule_interval: str = ""
+    default_args: dict = field(default_factory=dict)
+    tasks: list = field(default_factory=list)
+    connections_referenced: list = field(default_factory=list)
+    variables_referenced: list = field(default_factory=list)
+    python_imports: list = field(default_factory=list)
+    raw_code: str = ""
+    parse_warnings: list = field(default_factory=list)
+
+
+@dataclass
+class MigrationRecord:
+    """Tracks an Airflow-to-DAPOS migration lifecycle."""
+    migration_id: str = field(default_factory=new_id)
+    migration_name: str = ""
+    status: MigrationStatus = MigrationStatus.UPLOADING
+    uploaded_by: str = ""
+    upload_filename: str = ""
+    upload_size_bytes: int = 0
+    parsed_dags: list = field(default_factory=list)
+    parse_errors: list = field(default_factory=list)
+    total_dags_found: int = 0
+    total_tasks_found: int = 0
+    analysis: dict = field(default_factory=dict)
+    proposed_pipelines: list = field(default_factory=list)
+    proposed_transforms: list = field(default_factory=list)
+    proposed_connectors: list = field(default_factory=list)
+    proposed_dependencies: list = field(default_factory=list)
+    unmapped_tasks: list = field(default_factory=list)
+    agent_reasoning: str = ""
+    confidence: float = 0.0
+    created_pipeline_ids: list = field(default_factory=list)
+    created_transform_ids: list = field(default_factory=list)
+    created_connector_ids: list = field(default_factory=list)
+    execution_log: list = field(default_factory=list)
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
+    completed_at: Optional[str] = None

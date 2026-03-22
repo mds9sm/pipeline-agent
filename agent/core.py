@@ -607,6 +607,231 @@ Design the topology and respond with JSON:
             }
 
     # ------------------------------------------------------------------
+    # analyze_airflow_migration (Build 34)
+    # ------------------------------------------------------------------
+
+    async def analyze_airflow_migration(
+        self,
+        parsed_dags: list[dict],
+        existing_pipelines: Optional[list[dict]] = None,
+        existing_connectors: Optional[list[dict]] = None,
+    ) -> dict:
+        """Analyze parsed Airflow DAGs and propose DAPOS equivalents.
+
+        Returns a structured migration plan with proposed pipelines, transforms,
+        connectors, dependencies, and unmapped tasks.
+        """
+        if not self.has_api:
+            return self._rule_based_airflow_migration(parsed_dags)
+
+        existing_text = ""
+        if existing_pipelines:
+            lines = [f"  - {p.get('pipeline_name', '?')}: {p.get('source', '?')} -> {p.get('target', '?')}" for p in existing_pipelines[:20]]
+            existing_text += "\n\nExisting DAPOS pipelines:\n" + "\n".join(lines)
+        if existing_connectors:
+            lines = [f"  - {c.get('connector_name', '?')} ({c.get('connector_type', '?')}, {c.get('source_target_type', '?')})" for c in existing_connectors[:20]]
+            existing_text += "\n\nAvailable DAPOS connectors:\n" + "\n".join(lines)
+
+        # Summarize parsed DAGs for the prompt (truncate raw_code)
+        dag_summaries = []
+        for dag in parsed_dags[:30]:  # Limit to 30 DAGs per analysis batch
+            summary = {
+                "dag_id": dag.get("dag_id", ""),
+                "file_path": dag.get("file_path", ""),
+                "schedule_interval": dag.get("schedule_interval", ""),
+                "tasks": [],
+                "connections": dag.get("connections_referenced", []),
+                "variables": dag.get("variables_referenced", []),
+            }
+            for task in dag.get("tasks", []):
+                summary["tasks"].append({
+                    "task_id": task.get("task_id", ""),
+                    "operator_class": task.get("operator_class", ""),
+                    "sql": task.get("sql", "")[:500],
+                    "python_callable": task.get("python_callable", ""),
+                    "bash_command": task.get("bash_command", "")[:200],
+                    "connection_id": task.get("connection_id", ""),
+                    "depends_on": task.get("depends_on", []),
+                    "dapos_mapping": task.get("dapos_mapping", {}),
+                })
+            dag_summaries.append(summary)
+
+        user_prompt = f"""
+You are migrating Airflow DAGs to DAPOS (an agentic data platform).
+Analyze these parsed Airflow DAGs and propose the optimal DAPOS equivalent.
+
+DAPOS capabilities:
+- Pipelines: source connector -> target connector, with schedule_cron, quality gates
+- SQL Transforms: ref() for dependencies, var() for variables, 4 materialization strategies (table, view, incremental, ephemeral)
+- Step DAGs: compose steps (extract, transform, quality_gate, promote, cleanup, hook, sensor, custom)
+- Dependencies: pipelines can trigger downstream pipelines on completion
+- Data contracts: formalize producer/consumer relationships with freshness SLAs
+
+Parsed Airflow DAGs:
+{json.dumps(dag_summaries, indent=2, default=str)}
+{existing_text}
+
+For each Airflow DAG, propose the DAPOS equivalent. Respond with JSON:
+{{
+  "summary": "Overall migration assessment",
+  "confidence": 0.0-1.0,
+  "proposed_pipelines": [
+    {{
+      "name": "pipeline-name",
+      "description": "what this pipeline does",
+      "source_dag_id": "original airflow dag_id",
+      "source_tasks": ["task_ids this maps from"],
+      "source_type": "connector type (e.g., mysql, postgresql, s3)",
+      "target_type": "connector type",
+      "refresh_type": "full or incremental",
+      "load_type": "append or merge",
+      "schedule_cron": "cron expression (converted from Airflow schedule_interval)",
+      "tier": 1-3,
+      "needs_new_connector": true/false
+    }}
+  ],
+  "proposed_transforms": [
+    {{
+      "name": "transform-name",
+      "description": "what this transform does",
+      "source_dag_id": "original airflow dag_id",
+      "source_task_id": "original airflow task_id",
+      "sql": "the SQL (converted from Airflow operator)",
+      "materialization": "table/view/incremental/ephemeral",
+      "refs": ["upstream transform/pipeline names this depends on"]
+    }}
+  ],
+  "proposed_connectors": [
+    {{
+      "connector_name": "name",
+      "connector_type": "type",
+      "source_target_type": "source or target",
+      "reason": "why this connector is needed"
+    }}
+  ],
+  "proposed_dependencies": [
+    {{
+      "from": "upstream-pipeline-or-transform",
+      "to": "downstream-pipeline-or-transform",
+      "type": "data_triggered or scheduled"
+    }}
+  ],
+  "unmapped_tasks": [
+    {{
+      "dag_id": "source dag",
+      "task_id": "task that couldn't be mapped",
+      "operator_class": "original operator",
+      "reason": "why it can't be mapped",
+      "suggestion": "what the user should do manually"
+    }}
+  ],
+  "connection_mapping": {{
+    "airflow_conn_id": {{
+      "dapos_connector_type": "type",
+      "notes": "user needs to provide credentials for this connection"
+    }}
+  }},
+  "warnings": ["any important migration warnings"],
+  "reasoning": "detailed explanation of migration decisions"
+}}
+
+IMPORTANT:
+- Convert Airflow schedule presets: @daily -> "0 0 * * *", @hourly -> "0 * * * *", etc.
+- SQL operators map to DAPOS SQL Transforms
+- Transfer operators (S3ToRedshift, etc.) map to DAPOS pipelines
+- PythonOperator/BashOperator should be flagged as unmapped with suggestions
+- Sensors map to DAPOS event-driven triggers or dependencies
+- Preserve the dependency graph structure
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                operation="analyze_airflow_migration",
+                temperature=0.2,
+            )
+            result = self._extract_json(text)
+            result.setdefault("proposed_pipelines", [])
+            result.setdefault("proposed_transforms", [])
+            result.setdefault("proposed_connectors", [])
+            result.setdefault("proposed_dependencies", [])
+            result.setdefault("unmapped_tasks", [])
+            result.setdefault("summary", "")
+            result.setdefault("confidence", 0.0)
+            result.setdefault("reasoning", "")
+            return result
+        except Exception as e:
+            log.warning("Claude API error in analyze_airflow_migration: %s", e)
+            return self._rule_based_airflow_migration(parsed_dags)
+
+    def _rule_based_airflow_migration(self, parsed_dags: list[dict]) -> dict:
+        """Rule-based fallback for Airflow migration analysis."""
+        from migration.airflow_parser import OPERATOR_MAP
+
+        proposed_pipelines = []
+        proposed_transforms = []
+        unmapped = []
+
+        schedule_map = {
+            "@daily": "0 0 * * *", "@hourly": "0 * * * *",
+            "@weekly": "0 0 * * 0", "@monthly": "0 0 1 * *",
+            "@yearly": "0 0 1 1 *", "@once": "",
+        }
+
+        for dag in parsed_dags:
+            dag_id = dag.get("dag_id", "unknown")
+            schedule = dag.get("schedule_interval", "")
+            cron = schedule_map.get(schedule, schedule)
+
+            for task in dag.get("tasks", []):
+                op = task.get("operator_class", "")
+                mapping = OPERATOR_MAP.get(op, {})
+                dapos_type = mapping.get("dapos_type", "custom")
+                task_id = task.get("task_id", "unknown")
+
+                if dapos_type == "pipeline":
+                    proposed_pipelines.append({
+                        "name": f"{dag_id}-{task_id}",
+                        "source_dag_id": dag_id,
+                        "source_tasks": [task_id],
+                        "source_type": mapping.get("source", "generic"),
+                        "target_type": mapping.get("target", "generic"),
+                        "schedule_cron": cron,
+                        "refresh_type": "full",
+                        "load_type": "append",
+                        "tier": 2,
+                        "needs_new_connector": True,
+                    })
+                elif dapos_type == "transform":
+                    proposed_transforms.append({
+                        "name": f"{dag_id}-{task_id}",
+                        "source_dag_id": dag_id,
+                        "source_task_id": task_id,
+                        "sql": task.get("sql", ""),
+                        "materialization": "table",
+                    })
+                elif dapos_type in ("custom", "unsupported"):
+                    unmapped.append({
+                        "dag_id": dag_id,
+                        "task_id": task_id,
+                        "operator_class": op,
+                        "reason": mapping.get("reason", f"{op} requires manual review"),
+                        "suggestion": "Implement as a custom step or external process",
+                    })
+                # omit and sensor/hook handled separately
+
+        return {
+            "summary": f"Rule-based analysis: {len(parsed_dags)} DAGs parsed. API key required for detailed analysis.",
+            "confidence": 0.3,
+            "proposed_pipelines": proposed_pipelines,
+            "proposed_transforms": proposed_transforms,
+            "proposed_connectors": [],
+            "proposed_dependencies": [],
+            "unmapped_tasks": unmapped,
+            "reasoning": "Rule-based fallback (no API key). Operator types mapped mechanically.",
+            "warnings": ["Agent-based analysis unavailable — results are approximate."],
+        }
+
+    # ------------------------------------------------------------------
     # analyze_drift
     # ------------------------------------------------------------------
 
@@ -2104,6 +2329,7 @@ Available actions:
 - check_anomalies: Check for platform-wide anomalies and unusual patterns (params: none)
 - suggest_metrics: Suggest KPI metrics for a pipeline's target table (params: pipeline_name or pipeline_id)
 - interpret_metric_trend: Analyze trends in a metric (params: metric_name or metric_id)
+- migrate_airflow: Migrate Airflow DAGs to DAPOS (params: description of what they want to migrate)
 - explain: Explain something about the system (params: topic)
 - unknown: Could not determine intent
 

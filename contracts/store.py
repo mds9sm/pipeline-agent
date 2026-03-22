@@ -21,6 +21,7 @@ from contracts.models import (
     PipelineChangeType, RegisteredSource, SqlTransform, MaterializationType,
     MetricDefinition, MetricSnapshot, MetricType, RunContext, BusinessKnowledge,
     ColumnMapping, QualityConfig, CheckResult,
+    MigrationRecord, MigrationStatus,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
     ChangeType, ConnectorStatus, ConnectorType, TestStatus, AlertSeverity,
@@ -1882,6 +1883,76 @@ class ContractStore:
         )
 
 
+    # ==================================================================
+    # Build 34: Airflow Migration
+    # ==================================================================
+
+    async def save_migration(self, m: MigrationRecord) -> None:
+        m.updated_at = now_iso()
+        st = m.status.value if hasattr(m.status, "value") else m.status
+        await self.pool.execute("""
+            INSERT INTO migrations (
+                migration_id, migration_name, status, uploaded_by,
+                upload_filename, upload_size_bytes,
+                parsed_dags, parse_errors, total_dags_found, total_tasks_found,
+                analysis, proposed_pipelines, proposed_transforms,
+                proposed_connectors, proposed_dependencies, unmapped_tasks,
+                agent_reasoning, confidence,
+                created_pipeline_ids, created_transform_ids, created_connector_ids,
+                execution_log, created_at, updated_at, completed_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+            ON CONFLICT (migration_id) DO UPDATE SET
+                migration_name=EXCLUDED.migration_name, status=EXCLUDED.status,
+                parsed_dags=EXCLUDED.parsed_dags, parse_errors=EXCLUDED.parse_errors,
+                total_dags_found=EXCLUDED.total_dags_found, total_tasks_found=EXCLUDED.total_tasks_found,
+                analysis=EXCLUDED.analysis,
+                proposed_pipelines=EXCLUDED.proposed_pipelines,
+                proposed_transforms=EXCLUDED.proposed_transforms,
+                proposed_connectors=EXCLUDED.proposed_connectors,
+                proposed_dependencies=EXCLUDED.proposed_dependencies,
+                unmapped_tasks=EXCLUDED.unmapped_tasks,
+                agent_reasoning=EXCLUDED.agent_reasoning, confidence=EXCLUDED.confidence,
+                created_pipeline_ids=EXCLUDED.created_pipeline_ids,
+                created_transform_ids=EXCLUDED.created_transform_ids,
+                created_connector_ids=EXCLUDED.created_connector_ids,
+                execution_log=EXCLUDED.execution_log,
+                updated_at=EXCLUDED.updated_at, completed_at=EXCLUDED.completed_at
+        """,
+            m.migration_id, m.migration_name, st, m.uploaded_by,
+            m.upload_filename, m.upload_size_bytes,
+            json.dumps(m.parsed_dags), json.dumps(m.parse_errors),
+            m.total_dags_found, m.total_tasks_found,
+            json.dumps(m.analysis), json.dumps(m.proposed_pipelines),
+            json.dumps(m.proposed_transforms), json.dumps(m.proposed_connectors),
+            json.dumps(m.proposed_dependencies), json.dumps(m.unmapped_tasks),
+            m.agent_reasoning, m.confidence,
+            json.dumps(m.created_pipeline_ids), json.dumps(m.created_transform_ids),
+            json.dumps(m.created_connector_ids), json.dumps(m.execution_log),
+            m.created_at, m.updated_at, m.completed_at,
+        )
+
+    async def get_migration(self, migration_id: str) -> Optional[MigrationRecord]:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM migrations WHERE migration_id = $1", migration_id
+        )
+        return _row_to_migration(row) if row else None
+
+    async def list_migrations(self, status: str = "") -> list[MigrationRecord]:
+        if status:
+            rows = await self.pool.fetch(
+                "SELECT * FROM migrations WHERE status = $1 ORDER BY created_at DESC", status
+            )
+        else:
+            rows = await self.pool.fetch("SELECT * FROM migrations ORDER BY created_at DESC")
+        return [_row_to_migration(r) for r in rows]
+
+    async def delete_migration(self, migration_id: str) -> bool:
+        result = await self.pool.execute(
+            "DELETE FROM migrations WHERE migration_id = $1", migration_id
+        )
+        return "DELETE 1" in result
+
+
 # ======================================================================
 # Row-to-model helpers (module-level, stateless)
 # ======================================================================
@@ -2844,6 +2915,34 @@ CREATE TABLE IF NOT EXISTS metric_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_metric_snapshots_metric ON metric_snapshots(metric_id, computed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_metric_snapshots_pipeline ON metric_snapshots(pipeline_id, computed_at DESC);
+
+CREATE TABLE IF NOT EXISTS migrations (
+    migration_id TEXT PRIMARY KEY,
+    migration_name TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'uploading',
+    uploaded_by TEXT NOT NULL DEFAULT '',
+    upload_filename TEXT NOT NULL DEFAULT '',
+    upload_size_bytes BIGINT NOT NULL DEFAULT 0,
+    parsed_dags JSONB NOT NULL DEFAULT '[]',
+    parse_errors JSONB NOT NULL DEFAULT '[]',
+    total_dags_found INTEGER NOT NULL DEFAULT 0,
+    total_tasks_found INTEGER NOT NULL DEFAULT 0,
+    analysis JSONB NOT NULL DEFAULT '{}',
+    proposed_pipelines JSONB NOT NULL DEFAULT '[]',
+    proposed_transforms JSONB NOT NULL DEFAULT '[]',
+    proposed_connectors JSONB NOT NULL DEFAULT '[]',
+    proposed_dependencies JSONB NOT NULL DEFAULT '[]',
+    unmapped_tasks JSONB NOT NULL DEFAULT '[]',
+    agent_reasoning TEXT NOT NULL DEFAULT '',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    created_pipeline_ids JSONB NOT NULL DEFAULT '[]',
+    created_transform_ids JSONB NOT NULL DEFAULT '[]',
+    created_connector_ids JSONB NOT NULL DEFAULT '[]',
+    execution_log JSONB NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
 """
 
 _ALTER_TABLES_SQL = """
@@ -2885,6 +2984,41 @@ CREATE TABLE IF NOT EXISTS business_knowledge (
     updated_by TEXT NOT NULL DEFAULT ''
 );
 """
+
+def _row_to_migration(row: asyncpg.Record) -> MigrationRecord:
+    st = row.get("status", "uploading")
+    try:
+        st = MigrationStatus(st)
+    except ValueError:
+        st = MigrationStatus.UPLOADING
+    return MigrationRecord(
+        migration_id=row["migration_id"],
+        migration_name=row.get("migration_name", ""),
+        status=st,
+        uploaded_by=row.get("uploaded_by", ""),
+        upload_filename=row.get("upload_filename", ""),
+        upload_size_bytes=row.get("upload_size_bytes", 0),
+        parsed_dags=json.loads(row["parsed_dags"]) if row.get("parsed_dags") else [],
+        parse_errors=json.loads(row["parse_errors"]) if row.get("parse_errors") else [],
+        total_dags_found=row.get("total_dags_found", 0),
+        total_tasks_found=row.get("total_tasks_found", 0),
+        analysis=json.loads(row["analysis"]) if row.get("analysis") else {},
+        proposed_pipelines=json.loads(row["proposed_pipelines"]) if row.get("proposed_pipelines") else [],
+        proposed_transforms=json.loads(row["proposed_transforms"]) if row.get("proposed_transforms") else [],
+        proposed_connectors=json.loads(row["proposed_connectors"]) if row.get("proposed_connectors") else [],
+        proposed_dependencies=json.loads(row["proposed_dependencies"]) if row.get("proposed_dependencies") else [],
+        unmapped_tasks=json.loads(row["unmapped_tasks"]) if row.get("unmapped_tasks") else [],
+        agent_reasoning=row.get("agent_reasoning", ""),
+        confidence=row.get("confidence", 0.0),
+        created_pipeline_ids=json.loads(row["created_pipeline_ids"]) if row.get("created_pipeline_ids") else [],
+        created_transform_ids=json.loads(row["created_transform_ids"]) if row.get("created_transform_ids") else [],
+        created_connector_ids=json.loads(row["created_connector_ids"]) if row.get("created_connector_ids") else [],
+        execution_log=json.loads(row["execution_log"]) if row.get("execution_log") else [],
+        created_at=row.get("created_at", ""),
+        updated_at=row.get("updated_at", ""),
+        completed_at=row.get("completed_at"),
+    )
+
 
 # Alias used by several modules (agent, scheduler, monitor, api).
 Store = ContractStore

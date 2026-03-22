@@ -34,6 +34,7 @@ from contracts.models import (
     PipelineChangeLog, PipelineChangeType, RegisteredSource,
     StepDefinition, StepType, CheckStatus,
     SqlTransform, MaterializationType,
+    MigrationRecord, MigrationStatus,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -1020,6 +1021,22 @@ def create_app(
                 result_data = {
                     "topology": topology,
                     "fallback_text": "\n".join(lines) if lines else "Could not generate topology.",
+                }
+
+            # Build 34: Airflow migration chat routing
+            elif action == "migrate_airflow":
+                result_data = {
+                    "fallback_text": (
+                        "To migrate Airflow DAGs to DAPOS:\n\n"
+                        "1. Go to **Pipelines** > **Migrate from Airflow** (or use the API)\n"
+                        "2. Upload a .zip or .tar.gz of your Airflow DAGs folder\n"
+                        "3. The agent will parse your DAGs and propose DAPOS equivalents\n"
+                        "4. Review and approve the migration plan\n"
+                        "5. Execute to create pipelines, transforms, and dependencies\n\n"
+                        "**API:** `POST /api/migration/upload` with your archive as the request body or multipart form.\n\n"
+                        "The agent maps SQL operators to transforms, transfer operators to pipelines, "
+                        "sensors to dependencies, and flags PythonOperator/BashOperator tasks for manual review."
+                    ),
                 }
 
             # Build 24: Diagnostic & Reasoning actions
@@ -3330,6 +3347,293 @@ def create_app(
             ],
         )
         return topology
+
+    # -----------------------------------------------------------------------
+    # Airflow Migration (Build 34)
+    # -----------------------------------------------------------------------
+
+    @app.post("/api/migration/upload")
+    @limiter.limit("5/minute")
+    async def migration_upload(request: Request, caller: dict = Depends(auth_dep)):
+        """Upload an Airflow DAG archive (zip/tar.gz) for migration analysis."""
+        require_role(caller, "admin", "operator")
+
+        from migration.airflow_parser import parse_archive
+
+        content_type = request.headers.get("content-type", "")
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            upload = form.get("file")
+            if not upload:
+                raise HTTPException(400, "No file uploaded. Use multipart form with 'file' field.")
+            file_bytes = await upload.read()
+            filename = getattr(upload, "filename", "upload.zip") or "upload.zip"
+        else:
+            file_bytes = await request.body()
+            filename = request.headers.get("x-filename", "upload.zip")
+
+        if len(file_bytes) > 50 * 1024 * 1024:
+            raise HTTPException(400, "File too large (max 50MB)")
+        if len(file_bytes) < 10:
+            raise HTTPException(400, "File is empty or too small")
+
+        migration = MigrationRecord(
+            migration_name=os.path.splitext(filename)[0],
+            status=MigrationStatus.PARSING,
+            uploaded_by=caller.get("username", "unknown"),
+            upload_filename=filename,
+            upload_size_bytes=len(file_bytes),
+        )
+
+        # Parse the archive
+        parsed_dags, parse_errors = parse_archive(file_bytes, filename)
+        migration.parsed_dags = parsed_dags
+        migration.parse_errors = parse_errors
+        migration.total_dags_found = len(parsed_dags)
+        migration.total_tasks_found = sum(len(d.get("tasks", [])) for d in parsed_dags)
+
+        if not parsed_dags and parse_errors:
+            migration.status = MigrationStatus.FAILED
+            migration.agent_reasoning = "No valid DAGs found in the uploaded archive."
+            await store.save_migration(migration)
+            return {
+                "migration_id": migration.migration_id,
+                "status": "failed",
+                "parse_errors": parse_errors,
+                "message": "No valid Airflow DAGs found.",
+            }
+
+        # Analyze with agent
+        migration.status = MigrationStatus.ANALYZING
+        await store.save_migration(migration)
+
+        existing_p = await store.list_pipelines()
+        existing_c = await store.list_connectors(status="active")
+        analysis = await agent.analyze_airflow_migration(
+            parsed_dags,
+            existing_pipelines=[_pipeline_summary(p) for p in existing_p],
+            existing_connectors=[
+                {"connector_name": c.connector_name, "connector_type": c.connector_type.value, "source_target_type": c.source_target_type}
+                for c in existing_c
+            ],
+        )
+
+        migration.status = MigrationStatus.REVIEW
+        migration.analysis = analysis
+        migration.proposed_pipelines = analysis.get("proposed_pipelines", [])
+        migration.proposed_transforms = analysis.get("proposed_transforms", [])
+        migration.proposed_connectors = analysis.get("proposed_connectors", [])
+        migration.proposed_dependencies = analysis.get("proposed_dependencies", [])
+        migration.unmapped_tasks = analysis.get("unmapped_tasks", [])
+        migration.agent_reasoning = analysis.get("reasoning", "")
+        migration.confidence = analysis.get("confidence", 0.0)
+        await store.save_migration(migration)
+
+        return {
+            "migration_id": migration.migration_id,
+            "status": "review",
+            "summary": analysis.get("summary", ""),
+            "confidence": migration.confidence,
+            "total_dags": migration.total_dags_found,
+            "total_tasks": migration.total_tasks_found,
+            "proposed_pipelines": len(migration.proposed_pipelines),
+            "proposed_transforms": len(migration.proposed_transforms),
+            "proposed_connectors": len(migration.proposed_connectors),
+            "unmapped_tasks": len(migration.unmapped_tasks),
+            "warnings": analysis.get("warnings", []),
+        }
+
+    @app.get("/api/migration")
+    @limiter.limit("60/minute")
+    async def list_migrations(
+        request: Request,
+        status: str = "",
+        caller: dict = Depends(auth_dep),
+    ):
+        migrations = await store.list_migrations(status=status)
+        return [
+            {
+                "migration_id": m.migration_id,
+                "migration_name": m.migration_name,
+                "status": m.status.value if hasattr(m.status, "value") else m.status,
+                "uploaded_by": m.uploaded_by,
+                "upload_filename": m.upload_filename,
+                "total_dags_found": m.total_dags_found,
+                "total_tasks_found": m.total_tasks_found,
+                "confidence": m.confidence,
+                "proposed_pipelines": len(m.proposed_pipelines),
+                "proposed_transforms": len(m.proposed_transforms),
+                "unmapped_tasks": len(m.unmapped_tasks),
+                "created_at": m.created_at,
+            }
+            for m in migrations
+        ]
+
+    @app.get("/api/migration/{migration_id}")
+    @limiter.limit("60/minute")
+    async def get_migration(
+        request: Request,
+        migration_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        m = await store.get_migration(migration_id)
+        if not m:
+            raise HTTPException(404, "Migration not found")
+        return asdict(m)
+
+    @app.post("/api/migration/{migration_id}/approve")
+    @limiter.limit("10/minute")
+    async def approve_migration(
+        request: Request,
+        migration_id: str,
+        body: dict = Body({}),
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        m = await store.get_migration(migration_id)
+        if not m:
+            raise HTTPException(404, "Migration not found")
+        if m.status != MigrationStatus.REVIEW:
+            raise HTTPException(400, f"Migration is in '{m.status.value}' status, not 'review'")
+
+        # Optional: filter which items to approve
+        pipeline_selections = body.get("pipeline_selections", [])
+        transform_selections = body.get("transform_selections", [])
+
+        if pipeline_selections:
+            m.proposed_pipelines = [p for p in m.proposed_pipelines if p.get("name") in pipeline_selections]
+        if transform_selections:
+            m.proposed_transforms = [t for t in m.proposed_transforms if t.get("name") in transform_selections]
+
+        m.status = MigrationStatus.APPROVED
+        await store.save_migration(m)
+
+        return {"status": "approved", "migration_id": migration_id}
+
+    @app.post("/api/migration/{migration_id}/reject")
+    @limiter.limit("10/minute")
+    async def reject_migration(
+        request: Request,
+        migration_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin", "operator")
+        m = await store.get_migration(migration_id)
+        if not m:
+            raise HTTPException(404, "Migration not found")
+        m.status = MigrationStatus.REJECTED
+        await store.save_migration(m)
+        return {"status": "rejected", "migration_id": migration_id}
+
+    @app.post("/api/migration/{migration_id}/execute")
+    @limiter.limit("5/minute")
+    async def execute_migration(
+        request: Request,
+        migration_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Execute an approved migration — create pipelines, transforms, dependencies."""
+        require_role(caller, "admin", "operator")
+        m = await store.get_migration(migration_id)
+        if not m:
+            raise HTTPException(404, "Migration not found")
+        if m.status != MigrationStatus.APPROVED:
+            raise HTTPException(400, f"Migration must be approved first (current: {m.status.value})")
+
+        m.status = MigrationStatus.EXECUTING
+        await store.save_migration(m)
+
+        created_pipelines = []
+        created_transforms = []
+        exec_log = []
+
+        try:
+            # Create pipelines
+            for pp in m.proposed_pipelines:
+                try:
+                    from contracts.models import PipelineContract
+                    p = PipelineContract(
+                        pipeline_name=pp.get("name", f"migrated-{new_id()[:8]}"),
+                        source_connector_type=pp.get("source_type", ""),
+                        target_connector_type=pp.get("target_type", ""),
+                        schedule_cron=pp.get("schedule_cron", ""),
+                        refresh_type=pp.get("refresh_type", "full"),
+                        load_type=pp.get("load_type", "append"),
+                        tier=pp.get("tier", 2),
+                        description=pp.get("description", f"Migrated from Airflow DAG: {pp.get('source_dag_id', '')}"),
+                    )
+                    await store.save_pipeline(p)
+                    created_pipelines.append(p.pipeline_id)
+                    exec_log.append({"action": "create_pipeline", "name": p.pipeline_name, "id": p.pipeline_id, "status": "ok"})
+                except Exception as e:
+                    exec_log.append({"action": "create_pipeline", "name": pp.get("name", "?"), "status": "error", "error": str(e)})
+
+            # Create transforms
+            for pt in m.proposed_transforms:
+                try:
+                    t = SqlTransform(
+                        transform_name=pt.get("name", f"migrated-{new_id()[:8]}"),
+                        description=pt.get("description", f"Migrated from Airflow: {pt.get('source_dag_id', '')}/{pt.get('source_task_id', '')}"),
+                        sql=pt.get("sql", ""),
+                        materialization=pt.get("materialization", "table"),
+                    )
+                    await store.save_sql_transform(t)
+                    created_transforms.append(t.transform_id)
+                    exec_log.append({"action": "create_transform", "name": t.transform_name, "id": t.transform_id, "status": "ok"})
+                except Exception as e:
+                    exec_log.append({"action": "create_transform", "name": pt.get("name", "?"), "status": "error", "error": str(e)})
+
+            # Create dependencies
+            for dep in m.proposed_dependencies:
+                try:
+                    # Resolve pipeline names to IDs
+                    all_p = await store.list_pipelines()
+                    name_to_id = {p.pipeline_name: p.pipeline_id for p in all_p}
+                    from_id = name_to_id.get(dep.get("from", ""), "")
+                    to_id = name_to_id.get(dep.get("to", ""), "")
+                    if from_id and to_id:
+                        d = PipelineDependency(
+                            pipeline_id=to_id,
+                            depends_on_pipeline_id=from_id,
+                            dependency_type=dep.get("type", "data_triggered"),
+                        )
+                        await store.save_dependency(d)
+                        exec_log.append({"action": "create_dependency", "from": dep.get("from"), "to": dep.get("to"), "status": "ok"})
+                except Exception as e:
+                    exec_log.append({"action": "create_dependency", "status": "error", "error": str(e)})
+
+            m.status = MigrationStatus.COMPLETE
+            m.created_pipeline_ids = created_pipelines
+            m.created_transform_ids = created_transforms
+            m.execution_log = exec_log
+            m.completed_at = now_iso()
+            await store.save_migration(m)
+
+            return {
+                "status": "complete",
+                "created_pipelines": len(created_pipelines),
+                "created_transforms": len(created_transforms),
+                "execution_log": exec_log,
+            }
+
+        except Exception as e:
+            m.status = MigrationStatus.FAILED
+            m.execution_log = exec_log
+            await store.save_migration(m)
+            raise HTTPException(500, f"Migration execution failed: {e}")
+
+    @app.delete("/api/migration/{migration_id}")
+    @limiter.limit("10/minute")
+    async def delete_migration(
+        request: Request,
+        migration_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        require_role(caller, "admin")
+        deleted = await store.delete_migration(migration_id)
+        if not deleted:
+            raise HTTPException(404, "Migration not found")
+        return {"status": "deleted"}
 
     # -----------------------------------------------------------------------
     # DAG visualization (Build 19)

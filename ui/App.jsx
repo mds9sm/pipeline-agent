@@ -38,6 +38,22 @@ async function api(method, path, body) {
 }
 
 // ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+function getThemePref() {
+  return localStorage.getItem("pa_theme") || "light";
+}
+
+function applyTheme(theme) {
+  const resolved = theme === "system"
+    ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+    : theme;
+  document.documentElement.classList.toggle("dark", resolved === "dark");
+  return resolved;
+}
+
+// ---------------------------------------------------------------------------
 // Shared UI components
 // ---------------------------------------------------------------------------
 
@@ -86,6 +102,7 @@ function NavIcon({ id }) {
     alerts: <svg {...p}><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>,
     metrics: <svg {...p}><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>,
     settings: <svg {...p}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
+    migration: <svg {...p}><path d="M5 9l7-7 7 7"/><path d="M12 2v14"/><path d="M19 15l-7 7-7-7"/></svg>,
     agent: <svg {...p}><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg>,
     docs: <svg {...p}><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>,
   };
@@ -673,7 +690,7 @@ function ConnectorCodeSection({ sourceConnectorId, targetConnectorId }) {
 // Login component
 // ---------------------------------------------------------------------------
 
-function Login({ onLogin }) {
+function Login({ onLogin, isDark }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -696,30 +713,30 @@ function Login({ onLogin }) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50">
-      <div className="w-96 bg-white border border-slate-200 rounded-xl p-8 shadow-lg">
+    <div className={`min-h-screen flex items-center justify-center ${isDark ? "bg-slate-900" : "bg-slate-50"}`}>
+      <div className={`w-96 ${isDark ? "bg-slate-800 border-slate-700" : "bg-white border-slate-200"} border rounded-xl p-8 shadow-lg`}>
         <div className="text-center mb-8">
           <div className="flex justify-center mb-3"><DefaultLogo size={48} /></div>
-          <div className="text-2xl font-semibold text-slate-800 font-ui tracking-wide">DAPOS</div>
-          <div className="text-sm text-slate-400 mt-1">Sign in to continue</div>
+          <div className={`text-2xl font-semibold ${isDark ? "text-white" : "text-slate-800"} font-ui tracking-wide`}>DAPOS</div>
+          <div className={`text-sm ${isDark ? "text-slate-400" : "text-slate-400"} mt-1`}>Sign in to continue</div>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-xs text-slate-400 mb-1.5">Username</label>
+            <label className={`block text-xs ${isDark ? "text-slate-400" : "text-slate-400"} mb-1.5`}>Username</label>
             <input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className="w-full px-4 py-2.5 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-700 outline-none focus:border-blue-500"
+              className={`w-full px-4 py-2.5 ${isDark ? "bg-slate-700 border-slate-600 text-slate-200" : "bg-slate-50 border-slate-300 text-slate-700"} border rounded-lg text-sm outline-none focus:border-blue-500`}
               autoFocus
             />
           </div>
           <div>
-            <label className="block text-xs text-slate-400 mb-1.5">Password</label>
+            <label className={`block text-xs ${isDark ? "text-slate-400" : "text-slate-400"} mb-1.5`}>Password</label>
             <input
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full px-4 py-2.5 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-700 outline-none focus:border-blue-500"
+              className={`w-full px-4 py-2.5 ${isDark ? "bg-slate-700 border-slate-600 text-slate-200" : "bg-slate-50 border-slate-300 text-slate-700"} border rounded-lg text-sm outline-none focus:border-blue-500`}
             />
           </div>
           {error && <div className="text-xs text-red-600 bg-red-50 border border-red-200/50 rounded-lg px-3 py-2">{error}</div>}
@@ -800,19 +817,37 @@ const NAV = [
   { id: "connectors", label: "Connectors" },
   { id: "alerts", label: "Alerts" },
   { id: "metrics", label: "Metrics" },
+  { id: "migration", label: "Migration" },
   { id: "settings", label: "Settings" },
   { id: "agent", label: "Agent" },
   { id: "docs", label: "Docs" },
 ];
 
-function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSearchQuery, user, onLogout, guideStep, onGuideNav, branding }) {
+function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSearchQuery, user, onLogout, guideStep, onGuideNav, branding, isDark }) {
   const guideId = guideStep !== null ? GUIDE_ORDER[guideStep] : null;
   const appName = branding?.app_name || "DAPOS";
   const logoUrl = branding?.logo_url || "";
 
+  // Light sidebar: white bg, slate text.  Dark sidebar: slate-950 bg, light text.
+  const sb = isDark
+    ? { bg: "bg-slate-950", border: "border-slate-800", activeBg: "bg-slate-800", activeText: "text-white",
+        inactiveText: "text-slate-400", hoverBg: "hover:bg-slate-900", hoverText: "hover:text-slate-200",
+        inputBg: "bg-slate-900", inputBorder: "border-slate-700", inputText: "text-slate-300", inputFocus: "focus:bg-slate-800",
+        filterInactive: "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200",
+        title: "text-white", subtitle: "text-slate-500", userText: "text-slate-300", roleText: "text-slate-600",
+        logoutText: "text-slate-500 hover:text-slate-300 hover:bg-slate-800", ring: "ring-offset-slate-950",
+        placeholder: "placeholder-slate-600", clearBtn: "text-slate-500 hover:text-slate-300" }
+    : { bg: "bg-white", border: "border-slate-200", activeBg: "bg-slate-100", activeText: "text-slate-900",
+        inactiveText: "text-slate-500", hoverBg: "hover:bg-slate-50", hoverText: "hover:text-slate-700",
+        inputBg: "bg-slate-50", inputBorder: "border-slate-300", inputText: "text-slate-700", inputFocus: "focus:bg-white",
+        filterInactive: "bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700",
+        title: "text-slate-900", subtitle: "text-slate-400", userText: "text-slate-700", roleText: "text-slate-400",
+        logoutText: "text-slate-400 hover:text-slate-600 hover:bg-slate-100", ring: "ring-offset-white",
+        placeholder: "placeholder-slate-400", clearBtn: "text-slate-400 hover:text-slate-600" };
+
   return (
-    <div className="w-56 min-h-screen bg-slate-950 flex flex-col shrink-0">
-      <div className="px-4 py-4 border-b border-slate-800">
+    <div className={`w-56 min-h-screen ${sb.bg} flex flex-col shrink-0 border-r ${sb.border}`}>
+      <div className={`px-4 py-4 border-b ${sb.border}`}>
         <div className="flex items-center gap-2.5">
           <div className="shrink-0">
             {logoUrl ? (
@@ -822,8 +857,8 @@ function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSea
             )}
           </div>
           <div>
-            <div className="text-sm font-semibold text-white font-ui tracking-wide">{appName}</div>
-            <div className="text-[10px] text-slate-500">Agentic Data Platform</div>
+            <div className={`text-sm font-semibold ${sb.title} font-ui tracking-wide`}>{appName}</div>
+            <div className={`text-[10px] ${sb.subtitle}`}>Agentic Data Platform</div>
           </div>
         </div>
       </div>
@@ -842,9 +877,9 @@ function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSea
               }}
               className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors ${
                 view === n.id
-                  ? "bg-slate-800 text-white font-medium"
-                  : "text-slate-400 hover:bg-slate-900 hover:text-slate-200"
-              } ${isGuideTarget ? "ring-2 ring-blue-400 ring-offset-1 ring-offset-slate-950" : ""}`}
+                  ? `${sb.activeBg} ${sb.activeText} font-medium`
+                  : `${sb.inactiveText} ${sb.hoverBg} ${sb.hoverText}`
+              } ${isGuideTarget ? `ring-2 ring-blue-400 ring-offset-1 ${sb.ring}` : ""}`}
             >
               <span className="w-4 flex items-center justify-center opacity-70"><NavIcon id={n.id} /></span>
               {n.label}
@@ -855,25 +890,25 @@ function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSea
           );
         })}
       </nav>
-      <div className="px-3 py-2 border-t border-slate-800">
+      <div className={`px-3 py-2 border-t ${sb.border}`}>
         <div className="relative">
           <input
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Search pipelines..."
-            className="w-full text-xs px-2.5 py-1.5 border border-slate-700 rounded-lg bg-slate-900 text-slate-300 focus:outline-none focus:border-blue-500 focus:bg-slate-800 font-mono placeholder-slate-600"
+            className={`w-full text-xs px-2.5 py-1.5 border ${sb.inputBorder} rounded-lg ${sb.inputBg} ${sb.inputText} focus:outline-none focus:border-blue-500 ${sb.inputFocus} font-mono ${sb.placeholder}`}
           />
           {searchQuery && (
             <button
               onClick={() => setSearchQuery("")}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 text-xs"
+              className={`absolute right-2 top-1/2 -translate-y-1/2 ${sb.clearBtn} text-xs`}
             >&times;</button>
           )}
         </div>
       </div>
-      <div className="px-3 py-2 border-t border-slate-800">
-        <div className="text-xs text-slate-500 mb-2 px-1">Priority filter</div>
+      <div className={`px-3 py-2 border-t ${sb.border}`}>
+        <div className={`text-xs ${sb.subtitle} mb-2 px-1`}>Priority filter</div>
         <div className="flex gap-1">
           {[{ key: "All", label: "All" }, { key: "T1", label: "Critical" }, { key: "T2", label: "Standard" }, { key: "T3", label: "Exploratory" }].map((t) => (
             <button
@@ -882,7 +917,7 @@ function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSea
               className={`flex-1 text-xs py-1 rounded ${
                 tierFilter === t.key
                   ? "bg-blue-600 text-white"
-                  : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200"
+                  : sb.filterInactive
               }`}
             >
               {t.label}
@@ -891,13 +926,13 @@ function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSea
         </div>
       </div>
       {user && (
-        <div className="px-3 py-3 border-t border-slate-800">
+        <div className={`px-3 py-3 border-t ${sb.border}`}>
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-xs text-slate-300 font-medium">{user.username}</div>
-              <div className="text-xs text-slate-600">{user.role}</div>
+              <div className={`text-xs ${sb.userText} font-medium`}>{user.username}</div>
+              <div className={`text-xs ${sb.roleText}`}>{user.role}</div>
             </div>
-            <button onClick={onLogout} className="text-xs text-slate-500 hover:text-slate-300 px-2 py-1 rounded hover:bg-slate-800">
+            <button onClick={onLogout} className={`text-xs ${sb.logoutText} px-2 py-1 rounded`}>
               Logout
             </button>
           </div>
@@ -931,8 +966,8 @@ function GuideTooltip({ guideStep, setView, onGuideNav, onGuideFinish }) {
     <div className="fixed z-50" style={{ top: pos.top, left: pos.left, width: 300 }}>
       <div className="bg-white border border-slate-200 rounded-xl shadow-lg p-4">
         {/* Arrow pointing left */}
-        <div className="absolute -left-2 top-3 w-0 h-0" style={{ borderTop: "6px solid transparent", borderBottom: "6px solid transparent", borderRight: "8px solid #e2e8f0" }} />
-        <div className="absolute top-3 w-0 h-0" style={{ left: "-5.5px", borderTop: "5px solid transparent", borderBottom: "5px solid transparent", borderRight: "7px solid white", marginTop: "1px" }} />
+        <div className="absolute -left-2 top-3 w-0 h-0" style={{ borderTop: "6px solid transparent", borderBottom: "6px solid transparent", borderRight: document.documentElement.classList.contains("dark") ? "8px solid #334155" : "8px solid #e2e8f0" }} />
+        <div className="absolute top-3 w-0 h-0" style={{ left: "-5.5px", borderTop: "5px solid transparent", borderBottom: "5px solid transparent", borderRight: document.documentElement.classList.contains("dark") ? "7px solid #1e293b" : "7px solid white", marginTop: "1px" }} />
 
         <div className="text-xs text-blue-600 font-semibold uppercase tracking-wider mb-1">{hint.title}</div>
         <p className="text-sm text-slate-600 leading-relaxed">{hint.text}</p>
@@ -3910,9 +3945,449 @@ function CostsView() {
 // Settings View — Branding + Agent Costs
 // ---------------------------------------------------------------------------
 
-function SettingsView({ branding, onBrandingChange }) {
-  const [tab, setTab] = useState("usage");
+// ---------------------------------------------------------------------------
+// Migration View (Build 34) — Airflow DAG migration
+// ---------------------------------------------------------------------------
+
+function MigrationView() {
+  const [migrations, setMigrations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [uploadMsg, setUploadMsg] = useState("");
+  const [selected, setSelected] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const fileRef = useRef(null);
+
+  const load = useCallback(async () => {
+    try {
+      const data = await api("GET", "/api/migration");
+      setMigrations(data);
+    } catch (e) { console.error(e); }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setUploadMsg("");
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const token = getToken();
+      const res = await fetch("/api/migration/upload", {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: formData,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setUploadMsg(`Analyzed ${data.total_dags} DAGs, ${data.total_tasks} tasks. ${data.proposed_pipelines} pipelines proposed.`);
+      load();
+      setSelected(data.migration_id);
+    } catch (err) {
+      setUploadMsg("Error: " + err.message);
+    }
+    setUploading(false);
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  useEffect(() => {
+    if (!selected) { setDetail(null); return; }
+    api("GET", `/api/migration/${selected}`).then(setDetail).catch(() => setDetail(null));
+  }, [selected]);
+
+  const handleAction = async (action) => {
+    if (!selected) return;
+    try {
+      await api("POST", `/api/migration/${selected}/${action}`);
+      setUploadMsg(action === "approve" ? "Migration approved. Click Execute to create resources." : "Migration rejected.");
+      api("GET", `/api/migration/${selected}`).then(setDetail);
+      load();
+    } catch (err) {
+      setUploadMsg("Error: " + err.message);
+    }
+  };
+
+  const handleExecute = async () => {
+    if (!selected) return;
+    try {
+      const result = await api("POST", `/api/migration/${selected}/execute`);
+      setUploadMsg(`Migration complete: ${result.created_pipelines} pipelines, ${result.created_transforms} transforms created.`);
+      api("GET", `/api/migration/${selected}`).then(setDetail);
+      load();
+    } catch (err) {
+      setUploadMsg("Error: " + err.message);
+    }
+  };
+
+  const statusColor = (s) => {
+    const map = { review: "amber", complete: "green", approved: "blue", executing: "blue", failed: "red", rejected: "red" };
+    return map[s] || "gray";
+  };
+
+  return (
+    <div className="px-6 py-4">
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="text-lg font-semibold text-slate-800">Airflow Migration</h1>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => fileRef.current?.click()}
+            disabled={uploading}
+            className="text-xs px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 font-medium"
+          >
+            {uploading ? "Analyzing..." : "Upload Airflow DAGs"}
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".zip,.tar,.tar.gz,.tgz"
+            onChange={handleUpload}
+            className="hidden"
+          />
+        </div>
+      </div>
+      {uploadMsg && (
+        <div className={`text-xs mb-4 px-3 py-2 rounded-lg ${uploadMsg.startsWith("Error") ? "bg-red-50 text-red-600 border border-red-200" : "bg-blue-50 text-blue-700 border border-blue-200"}`}>
+          {uploadMsg}
+        </div>
+      )}
+
+      <div className="flex gap-4">
+        {/* Migration list */}
+        <div className="w-80 shrink-0 space-y-2">
+          {loading && <div className="text-xs text-slate-400">Loading...</div>}
+          {!loading && migrations.length === 0 && (
+            <div className="text-xs text-slate-400 bg-white border border-slate-200 rounded-lg p-4 text-center">
+              No migrations yet. Upload an Airflow DAG archive to get started.
+            </div>
+          )}
+          {migrations.map((m) => (
+            <button
+              key={m.migration_id}
+              onClick={() => setSelected(m.migration_id)}
+              className={`w-full text-left p-3 rounded-lg border transition-colors ${
+                selected === m.migration_id
+                  ? "border-blue-500 bg-blue-50"
+                  : "border-slate-200 bg-white hover:border-slate-300"
+              }`}
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-sm font-medium text-slate-700 truncate">{m.migration_name}</span>
+                <Pill label={m.status} color={statusColor(m.status)} />
+              </div>
+              <div className="text-xs text-slate-400">
+                {m.total_dags_found} DAGs, {m.total_tasks_found} tasks
+                {m.proposed_pipelines > 0 && ` → ${m.proposed_pipelines} pipelines`}
+              </div>
+              <div className="text-xs text-slate-400 mt-0.5">{m.created_at?.slice(0, 16)}</div>
+            </button>
+          ))}
+        </div>
+
+        {/* Detail panel */}
+        <div className="flex-1 min-w-0">
+          {!detail && (
+            <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-sm text-slate-400">
+              Select a migration or upload a new Airflow archive
+            </div>
+          )}
+          {detail && <MigrationDetail detail={detail} onApprove={() => handleAction("approve")} onReject={() => handleAction("reject")} onExecute={handleExecute} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MigrationDetail({ detail, onApprove, onReject, onExecute }) {
+  const [tab, setTab] = useState("overview");
+  const d = detail;
+  const status = typeof d.status === "string" ? d.status : d.status?.value || "";
+
+  return (
+    <div className="space-y-4">
+      {/* Header */}
+      <div className="bg-white border border-slate-200 rounded-xl p-5">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h2 className="text-base font-semibold text-slate-800">{d.migration_name}</h2>
+            <div className="text-xs text-slate-400 mt-0.5">
+              Uploaded by {d.uploaded_by} · {d.upload_filename} · {(d.upload_size_bytes / 1024).toFixed(0)} KB
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {status === "review" && (
+              <React.Fragment>
+                <button onClick={onApprove} className="text-xs px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium">Approve</button>
+                <button onClick={onReject} className="text-xs px-3 py-1.5 bg-slate-100 text-slate-500 rounded-lg hover:bg-slate-200">Reject</button>
+              </React.Fragment>
+            )}
+            {status === "approved" && (
+              <button onClick={onExecute} className="text-xs px-4 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">Execute Migration</button>
+            )}
+            <Pill label={status} color={status === "complete" ? "green" : status === "review" ? "amber" : status === "approved" ? "blue" : status === "failed" || status === "rejected" ? "red" : "gray"} />
+          </div>
+        </div>
+
+        {/* Stats row */}
+        <div className="flex gap-4 text-xs">
+          <div className="bg-slate-50 rounded-lg px-3 py-2">
+            <div className="text-slate-400">DAGs Parsed</div>
+            <div className="text-lg font-semibold text-slate-700">{d.total_dags_found}</div>
+          </div>
+          <div className="bg-slate-50 rounded-lg px-3 py-2">
+            <div className="text-slate-400">Total Tasks</div>
+            <div className="text-lg font-semibold text-slate-700">{d.total_tasks_found}</div>
+          </div>
+          <div className="bg-slate-50 rounded-lg px-3 py-2">
+            <div className="text-slate-400">Proposed Pipelines</div>
+            <div className="text-lg font-semibold text-blue-600">{(d.proposed_pipelines || []).length}</div>
+          </div>
+          <div className="bg-slate-50 rounded-lg px-3 py-2">
+            <div className="text-slate-400">Transforms</div>
+            <div className="text-lg font-semibold text-purple-600">{(d.proposed_transforms || []).length}</div>
+          </div>
+          <div className="bg-slate-50 rounded-lg px-3 py-2">
+            <div className="text-slate-400">Unmapped</div>
+            <div className="text-lg font-semibold text-amber-600">{(d.unmapped_tasks || []).length}</div>
+          </div>
+          <div className="bg-slate-50 rounded-lg px-3 py-2">
+            <div className="text-slate-400">Confidence</div>
+            <div className="text-lg font-semibold text-slate-700">{((d.confidence || 0) * 100).toFixed(0)}%</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1">
+        {[
+          { id: "overview", label: "Overview" },
+          { id: "pipelines", label: `Pipelines (${(d.proposed_pipelines || []).length})` },
+          { id: "transforms", label: `Transforms (${(d.proposed_transforms || []).length})` },
+          { id: "unmapped", label: `Unmapped (${(d.unmapped_tasks || []).length})` },
+          { id: "dags", label: `Parsed DAGs (${(d.parsed_dags || []).length})` },
+          ...(d.execution_log?.length ? [{ id: "log", label: "Execution Log" }] : []),
+        ].map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-colors ${
+              tab === t.id ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      <div className="bg-white border border-slate-200 rounded-xl p-5">
+        {tab === "overview" && (
+          <div className="space-y-3">
+            {d.agent_reasoning && (
+              <div>
+                <div className="text-xs font-medium text-slate-500 mb-1">Agent Analysis</div>
+                <div className="text-sm text-slate-600 whitespace-pre-wrap">{d.agent_reasoning}</div>
+              </div>
+            )}
+            {d.analysis?.warnings?.length > 0 && (
+              <div>
+                <div className="text-xs font-medium text-amber-600 mb-1">Warnings</div>
+                <ul className="text-xs text-slate-600 space-y-1">
+                  {d.analysis.warnings.map((w, i) => <li key={i} className="flex gap-1"><span className="text-amber-500">⚠</span> {w}</li>)}
+                </ul>
+              </div>
+            )}
+            {d.analysis?.connection_mapping && Object.keys(d.analysis.connection_mapping).length > 0 && (
+              <div>
+                <div className="text-xs font-medium text-slate-500 mb-1">Airflow Connections</div>
+                <div className="space-y-1">
+                  {Object.entries(d.analysis.connection_mapping).map(([connId, info]) => (
+                    <div key={connId} className="flex items-center gap-2 text-xs">
+                      <span className="font-mono text-slate-600 bg-slate-50 px-1.5 py-0.5 rounded">{connId}</span>
+                      <span className="text-slate-400">→</span>
+                      <span className="text-slate-600">{info.dapos_connector_type}</span>
+                      {info.notes && <span className="text-slate-400 italic">{info.notes}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {d.parse_errors?.length > 0 && (
+              <div>
+                <div className="text-xs font-medium text-red-600 mb-1">Parse Errors</div>
+                <ul className="text-xs text-slate-600 space-y-1">
+                  {d.parse_errors.map((e, i) => <li key={i} className="font-mono"><span className="text-red-500">{e.file}:</span> {e.error}</li>)}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "pipelines" && (
+          <div className="space-y-3">
+            {(d.proposed_pipelines || []).length === 0 && <div className="text-xs text-slate-400">No pipelines proposed.</div>}
+            {(d.proposed_pipelines || []).map((p, i) => (
+              <div key={i} className="border border-slate-200 rounded-lg p-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-sm font-medium text-slate-700">{p.name}</span>
+                  <Pill label={`T${p.tier || 2}`} color={p.tier === 1 ? "red" : p.tier === 3 ? "blue" : "amber"} />
+                  {p.needs_new_connector && <Pill label="needs connector" color="purple" />}
+                </div>
+                {p.description && <div className="text-xs text-slate-500 mb-1">{p.description}</div>}
+                <div className="text-xs text-slate-400 flex gap-3">
+                  <span>{p.source_type} → {p.target_type}</span>
+                  <span>{p.refresh_type} / {p.load_type}</span>
+                  {p.schedule_cron && <span className="font-mono">{p.schedule_cron}</span>}
+                </div>
+                {p.source_dag_id && <div className="text-xs text-slate-400 mt-0.5 italic">from: {p.source_dag_id} ({(p.source_tasks || []).join(", ")})</div>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === "transforms" && (
+          <div className="space-y-3">
+            {(d.proposed_transforms || []).length === 0 && <div className="text-xs text-slate-400">No transforms proposed.</div>}
+            {(d.proposed_transforms || []).map((t, i) => (
+              <div key={i} className="border border-slate-200 rounded-lg p-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-sm font-medium text-slate-700">{t.name}</span>
+                  <Pill label={t.materialization || "table"} color="purple" />
+                </div>
+                {t.description && <div className="text-xs text-slate-500 mb-1">{t.description}</div>}
+                {t.sql && (
+                  <pre className="text-xs bg-slate-50 border border-slate-200 rounded p-2 mt-1 overflow-x-auto whitespace-pre-wrap">{t.sql}</pre>
+                )}
+                <div className="text-xs text-slate-400 mt-1 italic">from: {t.source_dag_id}/{t.source_task_id}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === "unmapped" && (
+          <div className="space-y-3">
+            {(d.unmapped_tasks || []).length === 0 && <div className="text-xs text-slate-400">All tasks mapped successfully.</div>}
+            {(d.unmapped_tasks || []).map((u, i) => (
+              <div key={i} className="border border-amber-200 bg-amber-50 rounded-lg p-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-sm font-medium text-slate-700">{u.dag_id}/{u.task_id}</span>
+                  <Pill label={u.operator_class} color="amber" />
+                </div>
+                <div className="text-xs text-slate-600">{u.reason}</div>
+                {u.suggestion && <div className="text-xs text-blue-600 mt-1">{u.suggestion}</div>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === "dags" && (
+          <div className="space-y-3">
+            {(d.parsed_dags || []).map((dag, i) => (
+              <div key={i} className="border border-slate-200 rounded-lg p-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-sm font-medium text-slate-700">{dag.dag_id}</span>
+                  {dag.schedule_interval && <Pill label={dag.schedule_interval} color="blue" />}
+                </div>
+                <div className="text-xs text-slate-400 mb-1 font-mono">{dag.file_path}</div>
+                <div className="text-xs text-slate-500">
+                  {(dag.tasks || []).length} tasks
+                  {dag.connections_referenced?.length > 0 && `, connections: ${dag.connections_referenced.join(", ")}`}
+                </div>
+                <div className="mt-1 space-y-0.5">
+                  {(dag.tasks || []).map((t, ti) => (
+                    <div key={ti} className="flex items-center gap-2 text-xs">
+                      <span className="w-1 h-1 rounded-full bg-slate-400" />
+                      <span className="font-mono text-slate-600">{t.task_id}</span>
+                      <span className="text-slate-400">{t.operator_class}</span>
+                      {t.depends_on?.length > 0 && (
+                        <span className="text-slate-300">← {t.depends_on.join(", ")}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === "log" && (
+          <div className="space-y-1">
+            {(d.execution_log || []).map((entry, i) => (
+              <div key={i} className="flex items-center gap-2 text-xs py-1">
+                <StatusDot status={entry.status === "ok" ? "complete" : "failed"} />
+                <span className="text-slate-600">{entry.action}</span>
+                <span className="font-mono text-slate-500">{entry.name || ""}</span>
+                {entry.error && <span className="text-red-500">{entry.error}</span>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Settings (Build 33)
+// ---------------------------------------------------------------------------
+
+function AppearanceSettings({ theme, onThemeChange }) {
+  const options = [
+    { id: "light", label: "Light", desc: "Light backgrounds with dark text" },
+    { id: "dark", label: "Dark", desc: "Dark backgrounds with light text" },
+    { id: "system", label: "System", desc: "Follow your OS preference" },
+  ];
+  return (
+    <div className="max-w-lg">
+      <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+        <div>
+          <div className="text-xs font-medium text-slate-500 mb-3">Theme</div>
+          <div className="space-y-2">
+            {options.map((o) => (
+              <button
+                key={o.id}
+                onClick={() => onThemeChange(o.id)}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg border text-left transition-colors ${
+                  theme === o.id
+                    ? "border-blue-500 bg-blue-50 text-slate-800"
+                    : "border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50"
+                }`}
+              >
+                <div className={`w-8 h-8 rounded-lg border flex items-center justify-center shrink-0 ${
+                  o.id === "dark" ? "bg-slate-800 border-slate-600" :
+                  o.id === "light" ? "bg-white border-slate-300" :
+                  "bg-gradient-to-br from-white to-slate-800 border-slate-400"
+                }`}>
+                  {o.id === "dark" && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" strokeWidth="2" strokeLinecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>}
+                  {o.id === "light" && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#475569" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>}
+                  {o.id === "system" && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="2" strokeLinecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>}
+                </div>
+                <div>
+                  <div className="text-sm font-medium">{o.label}</div>
+                  <div className="text-xs text-slate-400">{o.desc}</div>
+                </div>
+                {theme === o.id && (
+                  <svg className="ml-auto shrink-0" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsView({ branding, onBrandingChange, theme, onThemeChange }) {
+  const [tab, setTab] = useState("appearance");
   const tabs = [
+    { id: "appearance", label: "Appearance" },
     { id: "usage", label: "Usage" },
     { id: "branding", label: "Branding" },
     { id: "costs", label: "Agent Costs" },
@@ -3936,6 +4411,7 @@ function SettingsView({ branding, onBrandingChange }) {
           </button>
         ))}
       </div>
+      {tab === "appearance" && <AppearanceSettings theme={theme} onThemeChange={onThemeChange} />}
       {tab === "usage" && <AnalyticsView />}
       {tab === "branding" && <BrandingSettings branding={branding} onBrandingChange={onBrandingChange} />}
       {tab === "costs" && <CostsView />}
@@ -3995,8 +4471,9 @@ function ContributionGraph({ heatmap, chatActivity }) {
     }
   });
 
+  const isDk = document.documentElement.classList.contains("dark");
   const greenScale = (v) => {
-    if (v === 0) return "#ebedf0";
+    if (v === 0) return isDk ? "#1e293b" : "#ebedf0";
     const t = v / maxVal;
     if (t <= 0.25) return "#9be9a8";
     if (t <= 0.5) return "#40c463";
@@ -4041,7 +4518,7 @@ function ContributionGraph({ heatmap, chatActivity }) {
                   return (
                     <div
                       key={dow}
-                      className="w-[11px] h-[11px] rounded-sm outline outline-1 outline-slate-200/50"
+                      className={`w-[11px] h-[11px] rounded-sm outline outline-1 ${isDk ? "outline-slate-700/50" : "outline-slate-200/50"}`}
                       style={{ background: greenScale(cell.total) }}
                       title={`${cell.key}: ${cell.runs} runs, ${cell.chats} chats`}
                     />
@@ -4054,7 +4531,7 @@ function ContributionGraph({ heatmap, chatActivity }) {
           {/* Legend */}
           <div className="flex items-center gap-1 mt-2 justify-end">
             <span className="text-[9px] text-slate-400">Less</span>
-            {["#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39"].map((c, i) => (
+            {[(isDk ? "#1e293b" : "#ebedf0"), "#9be9a8", "#40c463", "#30a14e", "#216e39"].map((c, i) => (
               <div key={i} className="w-[10px] h-[10px] rounded-sm" style={{ background: c }} />
             ))}
             <span className="text-[9px] text-slate-400">More</span>
@@ -5163,6 +5640,24 @@ function App() {
   const [authEnabled, setAuthEnabled] = useState(null);
   const [guideStep, setGuideStep] = useState(null);
   const [branding, setBranding] = useState({ app_name: "DAPOS", logo_url: "" });
+  const [theme, setTheme] = useState(getThemePref);
+  const [resolvedDark, setResolvedDark] = useState(() => applyTheme(getThemePref()) === "dark");
+
+  // Apply theme whenever it changes
+  useEffect(() => {
+    const resolved = applyTheme(theme);
+    setResolvedDark(resolved === "dark");
+    localStorage.setItem("pa_theme", theme);
+  }, [theme]);
+
+  // Listen for OS theme changes when in system mode
+  useEffect(() => {
+    if (theme !== "system") return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = () => { const r = applyTheme("system"); setResolvedDark(r === "dark"); };
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, [theme]);
 
   // Load branding
   useEffect(() => {
@@ -5221,12 +5716,12 @@ function App() {
 
   // Loading state while checking auth
   if (authEnabled === null) {
-    return React.createElement("div", { className: "flex items-center justify-center h-screen bg-bg text-text-primary" }, "Loading...");
+    return React.createElement("div", { className: `flex items-center justify-center h-screen ${resolvedDark ? "bg-slate-900 text-slate-200" : "bg-slate-50 text-slate-800"}` }, "Loading...");
   }
 
   // Show login if not authenticated and auth is enabled
   if (!authState.loggedIn && authEnabled) {
-    return React.createElement(Login, { onLogin: handleLogin });
+    return React.createElement(Login, { onLogin: handleLogin, isDark: resolvedDark });
   }
 
   // CommandView is always mounted so chat history survives tab switches.
@@ -5242,7 +5737,8 @@ function App() {
     connectors: <ConnectorsView />,
     alerts: <AlertsView tierFilter={tierFilter} searchQuery={sq} />,
     metrics: <MetricsView />,
-    settings: <SettingsView branding={branding} onBrandingChange={setBranding} />,
+    migration: <MigrationView />,
+    settings: <SettingsView branding={branding} onBrandingChange={setBranding} theme={theme} onThemeChange={setTheme} />,
     agent: <AgentKnowledgeView />,
     docs: <DocsView />,
   };
@@ -5269,8 +5765,9 @@ function App() {
         guideStep={guideStep}
         onGuideNav={handleGuideNav}
         branding={branding}
+        isDark={resolvedDark}
       />
-      <main className="flex-1 overflow-y-auto bg-slate-50">
+      <main className={`flex-1 overflow-y-auto ${resolvedDark ? "bg-slate-900" : "bg-slate-50"}`}>
         <div style={{ display: view === "command" ? "flex" : "none", flexDirection: "column", height: "100%" }}>
           <CommandView />
         </div>
