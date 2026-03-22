@@ -2690,6 +2690,53 @@ else
     warn "Chat routing: $(echo "$CHAT_LIST" | head -c 200)"
 fi
 
+# Test 10: Demo transforms exist (7 total)
+echo -n "  Demo transforms count... "
+ALL_TRANSFORMS=$(curl -s "$API_URL/api/transforms" \
+    -H "Authorization: Bearer $TOKEN")
+if echo "$ALL_TRANSFORMS" | jq -e '.[0].transform_name' > /dev/null 2>&1; then
+    T_TOTAL=$(echo "$ALL_TRANSFORMS" | jq '. | length')
+    if [ "$T_TOTAL" -ge 7 ]; then
+        pass "Demo transforms: $T_TOTAL (expected >= 7)"
+    else
+        warn "Demo transforms: $T_TOTAL (expected >= 7)"
+    fi
+else
+    skip "No demo transforms found (bootstrap may not have run)"
+fi
+
+# Test 11: customer_360 is a VIEW materialization
+echo -n "  customer_360 is VIEW... "
+C360=$(echo "$ALL_TRANSFORMS" | jq -r '.[] | select(.transform_name == "customer_360") | .materialization' 2>/dev/null)
+if [ "$C360" = "view" ]; then
+    pass "customer_360 materialization = view"
+elif [ -z "$C360" ]; then
+    skip "customer_360 transform not found"
+else
+    warn "customer_360 materialization = $C360 (expected view)"
+fi
+
+# Test 12: monthly_kpis refs 3 Layer 1 transforms
+echo -n "  monthly_kpis refs... "
+MKPI_REFS=$(echo "$ALL_TRANSFORMS" | jq '.[] | select(.transform_name == "monthly_kpis") | .refs | length' 2>/dev/null)
+if [ "$MKPI_REFS" = "3" ]; then
+    pass "monthly_kpis has 3 refs"
+elif [ -z "$MKPI_REFS" ]; then
+    skip "monthly_kpis transform not found"
+else
+    warn "monthly_kpis refs: $MKPI_REFS (expected 3)"
+fi
+
+# Test 13: demo-analytics-transforms pipeline exists with steps
+echo -n "  Transform pipeline exists... "
+TPIPE=$(curl -s "$API_URL/api/pipelines" -H "Authorization: Bearer $TOKEN" | \
+    jq '.[] | select(.pipeline_name == "demo-analytics-transforms")' 2>/dev/null)
+if [ -n "$TPIPE" ]; then
+    pass "demo-analytics-transforms pipeline exists"
+else
+    skip "demo-analytics-transforms pipeline not found"
+fi
+
 fi # --api (Build 29)
 
 # ============================================================================

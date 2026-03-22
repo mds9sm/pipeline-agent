@@ -16,7 +16,8 @@ from urllib.parse import urlparse
 
 from contracts.models import (
     PipelineContract, RunRecord, RunMode, PipelineStatus, RefreshType, ReplicationMethod, LoadType,
-    NotificationPolicy,
+    NotificationPolicy, SqlTransform, MaterializationType, StepDefinition, StepType,
+    PipelineDependency, DependencyType,
 )
 from contracts.store import ContractStore
 from connectors.registry import ConnectorRegistry
@@ -548,3 +549,323 @@ async def bootstrap_demo_pipelines(store: ContractStore, registry: ConnectorRegi
                 log.info("Triggered first run for: %s", pipeline.pipeline_name)
             except Exception as e:
                 log.warning("Could not trigger %s: %s", pipeline.pipeline_name, e)
+
+    # --- Build 29: Bootstrap demo SQL transforms ---
+    await _bootstrap_demo_transforms(store, created_pipelines)
+
+
+# ---------------------------------------------------------------------------
+# Build 29: Demo SQL Transforms — e-commerce analytics DAG
+# ---------------------------------------------------------------------------
+
+DEMO_TRANSFORMS = [
+    # Layer 1: Daily aggregates
+    {
+        "transform_name": "daily_revenue",
+        "description": "Daily order count, revenue, and average order value",
+        "sql": """SELECT
+    DATE(created_at) AS revenue_date,
+    COUNT(*) AS order_count,
+    COUNT(*) FILTER (WHERE status NOT IN ('cancelled')) AS completed_orders,
+    SUM(CASE WHEN status != 'cancelled' THEN total ELSE 0 END) AS gross_revenue,
+    SUM(CASE WHEN status = 'cancelled' THEN total ELSE 0 END) AS cancelled_revenue,
+    ROUND(SUM(CASE WHEN status != 'cancelled' THEN total ELSE 0 END)::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE status != 'cancelled'), 0), 2) AS avg_order_value,
+    SUM(CASE WHEN status != 'cancelled' THEN tax ELSE 0 END) AS total_tax
+FROM {{ ref('demo_orders') }}
+WHERE created_at >= NOW() - INTERVAL '{{ var("lookback_days") }} days'
+GROUP BY DATE(created_at)
+ORDER BY revenue_date""",
+        "materialization": "table",
+        "target_table": "daily_revenue",
+        "variables": {"lookback_days": "365"},
+        "refs": ["demo_orders"],
+    },
+    {
+        "transform_name": "daily_active_users",
+        "description": "Daily unique users, sessions, and event counts from web analytics",
+        "sql": """SELECT
+    DATE(timestamp) AS activity_date,
+    COUNT(DISTINCT user_id) AS unique_users,
+    COUNT(*) AS total_events,
+    COUNT(*) FILTER (WHERE event_type = 'page_view') AS page_views,
+    COUNT(*) FILTER (WHERE event_type = 'purchase') AS purchases,
+    COUNT(DISTINCT session_id) AS unique_sessions,
+    ROUND(COUNT(*)::numeric / NULLIF(COUNT(DISTINCT user_id), 0), 1) AS events_per_user
+FROM {{ ref('demo_analytics_events') }}
+WHERE timestamp >= NOW() - INTERVAL '{{ var("lookback_days") }} days'
+GROUP BY DATE(timestamp)
+ORDER BY activity_date""",
+        "materialization": "table",
+        "target_table": "daily_active_users",
+        "variables": {"lookback_days": "365"},
+        "refs": ["demo_analytics_events"],
+    },
+    {
+        "transform_name": "daily_funnel",
+        "description": "Conversion funnel: page_view → click → add_to_cart → purchase with rates",
+        "sql": """SELECT
+    DATE(timestamp) AS funnel_date,
+    COUNT(*) FILTER (WHERE event_type = 'page_view') AS stage_1_views,
+    COUNT(*) FILTER (WHERE event_type = 'click') AS stage_2_clicks,
+    COUNT(*) FILTER (WHERE event_type = 'add_to_cart') AS stage_3_add_to_cart,
+    COUNT(*) FILTER (WHERE event_type = 'purchase') AS stage_4_purchase,
+    ROUND(COUNT(*) FILTER (WHERE event_type = 'purchase')::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE event_type = 'page_view'), 0), 4) AS overall_conversion_rate
+FROM {{ ref('demo_analytics_events') }}
+WHERE timestamp >= NOW() - INTERVAL '{{ var("lookback_days") }} days'
+GROUP BY DATE(timestamp)
+ORDER BY funnel_date""",
+        "materialization": "table",
+        "target_table": "daily_funnel",
+        "variables": {"lookback_days": "365"},
+        "refs": ["demo_analytics_events"],
+    },
+    # Layer 2: Enriched / joined
+    {
+        "transform_name": "customer_orders_summary",
+        "description": "Per-customer order stats: lifetime revenue, order count, RFM segment",
+        "sql": """SELECT
+    c.id AS customer_id,
+    c.email,
+    c.first_name,
+    c.last_name,
+    c.tier,
+    COUNT(o.id) AS total_orders,
+    COUNT(o.id) FILTER (WHERE o.status != 'cancelled') AS completed_orders,
+    COALESCE(SUM(o.total) FILTER (WHERE o.status != 'cancelled'), 0) AS lifetime_revenue,
+    COALESCE(ROUND(AVG(o.total) FILTER (WHERE o.status != 'cancelled'), 2), 0) AS avg_order_value,
+    MIN(o.created_at) AS first_order_date,
+    MAX(o.created_at) AS last_order_date,
+    CASE
+        WHEN COUNT(o.id) FILTER (WHERE o.status != 'cancelled') >= 5 THEN 'champion'
+        WHEN COUNT(o.id) FILTER (WHERE o.status != 'cancelled') >= 3 THEN 'loyal'
+        WHEN COUNT(o.id) FILTER (WHERE o.status != 'cancelled') >= 1 THEN 'active'
+        ELSE 'prospect'
+    END AS rfm_segment,
+    c.created_at AS customer_since
+FROM {{ ref('demo_customers') }} c
+LEFT JOIN {{ ref('demo_orders') }} o ON o.customer_id = c.id
+GROUP BY c.id, c.email, c.first_name, c.last_name, c.tier, c.created_at""",
+        "materialization": "incremental",
+        "target_table": "customer_orders_summary",
+        "variables": {},
+        "refs": ["demo_customers", "demo_orders"],
+        "unique_key": ["customer_id"],
+    },
+    {
+        "transform_name": "campaign_performance",
+        "description": "Marketing campaign metrics: visitors, conversions, attributed revenue",
+        "sql": """SELECT
+    COALESCE(campaign, '(direct)') AS campaign_name,
+    COUNT(DISTINCT user_id) AS unique_visitors,
+    COUNT(DISTINCT session_id) AS sessions,
+    COUNT(*) AS total_events,
+    COUNT(*) FILTER (WHERE event_type = 'page_view') AS page_views,
+    COUNT(*) FILTER (WHERE event_type = 'add_to_cart') AS add_to_carts,
+    COUNT(*) FILTER (WHERE event_type = 'purchase') AS purchases,
+    ROUND(COUNT(*) FILTER (WHERE event_type = 'purchase')::numeric
+        / NULLIF(COUNT(DISTINCT user_id), 0), 4) AS conversion_rate
+FROM {{ ref('demo_analytics_events') }}
+WHERE timestamp >= NOW() - INTERVAL '{{ var("lookback_days") }} days'
+GROUP BY COALESCE(campaign, '(direct)')
+ORDER BY purchases DESC""",
+        "materialization": "table",
+        "target_table": "campaign_performance",
+        "variables": {"lookback_days": "365"},
+        "refs": ["demo_analytics_events"],
+    },
+    # Layer 3: Unified views
+    {
+        "transform_name": "customer_360",
+        "description": "Unified customer view joining orders, web activity, and segmentation",
+        "sql": """SELECT
+    cos.customer_id,
+    cos.email,
+    cos.first_name,
+    cos.last_name,
+    cos.tier,
+    cos.total_orders,
+    cos.completed_orders,
+    cos.lifetime_revenue,
+    cos.avg_order_value,
+    cos.first_order_date,
+    cos.last_order_date,
+    cos.rfm_segment,
+    cos.customer_since,
+    COALESCE(ev.total_events, 0) AS total_web_events,
+    COALESCE(ev.unique_sessions, 0) AS web_sessions,
+    ev.last_event_date,
+    ev.primary_device
+FROM {{ ref('customer_orders_summary') }} cos
+LEFT JOIN (
+    SELECT
+        user_id,
+        COUNT(*) AS total_events,
+        COUNT(DISTINCT session_id) AS unique_sessions,
+        DATE(MAX(timestamp)) AS last_event_date,
+        MODE() WITHIN GROUP (ORDER BY device) AS primary_device
+    FROM {{ ref('demo_analytics_events') }}
+    GROUP BY user_id
+) ev ON ev.user_id = 'user_' || cos.customer_id::text""",
+        "materialization": "view",
+        "target_table": "customer_360",
+        "variables": {},
+        "refs": ["customer_orders_summary", "demo_analytics_events"],
+    },
+    {
+        "transform_name": "monthly_kpis",
+        "description": "Monthly KPIs: revenue, orders, users, conversion rate, MoM growth",
+        "sql": """SELECT
+    DATE_TRUNC('month', dr.revenue_date)::date AS kpi_month,
+    SUM(dr.gross_revenue) AS monthly_revenue,
+    SUM(dr.order_count) AS monthly_orders,
+    SUM(dr.completed_orders) AS monthly_completed_orders,
+    ROUND(SUM(dr.gross_revenue)::numeric / NULLIF(SUM(dr.completed_orders), 0), 2) AS monthly_aov,
+    MAX(dau.unique_users) AS peak_daily_users,
+    ROUND(AVG(dau.unique_users)::numeric, 0) AS avg_daily_users,
+    SUM(dau.total_events) AS monthly_events,
+    SUM(df.stage_4_purchase) AS monthly_purchases_from_funnel,
+    ROUND(AVG(df.overall_conversion_rate)::numeric, 4) AS avg_conversion_rate
+FROM {{ ref('daily_revenue') }} dr
+LEFT JOIN {{ ref('daily_active_users') }} dau ON dau.activity_date = dr.revenue_date
+LEFT JOIN {{ ref('daily_funnel') }} df ON df.funnel_date = dr.revenue_date
+GROUP BY DATE_TRUNC('month', dr.revenue_date)
+ORDER BY kpi_month""",
+        "materialization": "table",
+        "target_table": "monthly_kpis",
+        "variables": {},
+        "refs": ["daily_revenue", "daily_active_users", "daily_funnel"],
+    },
+]
+
+
+async def _bootstrap_demo_transforms(store, created_pipelines: list):
+    """Create demo SQL transforms and a transform-only pipeline with step DAG."""
+    existing = await store.list_sql_transforms()
+    if existing:
+        log.info("Transforms already exist (%d), skipping transform bootstrap.", len(existing))
+        return
+
+    if not created_pipelines:
+        log.info("No demo pipelines created, skipping transform bootstrap.")
+        return
+
+    _tgt = _target_config()
+
+    # Find the target connector ID from an existing pipeline
+    target_connector_id = created_pipelines[0].target_connector_id
+
+    # Create all transform records
+    transform_ids = {}
+    for t_cfg in DEMO_TRANSFORMS:
+        t = SqlTransform(
+            transform_name=t_cfg["transform_name"],
+            description=t_cfg["description"],
+            sql=t_cfg["sql"],
+            materialization=MaterializationType(t_cfg["materialization"]),
+            target_schema="analytics",
+            target_table=t_cfg["target_table"],
+            variables=t_cfg.get("variables", {}),
+            refs=t_cfg.get("refs", []),
+            created_by="demo",
+            approved=True,  # pre-approved for demo
+        )
+        await store.save_sql_transform(t)
+        transform_ids[t_cfg["transform_name"]] = t.transform_id
+        log.info("Created demo transform: %s (%s)", t_cfg["transform_name"], t_cfg["materialization"])
+
+    # Build step DAG — one step per transform with correct dependencies
+    steps = []
+
+    # Layer 1: no transform dependencies
+    s_daily_rev = StepDefinition(
+        step_name="daily_revenue", step_type=StepType.TRANSFORM,
+        config={"transform_id": transform_ids["daily_revenue"]},
+    )
+    s_daily_users = StepDefinition(
+        step_name="daily_active_users", step_type=StepType.TRANSFORM,
+        config={"transform_id": transform_ids["daily_active_users"]},
+    )
+    s_daily_funnel = StepDefinition(
+        step_name="daily_funnel", step_type=StepType.TRANSFORM,
+        config={"transform_id": transform_ids["daily_funnel"]},
+    )
+    steps.extend([s_daily_rev, s_daily_users, s_daily_funnel])
+
+    # Layer 2: depend on Layer 1
+    s_cust_summary = StepDefinition(
+        step_name="customer_orders_summary", step_type=StepType.TRANSFORM,
+        config={"transform_id": transform_ids["customer_orders_summary"], "unique_key": ["customer_id"]},
+    )
+    s_campaign = StepDefinition(
+        step_name="campaign_performance", step_type=StepType.TRANSFORM,
+        config={"transform_id": transform_ids["campaign_performance"]},
+    )
+    steps.extend([s_cust_summary, s_campaign])
+
+    # Layer 3: depend on Layer 2 + Layer 1
+    s_cust360 = StepDefinition(
+        step_name="customer_360", step_type=StepType.TRANSFORM,
+        depends_on=[s_cust_summary.step_id],
+        config={"transform_id": transform_ids["customer_360"]},
+    )
+    s_monthly = StepDefinition(
+        step_name="monthly_kpis", step_type=StepType.TRANSFORM,
+        depends_on=[s_daily_rev.step_id, s_daily_users.step_id, s_daily_funnel.step_id],
+        config={"transform_id": transform_ids["monthly_kpis"]},
+    )
+    steps.extend([s_cust360, s_monthly])
+
+    # Create the transform-only pipeline
+    transform_pipeline = PipelineContract(
+        pipeline_name="demo-analytics-transforms",
+        status=PipelineStatus.ACTIVE,
+        target_connector_id=target_connector_id,
+        target_host=_tgt["host"],
+        target_port=_tgt["port"],
+        target_database=_tgt["database"],
+        target_user=_tgt["user"],
+        target_password=_tgt["password"],
+        target_schema="analytics",
+        target_table="monthly_kpis",  # primary output
+        schedule_cron="30 * * * *",  # 30 min after source pipelines
+        tier=2,
+        tags={"environment": "demo", "type": "transform"},
+        steps=steps,
+        semantic_tags={
+            "monthly_revenue": {"semantic_name": "monthly_revenue", "domain": "finance", "description": "Total gross revenue for the month", "pii": False, "unit": "USD", "source": "ai"},
+            "monthly_orders": {"semantic_name": "monthly_orders", "domain": "operations", "description": "Total order count for the month", "pii": False, "unit": None, "source": "ai"},
+            "avg_conversion_rate": {"semantic_name": "conversion_rate", "domain": "product", "description": "Average daily conversion rate (purchases/views)", "pii": False, "unit": "ratio", "source": "ai"},
+            "monthly_aov": {"semantic_name": "average_order_value", "domain": "finance", "description": "Average order value for the month", "pii": False, "unit": "USD", "source": "ai"},
+        },
+        business_context={
+            "business_process": "E-commerce analytics and executive reporting",
+            "consumers": "Executive team, product managers, marketing, data science",
+            "criticality": "High — weekly business reviews and board reporting depend on this",
+            "freshness_expectation": "Daily",
+        },
+    )
+    await store.save_pipeline(transform_pipeline)
+    log.info("Created demo-analytics-transforms pipeline with %d steps", len(steps))
+
+    # Link transforms to the pipeline
+    for t_name, t_id in transform_ids.items():
+        t = await store.get_sql_transform(t_id)
+        if t:
+            t.pipeline_id = transform_pipeline.pipeline_id
+            await store.save_sql_transform(t)
+
+    # Link transform pipeline to source pipelines via dependencies
+    source_names = {"demo-ecommerce-orders", "demo-ecommerce-customers", "demo-analytics-events"}
+    for p in created_pipelines:
+        if p.pipeline_name in source_names:
+            dep = PipelineDependency(
+                pipeline_id=transform_pipeline.pipeline_id,
+                depends_on_id=p.pipeline_id,
+                dependency_type=DependencyType.DATA,
+            )
+            await store.save_dependency(dep)
+            log.info("Linked %s -> demo-analytics-transforms", p.pipeline_name)
+
+    log.info("Demo transform bootstrap complete: %d transforms, 1 transform pipeline.", len(DEMO_TRANSFORMS))

@@ -191,7 +191,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Agent diagnostics | 8 | diagnose (200+404), impact (200+404), anomalies, chat routing x3 (Build 24) |
 | Data catalog & AI enablement | 15 | search, query, detail, trust, columns, stats, semantic tags (get/infer/override), context questions, context save, trust weights (set/reset), alert narratives (field+generate) (Build 26) |
 | MCP server | 3 | server import, resource listing, tool listing (Build 27) |
-| SQL transforms | 9 | CRUD (create, list, get, update, delete), lineage, AI generate, chat routing x2 (Build 29) |
+| SQL transforms | 13 | CRUD (create, list, get, update, delete), lineage, AI generate, chat routing x2, demo transforms (count, VIEW, refs, pipeline) (Build 29) |
 
 ### Adding New Tests
 

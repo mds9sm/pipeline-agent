@@ -864,11 +864,19 @@ class PipelineRunner:
         self._log_step(run, "preflight", "passed")
 
         # Resolve connectors once (steps that need them pull from context)
-        src_params, tgt_params = self._connector_params(contract, "both")
-        source = await self.registry.get_source(contract.source_connector_id, src_params)
-        target = await self.registry.get_target(contract.target_connector_id, tgt_params)
-        await target.create_table_if_not_exists(contract)
-        self._log_step(run, "connectors", f"source={contract.source_connector_id[:8]}, target={contract.target_connector_id[:8]}")
+        # Transform-only pipelines may have no source connector
+        source = None
+        target = None
+        if contract.source_connector_id:
+            src_params, tgt_params = self._connector_params(contract, "both")
+            source = await self.registry.get_source(contract.source_connector_id, src_params)
+            target = await self.registry.get_target(contract.target_connector_id, tgt_params)
+            await target.create_table_if_not_exists(contract)
+            self._log_step(run, "connectors", f"source={contract.source_connector_id[:8]}, target={contract.target_connector_id[:8]}")
+        elif contract.target_connector_id:
+            _, tgt_params = self._connector_params(contract, "target")
+            target = await self.registry.get_target(contract.target_connector_id, tgt_params)
+            self._log_step(run, "connectors", f"target-only={contract.target_connector_id[:8]}")
 
         # Load upstream run context
         upstream_run = None
