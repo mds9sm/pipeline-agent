@@ -47,6 +47,12 @@ Format: Each entry records what changed, why, and test results at the time of th
   - 6 decision principles: idempotent-by-default, never delete unconsumed, conservative on quality, context over thresholds, downstream awareness, explain reasoning
   - Cost: ~$0.004/call overhead (1,200 additional tokens vs old 50-token prompt)
 
+#### Documentation
+- **docs/architecture.md**: Updated execution flow to include Insights step, component map updated for agent/core.py
+- **docs/agent/overview.md**: New "System Prompt (Platform Context)" section documenting what the agent knows; `generate_run_insights` added to operations and fallback tables
+- **docs/concepts/pipelines.md**: New "Run Insights" section with scenario examples, insight structure, and API reference
+- **CLAUDE.md**: Updated agent/core.py description with system prompt and generate_run_insights
+
 ---
 
 ### Build 30b: Run Insights — 2026-03-22 (Claude Opus 4.6)

@@ -134,3 +134,32 @@ steps:
     step_type: promote
     depends_on: [gate-step-id]
 ```
+
+## Run Insights
+
+After every pipeline run completes (success, failure, or halt), the agent analyzes the results and generates **2-5 actionable insights**. These appear in the Activity view and are stored on the run record.
+
+### What the Agent Suggests
+
+| Scenario | Example Insights |
+|----------|-----------------|
+| **First run** | "Baselines established — 30 rows. Future runs compared against this." |
+| **Strategy mismatch** | "Pipeline uses full refresh but has `updated_at` — switch to incremental?" (with Apply button) |
+| **Volume anomaly** | "Row count dropped 60% vs baseline — investigate source data." |
+| **Consecutive failures** | "3rd consecutive failure — consider pausing until root cause is resolved." |
+| **Quality warnings** | "Data promoted with warnings — review null rate spike on discount_code column." |
+| **Schedule optimization** | "Source updates daily but pipeline runs hourly — reduce to daily at 6 AM?" |
+
+### Insight Structure
+
+Each insight includes:
+- **category**: quality, performance, strategy, schema, schedule, volume, configuration, error
+- **priority**: high, medium, low (shown as colored indicators)
+- **message**: Plain-language explanation
+- **action**: Optional one-click "Apply" button that PATCHes the pipeline configuration
+
+### API
+
+Insights are included in all run API responses:
+- `GET /api/pipelines/{id}/runs` — each run includes `insights` array
+- `POST /api/pipelines/{id}/trigger` — returned run will include insights after completion

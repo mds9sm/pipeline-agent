@@ -43,7 +43,7 @@ DAPOS runs as a single Python async process with four concurrent event loops, al
 ## Key Principles
 
 1. **Single process, no external dependencies** — No Redis, no Celery, no Kafka. PostgreSQL is the only infrastructure.
-2. **Agent IS the product** — Claude reasons about quality, designs topologies, generates connectors, diagnoses failures. Not a bolt-on.
+2. **Agent IS the product** — Claude reasons about quality, designs topologies, generates connectors, diagnoses failures, and generates post-run insights. The agent receives a rich system prompt with full platform awareness (architecture, execution flow, two-tier autonomy, quality semantics, data patterns, decision principles) on every call. Not a bolt-on.
 3. **Two-tier autonomy** — Runtime decisions (extract/load/promote) are autonomous. Structural changes (connectors, schema, topology) require human approval.
 4. **Database as source of truth** — All state lives in PostgreSQL. Git repo is a derived artifact. UI is a read layer.
 5. **Connector-agnostic quality** — Quality gate types against `TargetEngine` interface, not specific databases.
@@ -52,7 +52,7 @@ DAPOS runs as a single Python async process with four concurrent event loops, al
 
 ### Legacy Path (no steps defined)
 ```
-Extract → Stage → Quality Gate → Promote → Cleanup → Hooks → Metadata
+Extract → Stage → Quality Gate → Promote → Cleanup → Hooks → Metadata → Insights
 ```
 
 ### Step DAG Path (steps defined)
@@ -71,7 +71,7 @@ Steps execute in topological order with per-step retry:
 | Entry point | `main.py` | Wires 4 async loops + dependency injection |
 | Config | `config.py` | Environment variable loading |
 | API | `api/server.py` | FastAPI, 40+ endpoints, JWT, rate limiting |
-| Agent core | `agent/core.py` | Claude API: routing, strategy, diagnosis, topology |
+| Agent core | `agent/core.py` | Claude API: routing, strategy, quality gate, diagnosis, insights, topology (rich system prompt with full platform context) |
 | Conversation | `agent/conversation.py` | Multi-turn onboarding/discovery |
 | Runner | `agent/autonomous.py` | Pipeline execution state machine + step DAG executor |
 | Models | `contracts/models.py` | All dataclasses + enums |

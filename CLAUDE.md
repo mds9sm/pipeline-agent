@@ -71,7 +71,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `main.py` | Entry point - wires 4 async loops + dependency injection |
 | `config.py` | Environment variable loading with defaults |
 | `api/server.py` | FastAPI with 40+ endpoints, JWT auth, rate limiting |
-| `agent/core.py` | Claude API calls: route_command, propose_strategy, generate_connector, decide_quality_gate, diagnose_run_failure, diagnose_error_budget, reason_about_freshness, evaluate_anomaly_signals, assess_contract_violation, generate_migration_sql, parse_schedule, guided_pipeline_response (each with `_rule_based_*` fallback) |
+| `agent/core.py` | Claude API calls with rich system prompt (~1,250 token platform context): route_command, propose_strategy, generate_connector, decide_quality_gate, diagnose_run_failure, diagnose_error_budget, reason_about_freshness, evaluate_anomaly_signals, assess_contract_violation, generate_migration_sql, generate_run_insights, parse_schedule, guided_pipeline_response (each with `_rule_based_*` fallback) |
 | `agent/conversation.py` | Multi-turn onboarding/discovery flow |
 | `agent/autonomous.py` | Pipeline execution state machine (PENDING -> COMPLETE/HALTED) with structured execution logging (13 steps) |
 | `contracts/models.py` | All dataclasses + enums (PipelineContract, ConnectorRecord, RunRecord, etc.) |

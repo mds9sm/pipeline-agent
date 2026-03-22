@@ -40,6 +40,21 @@ This boundary is a **hard constraint** — no configuration can make structural 
 
 ## How the Agent Works
 
+### System Prompt (Platform Context)
+
+Every Claude API call includes a rich system prompt (`_SYSTEM_PROMPT` in `agent/core.py`, ~1,250 tokens) that gives the agent full platform awareness:
+
+- **Identity**: DAPOS as a unified data platform replacing Fivetran + dbt + Airflow + Monte Carlo
+- **Architecture**: Single process, 4 async loops, PostgreSQL-only state
+- **Execution flow**: Full state machine (PENDING → extract → stage → gate → promote → COMPLETE)
+- **Two-tier autonomy**: What the agent can do autonomously vs what requires human approval
+- **Key concepts**: Connectors, refresh/load types, tiers, error budgets, contracts, schema drift policies, hooks, steps, transforms
+- **Quality gate**: All 7 checks and the agent's role as decision-maker
+- **Data patterns**: 8 supported patterns (consume-and-merge, fan-in, SCD2, quarantine, etc.)
+- **Decision principles**: Idempotent-by-default, never delete unconsumed data, conservative on quality, context over thresholds, downstream awareness, explain reasoning
+
+This ensures the agent reasons with full context on every call, not just the narrow task prompt.
+
 ### No External Dependencies
 - **No LangChain** — direct Claude API via httpx
 - **No external vector DB** — PostgreSQL + pgvector for embeddings
@@ -81,6 +96,7 @@ These methods use Claude to reason about signals in context. Each has a `_rule_b
 | `assess_contract_violation()` | Evaluates consumer impact, determines alert severity | Rule-based: hardcoded WARNING severity |
 | `reason_about_preflight_failure()` | Reasons about why preflight checks failed, recommends action | Rule-based: generic message |
 | `generate_migration_sql()` | Generates ALTER TABLE SQL for schema drift with reasoning | `_rule_based_migration_sql()` — template-based ALTER |
+| `generate_run_insights()` | Post-run analysis: 2-5 contextual suggestions with optional one-click actions | `_rule_based_run_insights()` — condition-based checks |
 
 ### Conversational & Design Methods
 
@@ -114,6 +130,7 @@ When the Claude API key is not configured or the API is unavailable, every agent
 | `evaluate_anomaly_signals()` | `_rule_based_anomaly_evaluation()` | Fixed thresholds (30% volume, 2+ failures, 5% budget) |
 | `assess_contract_violation()` | *(inline)* | Hardcoded WARNING severity |
 | `generate_migration_sql()` | `_rule_based_migration_sql()` | Template-based ALTER TABLE statements |
+| `generate_run_insights()` | `_rule_based_run_insights()` | Condition-based: first-run baseline, strategy mismatch, volume deviation, consecutive failures |
 
 ---
 
