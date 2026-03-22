@@ -32,7 +32,7 @@ from contracts.models import (
     DataContract, ContractViolation,
     DataContractStatus, CleanupOwnership, ContractViolationType,
     PipelineChangeLog, PipelineChangeType, RegisteredSource,
-    StepDefinition, StepType,
+    StepDefinition, StepType, CheckStatus,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -4074,6 +4074,387 @@ def create_app(
             return {"pipeline_id": pipeline_id, "mode": "step_dag", "error": str(e)}
 
     # -----------------------------------------------------------------------
+    # Data Catalog API (Build 26)
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/catalog/search")
+    async def catalog_search(
+        request: Request,
+        q: str = Query("", description="Search query — matches table names, column names, pipeline names, tags"),
+        source_type: Optional[str] = Query(None, description="Filter by source type (mysql, mongodb, etc.)"),
+        status: Optional[str] = Query(None, description="Filter by pipeline status"),
+        tier: Optional[int] = Query(None, description="Filter by observability tier (1/2/3)"),
+        limit: int = Query(50, le=200),
+        offset: int = Query(0),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Search the data catalog — returns tables with freshness, quality, lineage, and trust scores."""
+        pipelines = await store.list_pipelines(status=status)
+
+        results = []
+        for p in pipelines:
+            # Apply filters
+            if tier is not None and p.tier != tier:
+                continue
+
+            # Text search across multiple fields
+            if q:
+                q_lower = q.lower()
+                searchable = " ".join([
+                    p.pipeline_name or "",
+                    p.source_table or "",
+                    p.target_table or "",
+                    p.source_schema or "",
+                    p.target_schema or "",
+                    p.owner or "",
+                    " ".join(str(v) for v in (p.tags or {}).values()),
+                    " ".join(str(k) for k in (p.tags or {}).keys()),
+                    " ".join(m.source_column for m in (p.column_mappings or [])),
+                    " ".join(m.target_column for m in (p.column_mappings or [])),
+                ]).lower()
+                if q_lower not in searchable:
+                    continue
+
+            # Source type filter
+            if source_type:
+                connector = await store.get_connector(p.source_connector_id) if p.source_connector_id else None
+                if not connector or source_type.lower() not in (connector.source_target_type or "").lower():
+                    continue
+
+            # Gather freshness
+            freshness = await store.get_latest_freshness(p.pipeline_id)
+            freshness_info = None
+            if freshness:
+                freshness_info = {
+                    "staleness_minutes": freshness.staleness_minutes,
+                    "status": freshness.status.value if hasattr(freshness.status, "value") else freshness.status,
+                    "sla_met": freshness.sla_met,
+                    "checked_at": freshness.checked_at,
+                }
+
+            # Gather latest quality gate
+            gates = await store.get_quality_trend(p.pipeline_id, limit=1)
+            quality_info = None
+            if gates:
+                g = gates[0]
+                checks_passed = sum(1 for c in (g.checks or []) if c.status in ("pass", CheckStatus.PASS))
+                total_checks = len(g.checks or [])
+                quality_info = {
+                    "decision": g.decision.value if hasattr(g.decision, "value") else g.decision,
+                    "checks_passed": checks_passed,
+                    "total_checks": total_checks,
+                    "evaluated_at": g.evaluated_at,
+                }
+
+            # Error budget
+            budget = await store.get_error_budget(p.pipeline_id)
+            budget_info = None
+            if budget:
+                budget_info = {
+                    "success_rate": budget.success_rate,
+                    "budget_remaining": budget.budget_remaining,
+                    "escalated": budget.escalated,
+                }
+
+            # Compute trust score (0.0 - 1.0)
+            trust = _compute_trust_score(freshness, gates[0] if gates else None, budget, p)
+
+            # Column catalog
+            columns = [
+                {
+                    "name": m.target_column or m.source_column,
+                    "source_name": m.source_column,
+                    "type": m.target_type or m.source_type,
+                    "nullable": m.is_nullable,
+                    "primary_key": m.is_primary_key,
+                }
+                for m in (p.column_mappings or [])
+            ]
+
+            results.append({
+                "pipeline_id": p.pipeline_id,
+                "pipeline_name": p.pipeline_name,
+                "target_table": f"{p.target_schema}.{p.target_table}",
+                "source_table": f"{p.source_schema}.{p.source_table}",
+                "status": p.status.value if hasattr(p.status, "value") else p.status,
+                "tier": p.tier,
+                "owner": p.owner,
+                "tags": p.tags or {},
+                "refresh_type": p.refresh_type.value if hasattr(p.refresh_type, "value") else p.refresh_type,
+                "schedule_cron": p.schedule_cron,
+                "column_count": len(p.column_mappings or []),
+                "columns": columns,
+                "freshness": freshness_info,
+                "quality": quality_info,
+                "error_budget": budget_info,
+                "trust_score": trust["score"],
+                "trust_detail": trust["detail"],
+                "created_at": p.created_at,
+                "updated_at": p.updated_at,
+            })
+
+        # Paginate
+        total = len(results)
+        results = results[offset : offset + limit]
+        return {"items": results, "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/api/catalog/tables/{pipeline_id}")
+    async def catalog_table_detail(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Full catalog entry for a single table — includes columns, lineage, trust breakdown, quality history."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        # Freshness
+        freshness = await store.get_latest_freshness(p.pipeline_id)
+        freshness_history = await store.list_freshness_history(p.pipeline_id, hours=72)
+
+        # Quality trend
+        gates = await store.get_quality_trend(p.pipeline_id, limit=10)
+
+        # Error budget
+        budget = await store.get_error_budget(p.pipeline_id)
+
+        # Column lineage
+        lineage = await store.list_column_lineage(p.pipeline_id)
+
+        # Schema versions
+        schema_versions = await store.list_schema_versions(p.pipeline_id)
+
+        # Recent runs
+        runs = await store.list_runs(p.pipeline_id, limit=5)
+
+        # Data contracts (as producer or consumer)
+        contracts = await store.list_data_contracts()
+        related_contracts = [
+            {
+                "contract_id": c.contract_id,
+                "role": "producer" if c.producer_pipeline_id == p.pipeline_id else "consumer",
+                "counterpart_id": c.consumer_pipeline_id if c.producer_pipeline_id == p.pipeline_id else c.producer_pipeline_id,
+                "freshness_sla_minutes": c.freshness_sla_minutes,
+                "status": c.status.value if hasattr(c.status, "value") else c.status,
+            }
+            for c in contracts
+            if c.producer_pipeline_id == p.pipeline_id or c.consumer_pipeline_id == p.pipeline_id
+        ]
+
+        # Connector info
+        source_connector = await store.get_connector(p.source_connector_id) if p.source_connector_id else None
+        target_connector = await store.get_connector(p.target_connector_id) if p.target_connector_id else None
+
+        # Trust score
+        trust = _compute_trust_score(freshness, gates[0] if gates else None, budget, p)
+
+        return {
+            "pipeline_id": p.pipeline_id,
+            "pipeline_name": p.pipeline_name,
+            "target_table": f"{p.target_schema}.{p.target_table}",
+            "source_table": f"{p.source_schema}.{p.source_table}",
+            "source_type": source_connector.source_target_type if source_connector else None,
+            "target_type": target_connector.source_target_type if target_connector else None,
+            "status": p.status.value if hasattr(p.status, "value") else p.status,
+            "tier": p.tier,
+            "owner": p.owner,
+            "tags": p.tags or {},
+            "refresh_type": p.refresh_type.value if hasattr(p.refresh_type, "value") else p.refresh_type,
+            "schedule_cron": p.schedule_cron,
+            "columns": [
+                {
+                    "name": m.target_column or m.source_column,
+                    "source_name": m.source_column,
+                    "type": m.target_type or m.source_type,
+                    "source_type": m.source_type,
+                    "nullable": m.is_nullable,
+                    "primary_key": m.is_primary_key,
+                }
+                for m in (p.column_mappings or [])
+            ],
+            "lineage": [
+                {
+                    "source_column": l.source_column,
+                    "source_table": f"{l.source_schema}.{l.source_table}",
+                    "target_column": l.target_column,
+                    "target_table": f"{l.target_schema}.{l.target_table}",
+                    "transformation": l.transformation,
+                }
+                for l in lineage
+            ],
+            "freshness": {
+                "current": {
+                    "staleness_minutes": freshness.staleness_minutes,
+                    "status": freshness.status.value if hasattr(freshness.status, "value") else freshness.status,
+                    "sla_met": freshness.sla_met,
+                    "checked_at": freshness.checked_at,
+                } if freshness else None,
+                "history": [
+                    {
+                        "staleness_minutes": f.staleness_minutes,
+                        "status": f.status.value if hasattr(f.status, "value") else f.status,
+                        "checked_at": f.checked_at,
+                    }
+                    for f in freshness_history
+                ],
+            },
+            "quality": {
+                "latest": {
+                    "decision": gates[0].decision.value if hasattr(gates[0].decision, "value") else gates[0].decision,
+                    "checks": [
+                        {
+                            "check_name": c.check_name,
+                            "status": c.status.value if hasattr(c.status, "value") else c.status,
+                            "detail": c.detail,
+                        }
+                        for c in (gates[0].checks or [])
+                    ],
+                    "evaluated_at": gates[0].evaluated_at,
+                } if gates else None,
+                "trend": [
+                    {
+                        "decision": g.decision.value if hasattr(g.decision, "value") else g.decision,
+                        "checks_passed": sum(1 for c in (g.checks or []) if c.status in ("pass", CheckStatus.PASS)),
+                        "total_checks": len(g.checks or []),
+                        "evaluated_at": g.evaluated_at,
+                    }
+                    for g in gates
+                ],
+            },
+            "error_budget": {
+                "success_rate": budget.success_rate,
+                "budget_remaining": budget.budget_remaining,
+                "total_runs": budget.total_runs,
+                "escalated": budget.escalated,
+            } if budget else None,
+            "trust_score": trust["score"],
+            "trust_detail": trust["detail"],
+            "schema_versions": len(schema_versions),
+            "data_contracts": related_contracts,
+            "recent_runs": [
+                {
+                    "run_id": r.run_id,
+                    "status": r.status.value if hasattr(r.status, "value") else r.status,
+                    "rows_loaded": r.rows_loaded,
+                    "started_at": r.started_at,
+                    "completed_at": r.completed_at,
+                }
+                for r in runs
+            ],
+            "created_at": p.created_at,
+            "updated_at": p.updated_at,
+        }
+
+    @app.get("/api/catalog/trust/{pipeline_id}")
+    async def catalog_trust_detail(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Trust score breakdown with individual component scores and weights."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+
+        freshness = await store.get_latest_freshness(p.pipeline_id)
+        gates = await store.get_quality_trend(p.pipeline_id, limit=1)
+        budget = await store.get_error_budget(p.pipeline_id)
+
+        trust = _compute_trust_score(freshness, gates[0] if gates else None, budget, p)
+        return {
+            "pipeline_id": p.pipeline_id,
+            "pipeline_name": p.pipeline_name,
+            "target_table": f"{p.target_schema}.{p.target_table}",
+            "trust_score": trust["score"],
+            "detail": trust["detail"],
+            "recommendation": trust["recommendation"],
+            "weights": _TRUST_WEIGHTS,
+        }
+
+    @app.get("/api/catalog/columns")
+    async def catalog_columns(
+        request: Request,
+        q: str = Query("", description="Search column names"),
+        table: Optional[str] = Query(None, description="Filter by target table name"),
+        limit: int = Query(100, le=500),
+        offset: int = Query(0),
+        caller: dict = Depends(auth_dep),
+    ):
+        """Search columns across all pipelines in the catalog."""
+        pipelines = await store.list_pipelines()
+        results = []
+        q_lower = q.lower() if q else ""
+
+        for p in pipelines:
+            for m in (p.column_mappings or []):
+                col_name = m.target_column or m.source_column
+                # Table filter
+                if table and table.lower() not in f"{p.target_schema}.{p.target_table}".lower():
+                    continue
+                # Text search
+                if q_lower and q_lower not in (col_name or "").lower():
+                    continue
+                results.append({
+                    "column_name": col_name,
+                    "source_column": m.source_column,
+                    "type": m.target_type or m.source_type,
+                    "nullable": m.is_nullable,
+                    "primary_key": m.is_primary_key,
+                    "table": f"{p.target_schema}.{p.target_table}",
+                    "pipeline_id": p.pipeline_id,
+                    "pipeline_name": p.pipeline_name,
+                })
+
+        total = len(results)
+        results = results[offset : offset + limit]
+        return {"items": results, "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/api/catalog/stats")
+    async def catalog_stats(
+        request: Request,
+        caller: dict = Depends(auth_dep),
+    ):
+        """High-level catalog statistics."""
+        pipelines = await store.list_pipelines()
+        active = [p for p in pipelines if p.status in (PipelineStatus.ACTIVE, "active")]
+        total_columns = sum(len(p.column_mappings or []) for p in pipelines)
+
+        # Source types
+        source_types = {}
+        for p in pipelines:
+            if p.source_connector_id:
+                c = await store.get_connector(p.source_connector_id)
+                if c:
+                    st = c.source_target_type or "unknown"
+                    source_types[st] = source_types.get(st, 0) + 1
+
+        # Trust distribution
+        trust_counts = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
+        for p in active:
+            freshness = await store.get_latest_freshness(p.pipeline_id)
+            gates = await store.get_quality_trend(p.pipeline_id, limit=1)
+            budget = await store.get_error_budget(p.pipeline_id)
+            trust = _compute_trust_score(freshness, gates[0] if gates else None, budget, p)
+            score = trust["score"]
+            if score is None:
+                trust_counts["unknown"] += 1
+            elif score >= 0.8:
+                trust_counts["high"] += 1
+            elif score >= 0.5:
+                trust_counts["medium"] += 1
+            else:
+                trust_counts["low"] += 1
+
+        return {
+            "total_tables": len(pipelines),
+            "active_tables": len(active),
+            "total_columns": total_columns,
+            "source_types": source_types,
+            "trust_distribution": trust_counts,
+        }
+
+    # -----------------------------------------------------------------------
     # Serve static UI
     # -----------------------------------------------------------------------
 
@@ -4490,6 +4871,111 @@ def _run_summary(r) -> dict:
         "triggered_by_pipeline_id": r.triggered_by_pipeline_id,
         "execution_log": r.execution_log,
     }
+
+
+# ---------------------------------------------------------------------------
+# Trust score computation (Build 26)
+# ---------------------------------------------------------------------------
+
+# Default weights — exposed via /api/catalog/trust/{id} so users can see them
+_TRUST_WEIGHTS = {
+    "freshness": 0.30,       # Is the data current?
+    "quality_gate": 0.30,    # Did it pass quality checks?
+    "error_budget": 0.25,    # Is the pipeline reliable over time?
+    "schema_stability": 0.15, # Has the schema been stable?
+}
+
+
+def _compute_trust_score(
+    freshness,
+    latest_gate,
+    error_budget,
+    pipeline,
+) -> dict:
+    """Compute a 0.0-1.0 trust score from available signals.
+
+    Each component scores 0.0-1.0, then weighted by _TRUST_WEIGHTS.
+    Returns {"score": float|None, "detail": dict, "recommendation": str}.
+    """
+    components = {}
+    has_data = False
+
+    # Freshness component (0.0 - 1.0)
+    if freshness:
+        has_data = True
+        fs = freshness.status
+        status_str = fs.value if hasattr(fs, "value") else fs
+        if status_str == "fresh":
+            components["freshness"] = 1.0
+        elif status_str == "warning":
+            components["freshness"] = 0.5
+        else:  # critical
+            components["freshness"] = 0.1
+    else:
+        components["freshness"] = None
+
+    # Quality gate component (0.0 - 1.0)
+    if latest_gate:
+        has_data = True
+        checks = latest_gate.checks or []
+        total = len(checks)
+        if total > 0:
+            passed = sum(1 for c in checks if c.status in ("pass", CheckStatus.PASS))
+            components["quality_gate"] = passed / total
+        else:
+            components["quality_gate"] = None
+    else:
+        components["quality_gate"] = None
+
+    # Error budget component (0.0 - 1.0)
+    if error_budget:
+        has_data = True
+        components["error_budget"] = min(error_budget.success_rate / 100.0, 1.0) if error_budget.success_rate else 0.0
+    else:
+        components["error_budget"] = None
+
+    # Schema stability component (0.0 - 1.0)
+    # Based on whether schema has been stable (no schema_change_policy overrides needed)
+    has_data_for_schema = pipeline.column_mappings and len(pipeline.column_mappings) > 0
+    if has_data_for_schema:
+        has_data = True
+        components["schema_stability"] = 1.0 if pipeline.auto_approve_additive_schema else 0.7
+    else:
+        components["schema_stability"] = None
+
+    if not has_data:
+        return {
+            "score": None,
+            "detail": {k: {"score": None, "weight": v} for k, v in _TRUST_WEIGHTS.items()},
+            "recommendation": "No data available yet — run the pipeline to establish baselines",
+        }
+
+    # Weighted average (only over components that have data)
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    detail = {}
+    for key, weight in _TRUST_WEIGHTS.items():
+        val = components.get(key)
+        detail[key] = {"score": round(val, 3) if val is not None else None, "weight": weight}
+        if val is not None:
+            weighted_sum += val * weight
+            weight_sum += weight
+
+    score = round(weighted_sum / weight_sum, 3) if weight_sum > 0 else None
+
+    # Recommendation
+    if score is None:
+        rec = "Insufficient data to assess trust"
+    elif score >= 0.9:
+        rec = "High trust — safe for production decisions"
+    elif score >= 0.7:
+        rec = "Good trust — reliable for most use cases"
+    elif score >= 0.5:
+        rec = "Medium trust — verify before critical decisions"
+    else:
+        rec = "Low trust — investigate quality and freshness issues"
+
+    return {"score": score, "detail": detail, "recommendation": rec}
 
 
 def _proposal_summary(p) -> dict:

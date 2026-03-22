@@ -185,6 +185,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | GitOps API | 5 | status, log, diff, pipeline history, restore dry-run (Build 23) |
 | Step DAG | 5 | steps definition, run steps, validate, preview, PATCH update (Build 18) |
 | Agent diagnostics | 8 | diagnose (200+404), impact (200+404), anomalies, chat routing x3 (Build 24) |
+| Data catalog | 6 | search, search with query, table detail, trust score, columns, stats (Build 26) |
 
 ### Adding New Tests
 

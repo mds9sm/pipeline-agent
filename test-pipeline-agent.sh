@@ -2223,6 +2223,119 @@ fi
 fi # --api (Build 24)
 
 # ============================================================================
+# Data Catalog API (Build 26)
+# ============================================================================
+
+if should_run "api"; then
+
+section "Data Catalog API (Build 26)"
+
+# Test 1: Catalog search (all)
+test_name "GET /api/catalog/search (all tables)"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/catalog/search" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    TOTAL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+    HAS_TRUST=$(echo "$BODY" | python3 -c "import sys,json; items=json.load(sys.stdin).get('items',[]); print('yes' if items and 'trust_score' in items[0] else 'no')" 2>/dev/null)
+    if [ "$HAS_TRUST" = "yes" ]; then
+        pass "Catalog search returned $TOTAL tables with trust scores"
+    else
+        warn "Catalog search returned $TOTAL tables (no trust data yet)"
+    fi
+else
+    fail "Catalog search returned HTTP $CODE"
+fi
+
+# Test 2: Catalog search with query
+test_name "GET /api/catalog/search?q=demo"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/catalog/search?q=demo" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    TOTAL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+    pass "Catalog search q=demo returned $TOTAL results"
+else
+    fail "Catalog search q=demo returned HTTP $CODE"
+fi
+
+# Test 3: Catalog table detail
+CAT_PID=$(echo "$BODY" | python3 -c "import sys,json; items=json.load(sys.stdin).get('items',[]); print(items[0]['pipeline_id'] if items else '')" 2>/dev/null)
+if [ -n "$CAT_PID" ]; then
+test_name "GET /api/catalog/tables/{id} (detail)"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/catalog/tables/$CAT_PID" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_FIELDS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'trust_score' in d and 'freshness' in d and 'quality' in d and 'columns' in d else 'no')" 2>/dev/null)
+    if [ "$HAS_FIELDS" = "yes" ]; then
+        TRUST=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('trust_score','N/A'))" 2>/dev/null)
+        pass "Catalog detail: trust_score=$TRUST"
+    else
+        fail "Catalog detail missing trust_score, freshness, quality, or columns"
+    fi
+else
+    fail "Catalog detail returned HTTP $CODE"
+fi
+
+# Test 4: Trust score detail
+test_name "GET /api/catalog/trust/{id}"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/catalog/trust/$CAT_PID" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_WEIGHTS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'weights' in d and 'detail' in d and 'recommendation' in d else 'no')" 2>/dev/null)
+    if [ "$HAS_WEIGHTS" = "yes" ]; then
+        REC=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('recommendation',''))" 2>/dev/null)
+        pass "Trust detail with weights and recommendation: $REC"
+    else
+        fail "Trust detail missing weights, detail, or recommendation"
+    fi
+else
+    fail "Trust detail returned HTTP $CODE"
+fi
+else
+    skip "No pipelines found for catalog detail tests"
+fi
+
+# Test 5: Column search
+test_name "GET /api/catalog/columns"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/catalog/columns" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    TOTAL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+    pass "Column catalog returned $TOTAL columns"
+else
+    fail "Column catalog returned HTTP $CODE"
+fi
+
+# Test 6: Catalog stats
+test_name "GET /api/catalog/stats"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/catalog/stats" \
+    -H "Authorization: Bearer $TOKEN")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$CODE" = "200" ]; then
+    HAS_FIELDS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'total_tables' in d and 'trust_distribution' in d and 'source_types' in d else 'no')" 2>/dev/null)
+    if [ "$HAS_FIELDS" = "yes" ]; then
+        TABLES=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_tables',0))" 2>/dev/null)
+        pass "Catalog stats: $TABLES tables"
+    else
+        fail "Catalog stats missing expected fields"
+    fi
+else
+    fail "Catalog stats returned HTTP $CODE"
+fi
+
+fi # --api (Build 26)
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -2284,6 +2397,7 @@ echo "  - Topology reasoning: design endpoint, chat routing (Build 20)"
 echo "  - Source registry: register, list, get, update, discover, delete (Build 21)"
 echo "  - Step DAG: steps definition, validate, cycle detection, preview, PATCH update (Build 18)"
 echo "  - Agent diagnostics: diagnose, impact, anomalies, chat routing (Build 24)"
+echo "  - Data catalog: search, table detail, trust score, columns, stats (Build 26)"
 echo "  - GitOps API: status, log, diff, pipeline history, restore dry-run (Build 23)"
 echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21)"
 echo "  - Interaction audit: list, export (Build 21)"
