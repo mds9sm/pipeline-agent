@@ -5305,6 +5305,8 @@ def _pipeline_summary(p) -> dict:
         "created_at": p.created_at,
         "updated_at": p.updated_at,
         "step_count": len(p.steps) if p.steps else 0,
+        "source_connector_id": p.source_connector_id,
+        "target_connector_id": p.target_connector_id,
     }
 
 

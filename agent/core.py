@@ -1975,8 +1975,8 @@ The narrative should:
 Write as a single paragraph. Be specific, not generic. Do not use JSON."""
 
         try:
-            resp = await self._call_claude(prompt, max_tokens=300)
-            text = resp.get("text", "") if isinstance(resp, dict) else str(resp)
+            resp = await self._call_claude(self._system_prompt(), prompt)
+            text = resp if isinstance(resp, str) else str(resp)
             # Clean up — just return the text, no JSON
             text = text.strip().strip('"')
             if text and len(text) > 20:
@@ -2105,8 +2105,8 @@ Guidelines:
 - Be concise but accurate in descriptions
 """
         try:
-            resp = await self._call_claude(prompt, max_tokens=2000)
-            text = resp.get("text", "")
+            resp = await self._call_claude(self._system_prompt(), prompt)
+            text = resp if isinstance(resp, str) else str(resp)
             parsed = self._extract_json(text)
             if isinstance(parsed, dict):
                 result = dict(existing_tags)
@@ -2227,8 +2227,8 @@ Respond with JSON only:
 ]
 """
         try:
-            resp = await self._call_claude(prompt, max_tokens=1500)
-            text = resp.get("text", "")
+            resp = await self._call_claude(self._system_prompt(), prompt)
+            text = resp if isinstance(resp, str) else str(resp)
             parsed = self._extract_json(text)
             if isinstance(parsed, list) and parsed:
                 return parsed
@@ -2352,8 +2352,8 @@ Rules:
             return self._fallback_transform_sql(description, target_table)
 
         try:
-            resp = await self._call_claude(prompt, max_tokens=2000)
-            text = resp.get("text", "") if isinstance(resp, dict) else str(resp)
+            resp = await self._call_claude(self._system_prompt(), prompt)
+            text = resp if isinstance(resp, str) else str(resp)
             # Extract JSON from response
             text = text.strip()
             if text.startswith("```"):

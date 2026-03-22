@@ -1837,6 +1837,144 @@ function PipelinesView({ tierFilter, searchQuery }) {
 // 3. Activity View
 // ---------------------------------------------------------------------------
 
+// Maps execution log step names to which connector role they relate to
+const STEP_CONNECTOR_MAP = {
+  connectors: "both",
+  extract: "source",
+  load_staging: "target",
+  quality_gate: "target",
+  promote: "target",
+  cleanup: "target",
+  hook: "target",
+};
+
+function ExecutionLogWithCode({ log, sourceConnectorId, targetConnectorId }) {
+  const [expandedStep, setExpandedStep] = useState(null); // index of expanded step
+  const [connectorCache, setConnectorCache] = useState({}); // { connectorId: data }
+  const [loading, setLoading] = useState(false);
+
+  const hasConnectors = sourceConnectorId || targetConnectorId;
+
+  async function toggleStep(idx, stepName) {
+    if (expandedStep === idx) { setExpandedStep(null); return; }
+    const role = STEP_CONNECTOR_MAP[stepName];
+    if (!role || !hasConnectors) return;
+
+    setExpandedStep(idx);
+    const idsToFetch = [];
+    if ((role === "source" || role === "both") && sourceConnectorId && !connectorCache[sourceConnectorId]) {
+      idsToFetch.push(sourceConnectorId);
+    }
+    if ((role === "target" || role === "both") && targetConnectorId && !connectorCache[targetConnectorId]) {
+      idsToFetch.push(targetConnectorId);
+    }
+    if (idsToFetch.length > 0) {
+      setLoading(true);
+      const results = await Promise.all(
+        idsToFetch.map((id) => api("GET", `/api/connectors/${id}`).catch(() => null))
+      );
+      const updated = { ...connectorCache };
+      idsToFetch.forEach((id, i) => { if (results[i]) updated[id] = results[i]; });
+      setConnectorCache(updated);
+      setLoading(false);
+    }
+  }
+
+  // Find the relevant method in connector code for a given step
+  function findMethod(code, stepName) {
+    if (!code) return null;
+    const methodMap = {
+      extract: "async def extract",
+      load_staging: "async def load_staging",
+      promote: "async def promote",
+      quality_gate: "async def count_rows",
+      cleanup: "async def cleanup",
+      connectors: "async def test_connection",
+    };
+    const pattern = methodMap[stepName];
+    if (!pattern) return null;
+    const lines = code.split("\n");
+    const startIdx = lines.findIndex((l) => l.includes(pattern));
+    if (startIdx === -1) return null;
+    // Find the next method or end of class
+    const indent = lines[startIdx].search(/\S/);
+    let endIdx = lines.length;
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.trim() === "") continue;
+      const lineIndent = line.search(/\S/);
+      if (lineIndent <= indent && (line.trim().startsWith("async def ") || line.trim().startsWith("def ") || line.trim().startsWith("class "))) {
+        endIdx = i;
+        break;
+      }
+    }
+    return lines.slice(startIdx, endIdx).join("\n");
+  }
+
+  return (
+    <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
+      <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Execution Log</div>
+      <div className="relative pl-4 border-l-2 border-stone-200 space-y-1.5">
+        {log.map((entry, i) => {
+          const stepColor = entry.status === "error" ? "bg-red-400" : entry.status === "warn" ? "bg-amber-400" : "bg-green-400";
+          const role = STEP_CONNECTOR_MAP[entry.step];
+          const isClickable = hasConnectors && role;
+          const isExpanded = expandedStep === i;
+          return (
+            <div key={i}>
+              <div
+                className={"relative flex items-start gap-2 text-xs" + (isClickable ? " cursor-pointer hover:bg-stone-50 -mx-1 px-1 rounded" : "")}
+                onClick={() => isClickable && toggleStep(i, entry.step)}
+              >
+                <div className={`absolute -left-[21px] top-1 w-2.5 h-2.5 rounded-full ${stepColor} ring-2 ring-white`} />
+                <div className="flex-1 flex items-baseline gap-2 min-w-0">
+                  <span className={"font-mono font-medium whitespace-nowrap " + (isClickable ? "text-blue-700 underline decoration-dotted" : "text-stone-700")}>{entry.step}</span>
+                  {entry.detail && <span className="text-stone-400 truncate">{entry.detail}</span>}
+                </div>
+                <span className="text-stone-300 font-mono whitespace-nowrap text-[10px]">{entry.elapsed_ms}ms</span>
+                {isClickable && <span className="text-[10px] text-stone-300">{isExpanded ? "\u25B2" : "\u25BC"}</span>}
+              </div>
+              {isExpanded && (
+                <div className="ml-2 mt-1 mb-2 space-y-2">
+                  {loading && <div className="text-[10px] text-stone-400">Loading connector code...</div>}
+                  {(role === "source" || role === "both") && sourceConnectorId && connectorCache[sourceConnectorId] && (() => {
+                    const c = connectorCache[sourceConnectorId];
+                    const method = findMethod(c.code, entry.step);
+                    return (
+                      <div className="border border-blue-200 rounded bg-blue-50/50">
+                        <div className="flex items-center gap-2 px-2 py-1.5">
+                          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">source</span>
+                          <span className="text-[10px] font-medium text-stone-600">{c.name}</span>
+                          <span className="text-[10px] text-stone-400">{c.db_type}</span>
+                        </div>
+                        <pre className="text-[11px] bg-stone-900 text-green-300 rounded-b p-2 overflow-x-auto whitespace-pre-wrap max-h-60 overflow-y-auto">{method || c.code}</pre>
+                      </div>
+                    );
+                  })()}
+                  {(role === "target" || role === "both") && targetConnectorId && connectorCache[targetConnectorId] && (() => {
+                    const c = connectorCache[targetConnectorId];
+                    const method = findMethod(c.code, entry.step);
+                    return (
+                      <div className="border border-green-200 rounded bg-green-50/50">
+                        <div className="flex items-center gap-2 px-2 py-1.5">
+                          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-green-100 text-green-700">target</span>
+                          <span className="text-[10px] font-medium text-stone-600">{c.name}</span>
+                          <span className="text-[10px] text-stone-400">{c.db_type}</span>
+                        </div>
+                        <pre className="text-[11px] bg-stone-900 text-green-300 rounded-b p-2 overflow-x-auto whitespace-pre-wrap max-h-60 overflow-y-auto">{method || c.code}</pre>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ActivityRunDetail({ r }) {
   const [expanded, setExpanded] = useState(false);
   const duration = r.started_at && r.completed_at
@@ -1956,26 +2094,13 @@ function ActivityRunDetail({ r }) {
             </div>
           )}
 
-          {/* Execution Log */}
+          {/* Execution Log with Connector Code Links */}
           {r.execution_log && r.execution_log.length > 0 && (
-            <div className="bg-white border border-stone-200 rounded-lg px-3 py-2">
-              <div className="text-[10px] uppercase text-stone-400 font-semibold mb-2">Execution Log</div>
-              <div className="relative pl-4 border-l-2 border-stone-200 space-y-1.5">
-                {r.execution_log.map((entry, i) => {
-                  const stepColor = entry.status === "error" ? "bg-red-400" : entry.status === "warn" ? "bg-amber-400" : "bg-green-400";
-                  return (
-                    <div key={i} className="relative flex items-start gap-2 text-xs">
-                      <div className={`absolute -left-[21px] top-1 w-2.5 h-2.5 rounded-full ${stepColor} ring-2 ring-white`} />
-                      <div className="flex-1 flex items-baseline gap-2 min-w-0">
-                        <span className="font-mono font-medium text-stone-700 whitespace-nowrap">{entry.step}</span>
-                        {entry.detail && <span className="text-stone-400 truncate">{entry.detail}</span>}
-                      </div>
-                      <span className="text-stone-300 font-mono whitespace-nowrap text-[10px]">{entry.elapsed_ms}ms</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+            <ExecutionLogWithCode
+              log={r.execution_log}
+              sourceConnectorId={r.source_connector_id}
+              targetConnectorId={r.target_connector_id}
+            />
           )}
 
           {/* Error detail */}
@@ -2003,7 +2128,7 @@ function ActivityView({ searchQuery }) {
         const allRuns = await Promise.all(
           pipelines.slice(0, 20).map((p) =>
             api("GET", `/api/pipelines/${p.pipeline_id}/runs?limit=10`)
-              .then((rs) => rs.map((r) => ({ ...r, pipeline_name: p.pipeline_name, tier: p.tier })))
+              .then((rs) => rs.map((r) => ({ ...r, pipeline_name: p.pipeline_name, tier: p.tier, source_connector_id: p.source_connector_id, target_connector_id: p.target_connector_id })))
               .catch(() => [])
           )
         );
