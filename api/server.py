@@ -5127,7 +5127,7 @@ def create_app(
         caller: dict = Depends(auth_dep),
     ):
         """Agent suggests KPI metrics for a pipeline's target table."""
-        require_role(caller, "operator")
+        require_role(caller, "admin", "operator")
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
@@ -5157,7 +5157,7 @@ def create_app(
         caller: dict = Depends(auth_dep),
     ):
         """Create a metric. If sql_expression is empty, agent generates it from description."""
-        require_role(caller, "operator")
+        require_role(caller, "admin", "operator")
         from contracts.models import MetricDefinition, MetricType
 
         p = await store.get_pipeline(body.pipeline_id)
@@ -5207,7 +5207,7 @@ def create_app(
     ):
         """List metrics, optionally filtered by pipeline."""
         metrics = await store.list_metrics(pipeline_id)
-        return [
+        return {"metrics": [
             {"metric_id": m.metric_id, "pipeline_id": m.pipeline_id,
              "metric_name": m.metric_name, "description": m.description,
              "metric_type": m.metric_type.value if hasattr(m.metric_type, "value") else m.metric_type,
@@ -5216,7 +5216,7 @@ def create_app(
              "tags": m.tags, "enabled": m.enabled, "created_by": m.created_by,
              "created_at": m.created_at}
             for m in metrics
-        ]
+        ]}
 
     @app.get("/api/metrics/{metric_id}")
     async def get_metric(
@@ -5252,7 +5252,7 @@ def create_app(
         caller: dict = Depends(auth_dep),
     ):
         """Compute a metric now by executing its SQL against the target database."""
-        require_role(caller, "operator")
+        require_role(caller, "admin", "operator")
         from contracts.models import MetricSnapshot, now_iso
 
         m = await store.get_metric(metric_id)
@@ -5274,9 +5274,9 @@ def create_app(
             if p.target_user:
                 tgt_params["user"] = p.target_user
             if p.target_password:
-                from crypto import decrypt_dict, CREDENTIAL_FIELDS
-                creds = decrypt_dict({"password": p.target_password}, CREDENTIAL_FIELDS)
-                tgt_params["password"] = creds.get("password", "")
+                tgt_params["password"] = p.target_password
+            if config.has_encryption_key:
+                tgt_params = decrypt_dict(tgt_params, config.encryption_key, CREDENTIAL_FIELDS)
             if p.target_options:
                 tgt_params.update(p.target_options)
 
@@ -5351,7 +5351,7 @@ def create_app(
         caller: dict = Depends(auth_dep),
     ):
         """Update metric fields."""
-        require_role(caller, "operator")
+        require_role(caller, "admin", "operator")
         from contracts.models import MetricType, now_iso
         m = await store.get_metric(metric_id)
         if not m:

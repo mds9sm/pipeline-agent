@@ -91,7 +91,7 @@ async def observability_loop(config: Config, store: Store, agent: AgentCore, reg
 
             # Scheduled metric computation every 5m (10 ticks x 30s)
             if registry and tick % 10 == 0:
-                await _compute_scheduled_metrics(store, registry)
+                await _compute_scheduled_metrics(store, registry, config)
 
             # GitOps reconciliation every 5m (10 ticks x 30s) when conflicts detected
             if gitops and gitops.needs_reconcile and tick % 10 == 0:
@@ -170,7 +170,7 @@ async def _check_anomalies(store: Store, agent):
         log.warning("Anomaly reasoning failed: %s", e)
 
 
-async def _compute_scheduled_metrics(store: Store, registry):
+async def _compute_scheduled_metrics(store: Store, registry, config: Config):
     """Compute all enabled metrics that have a schedule_cron set."""
     try:
         metrics = await store.list_metrics()
@@ -192,11 +192,12 @@ async def _compute_scheduled_metrics(store: Store, registry):
                 if p.target_user:
                     tgt_params["user"] = p.target_user
                 if p.target_password:
-                    from crypto import decrypt_dict, CREDENTIAL_FIELDS
-                    creds = decrypt_dict({"password": p.target_password}, CREDENTIAL_FIELDS)
-                    tgt_params["password"] = creds.get("password", "")
+                    tgt_params["password"] = p.target_password
                 if p.target_options:
                     tgt_params.update(p.target_options)
+                if config.has_encryption_key:
+                    from crypto import decrypt_dict, CREDENTIAL_FIELDS
+                    tgt_params = decrypt_dict(tgt_params, config.encryption_key, CREDENTIAL_FIELDS)
                 target = await registry.get_target(p.target_connector_id, tgt_params)
                 result = await target.execute_sql(m.sql_expression, timeout_seconds=30)
                 value = 0.0
