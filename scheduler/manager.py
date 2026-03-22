@@ -299,9 +299,10 @@ class Scheduler:
                         break
 
                 if all_satisfied:
+                    ctx_flag = downstream.auto_propagate_context if hasattr(downstream, "auto_propagate_context") else True
                     log.info(
-                        "Data-triggered: upstream %s completed, triggering downstream %s.",
-                        completed_pipeline_id, downstream.pipeline_name,
+                        "Data-triggered: upstream %s completed, triggering downstream %s (context_propagation=%s).",
+                        completed_pipeline_id, downstream.pipeline_name, ctx_flag,
                     )
                     run = RunRecord(
                         pipeline_id=downstream_id,
@@ -315,7 +316,7 @@ class Scheduler:
                     await self.store.save_decision(DecisionLog(
                         pipeline_id=downstream_id,
                         decision_type="data_triggered",
-                        detail=f"Triggered by upstream completion: {completed_pipeline_id}",
+                        detail=f"Triggered by upstream completion: {completed_pipeline_id} (context_propagation={ctx_flag})",
                         reasoning="All upstream dependencies satisfied after upstream pipeline completed.",
                     ))
 

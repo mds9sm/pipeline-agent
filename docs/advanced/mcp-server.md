@@ -72,7 +72,7 @@ For a remote DAPOS instance (e.g., Railway):
 
 ## Resources (Browsable Data)
 
-Resources are read-only data that MCP clients can browse. DAPOS exposes 9 resources:
+Resources are read-only data that MCP clients can browse. DAPOS exposes 12 resources:
 
 | Resource URI | Description |
 |-------------|-------------|
@@ -84,12 +84,16 @@ Resources are read-only data that MCP clients can browse. DAPOS exposes 9 resour
 | `dapos://anomalies` | Current platform anomaly scan with AI reasoning |
 | `dapos://catalog/tables/{pipeline_id}` | Detailed catalog entry for a specific table |
 | `dapos://pipelines/{pipeline_id}` | Full pipeline configuration and status |
+| `dapos://transforms` | All SQL transform definitions |
+| `dapos://metrics` | All metric definitions with latest values |
+| `dapos://metrics/{metric_id}` | Metric detail with snapshots and reasoning |
+| `dapos://business-knowledge` | Company context, glossary, and KPI definitions |
 
 ---
 
 ## Tools (Actions)
 
-Tools are actions that AI agents can invoke. DAPOS exposes 13 tools:
+Tools are actions that AI agents can invoke. DAPOS exposes 24 tools:
 
 ### Catalog & Discovery
 
@@ -113,6 +117,32 @@ Tools are actions that AI agents can invoke. DAPOS exposes 13 tools:
 | `get_freshness` | Check data freshness (single pipeline or all) |
 | `generate_narrative` | Generate human-readable alert explanation |
 | `design_topology` | Design multi-pipeline architecture from natural language |
+
+### Transforms
+
+| Tool | Description |
+|------|-------------|
+| `list_transforms` | List all SQL transforms |
+| `get_transform` | Get transform detail |
+| `create_transform` | Create a new SQL transform |
+| `generate_transform` | AI-generate transform SQL from description |
+| `validate_transform` | Validate transform SQL syntax and refs |
+
+### Metrics & KPIs
+
+| Tool | Description |
+|------|-------------|
+| `suggest_metrics` | Agent suggests KPI metrics for a pipeline |
+| `create_metric` | Create a metric definition |
+| `compute_metric` | Execute metric SQL and store snapshot |
+| `get_metric_trend` | Agent interprets metric time-series trend |
+| `list_metrics` | List all metrics, optional pipeline filter |
+
+### Context & Knowledge
+
+| Tool | Description |
+|------|-------------|
+| `get_business_knowledge` | Get company context, glossary, KPI definitions |
 
 ---
 

@@ -27,6 +27,7 @@
 | [Data Catalog](concepts/data-catalog.md) | Search, trust scores, semantic tags, business context |
 | [Anomaly Narratives](concepts/anomaly-narratives.md) | AI-generated alert explanations |
 | [SQL Transforms](concepts/transforms.md) | Native SQL transforms replacing dbt — ref(), var(), materialization |
+| [Metrics & KPIs](concepts/metrics.md) | Lightweight KPI definitions, agentic suggest/generate/interpret, per-metric reasoning |
 
 ## Operations
 
@@ -52,8 +53,8 @@
 
 | Topic | Description |
 |-------|-------------|
-| [Post-Promotion Hooks](advanced/hooks.md) | SQL hooks with 34 template variables |
-| [Template Variables](advanced/template-variables.md) | Full reference for `{{variable}}` placeholders |
+| [Post-Promotion Hooks](advanced/hooks.md) | SQL hooks with 42 template variables |
+| [Template Variables](advanced/template-variables.md) | Full reference for `{{variable}}` placeholders (42 total) |
 | [Schema Drift](advanced/schema-drift.md) | Detection, policies, auto-remediation |
 | [Trust Scores](advanced/trust-scores.md) | Trust score formula, components, weight customization |
 | [Multi-Environment](advanced/multi-environment.md) | Branch-per-environment, connection parameterization |

@@ -10,7 +10,7 @@ Post-promotion hooks execute SQL statements after a pipeline run successfully pr
 Extract → Load → Quality Gate → Promote → Hooks Execute → Complete
 ```
 
-Hooks run **after promotion**, so they can reference the newly-promoted data. Each hook is a SQL template with access to 34 template variables.
+Hooks run **after promotion**, so they can reference the newly-promoted data. Each hook is a SQL template with access to 42 template variables.
 
 ---
 
@@ -36,7 +36,9 @@ Hooks run **after promotion**, so they can reference the newly-promoted data. Ea
 
 ---
 
-## Template Variables (34 Total)
+## Template Variables (42 Total)
+
+See [Template Variables Reference](template-variables.md) for the complete list with types and examples.
 
 ### Run Context (15)
 
@@ -73,7 +75,7 @@ Hooks run **after promotion**, so they can reference the newly-promoted data. Ea
 | `{{target_port}}` | `5432` | Target connection port |
 | `{{target_ddl}}` | `CREATE TABLE...` | Target table DDL |
 
-### Upstream Context (9)
+### Upstream Context (9 base + 8 enriched)
 
 Available when the run was triggered by an upstream pipeline completion:
 
@@ -88,6 +90,22 @@ Available when the run was triggered by an upstream pipeline completion:
 | `{{upstream_target_schema}}` | Upstream target schema |
 | `{{upstream_target_table}}` | Upstream target table |
 | `{{upstream_completed_at}}` | Upstream run completion timestamp |
+
+#### Enriched Context (Build 28)
+
+When `auto_propagate_context` is enabled (default: true), quality and metadata from upstream runs flow automatically:
+
+| Variable | Description |
+|----------|-------------|
+| `{{upstream_pipeline_name}}` | Upstream pipeline name |
+| `{{upstream_gate_decision}}` | Upstream quality gate decision |
+| `{{upstream_quality_decision}}` | Alias for gate decision |
+| `{{upstream_quality_checks_passed}}` | Checks that passed upstream |
+| `{{upstream_quality_checks_warned}}` | Checks with warnings upstream |
+| `{{upstream_quality_checks_failed}}` | Checks that failed upstream |
+| `{{upstream_rows_loaded}}` | Rows loaded upstream |
+| `{{upstream_status}}` | Upstream run status |
+| `{{upstream_metadata.<key>}}` | Any key from upstream pipeline metadata (dynamic) |
 
 ---
 

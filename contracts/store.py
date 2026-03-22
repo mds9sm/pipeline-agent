@@ -19,7 +19,7 @@ from contracts.models import (
     PipelineMetadata, SchemaChangePolicy, PostPromotionHook,
     DataContract, ContractViolation, ChatInteraction, PipelineChangeLog,
     PipelineChangeType, RegisteredSource, SqlTransform, MaterializationType,
-    MetricDefinition, MetricSnapshot, MetricType,
+    MetricDefinition, MetricSnapshot, MetricType, RunContext, BusinessKnowledge,
     ColumnMapping, QualityConfig, CheckResult,
     PipelineStatus, RunStatus, RunMode, RefreshType, ReplicationMethod,
     LoadType, GateDecision, CheckStatus, ProposalStatus, TriggerType,
@@ -162,12 +162,13 @@ class ContractStore:
                 baseline_cardinality, baseline_volume_avg, baseline_volume_stddev,
                 auto_approve_additive_schema, approval_notification_channel,
                 schema_change_policy, post_promotion_hooks, steps,
-                semantic_tags, trust_weights, business_context
+                semantic_tags, trust_weights, business_context,
+                auto_propagate_context
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
                 $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
                 $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,
-                $57,$58,$59
+                $57,$58,$59,$60
             )
             ON CONFLICT (pipeline_id) DO UPDATE SET
                 pipeline_name=EXCLUDED.pipeline_name, version=EXCLUDED.version,
@@ -215,7 +216,8 @@ class ContractStore:
                 steps=EXCLUDED.steps,
                 semantic_tags=EXCLUDED.semantic_tags,
                 trust_weights=EXCLUDED.trust_weights,
-                business_context=EXCLUDED.business_context
+                business_context=EXCLUDED.business_context,
+                auto_propagate_context=EXCLUDED.auto_propagate_context
         """,
             p.pipeline_id, p.pipeline_name, p.version, p.created_at, p.updated_at,
             p.status.value, p.environment,
@@ -241,6 +243,7 @@ class ContractStore:
             scp_json, hooks_json, steps_json,
             json.dumps(p.semantic_tags), json.dumps(p.trust_weights) if p.trust_weights else None,
             json.dumps(p.business_context),
+            p.auto_propagate_context,
         )
 
     async def get_pipeline(self, pipeline_id: str) -> Optional[PipelineContract]:
@@ -1546,8 +1549,9 @@ class ContractStore:
             INSERT INTO metrics (
                 metric_id, pipeline_id, metric_name, description, sql_expression,
                 metric_type, dimensions, schedule_cron, tags,
-                created_by, enabled, created_at, updated_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                created_by, enabled, reasoning, reasoning_history,
+                created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
             ON CONFLICT (metric_id) DO UPDATE SET
                 metric_name=EXCLUDED.metric_name,
                 description=EXCLUDED.description,
@@ -1557,6 +1561,8 @@ class ContractStore:
                 schedule_cron=EXCLUDED.schedule_cron,
                 tags=EXCLUDED.tags,
                 enabled=EXCLUDED.enabled,
+                reasoning=EXCLUDED.reasoning,
+                reasoning_history=EXCLUDED.reasoning_history,
                 updated_at=EXCLUDED.updated_at
         """,
             m.metric_id, m.pipeline_id, m.metric_name, m.description,
@@ -1565,7 +1571,9 @@ class ContractStore:
             json.dumps(m.dimensions),
             m.schedule_cron,
             json.dumps(m.tags),
-            m.created_by, m.enabled, m.created_at, m.updated_at,
+            m.created_by, m.enabled, m.reasoning,
+            json.dumps(m.reasoning_history),
+            m.created_at, m.updated_at,
         )
 
     async def get_metric(self, metric_id: str) -> Optional[MetricDefinition]:
@@ -1615,6 +1623,263 @@ class ContractStore:
             "SELECT * FROM pipelines WHERE target_table = $1 LIMIT 1", target_table
         )
         return self._row_to_pipeline(row) if row else None
+
+    # ==================================================================
+    # Build 28: Run Context
+    # ==================================================================
+
+    async def get_run_context(self, run_id: str) -> Optional[RunContext]:
+        """Build a RunContext for a single run: own data + upstream + metadata."""
+        run = await self.get_run(run_id)
+        if not run:
+            return None
+
+        pipeline = await self.get_pipeline(run.pipeline_id)
+        p_name = pipeline.pipeline_name if pipeline else ""
+
+        # Quality summary from quality_results
+        quality_summary = {}
+        if run.quality_results:
+            qr = run.quality_results
+            checks = qr.get("checks", [])
+            quality_summary = {
+                "decision": qr.get("decision", ""),
+                "checks_passed": sum(1 for c in checks if c.get("status") == "pass"),
+                "checks_warned": sum(1 for c in checks if c.get("status") == "warn"),
+                "checks_failed": sum(1 for c in checks if c.get("status") == "fail"),
+                "total_checks": len(checks),
+            }
+
+        # Metadata snapshot
+        metadata_items = await self.list_metadata(run.pipeline_id)
+        metadata_snapshot = {
+            m.key: m.value_json for m in metadata_items
+            if m.created_by_run_id == run.run_id
+        }
+
+        # Build upstream context recursively (one level deep to avoid deep chains)
+        upstream_context = {}
+        if run.triggered_by_run_id:
+            upstream_ctx = await self._build_upstream_context(run.triggered_by_run_id, depth=0, max_depth=5)
+            if upstream_ctx:
+                upstream_context = upstream_ctx
+
+        return RunContext(
+            run_id=run.run_id,
+            pipeline_id=run.pipeline_id,
+            pipeline_name=p_name,
+            status=run.status.value if hasattr(run.status, "value") else str(run.status),
+            rows_extracted=run.rows_extracted,
+            rows_loaded=run.rows_loaded,
+            watermark_before=run.watermark_before,
+            watermark_after=run.watermark_after,
+            started_at=run.started_at,
+            completed_at=run.completed_at,
+            gate_decision=run.gate_decision.value if run.gate_decision and hasattr(run.gate_decision, "value") else (str(run.gate_decision) if run.gate_decision else None),
+            quality_summary=quality_summary,
+            triggered_by_run_id=run.triggered_by_run_id,
+            triggered_by_pipeline_id=run.triggered_by_pipeline_id,
+            upstream_context=upstream_context,
+            metadata_snapshot=metadata_snapshot,
+        )
+
+    async def _build_upstream_context(self, run_id: str, depth: int = 0, max_depth: int = 5) -> dict:
+        """Recursively build upstream context chain."""
+        if depth >= max_depth:
+            return {}
+        run = await self.get_run(run_id)
+        if not run:
+            return {}
+        pipeline = await self.get_pipeline(run.pipeline_id)
+        p_name = pipeline.pipeline_name if pipeline else ""
+
+        quality_summary = {}
+        if run.quality_results:
+            qr = run.quality_results
+            checks = qr.get("checks", [])
+            quality_summary = {
+                "decision": qr.get("decision", ""),
+                "checks_passed": sum(1 for c in checks if c.get("status") == "pass"),
+                "checks_warned": sum(1 for c in checks if c.get("status") == "warn"),
+                "checks_failed": sum(1 for c in checks if c.get("status") == "fail"),
+            }
+
+        ctx = {
+            "run_id": run.run_id,
+            "pipeline_id": run.pipeline_id,
+            "pipeline_name": p_name,
+            "status": run.status.value if hasattr(run.status, "value") else str(run.status),
+            "rows_extracted": run.rows_extracted,
+            "rows_loaded": run.rows_loaded,
+            "watermark_before": run.watermark_before,
+            "watermark_after": run.watermark_after,
+            "gate_decision": run.gate_decision.value if run.gate_decision and hasattr(run.gate_decision, "value") else None,
+            "quality_summary": quality_summary,
+            "started_at": run.started_at,
+            "completed_at": run.completed_at,
+        }
+
+        # Recurse upstream
+        if run.triggered_by_run_id:
+            ctx["upstream"] = await self._build_upstream_context(
+                run.triggered_by_run_id, depth + 1, max_depth,
+            )
+
+        return ctx
+
+    async def get_context_chain(self, pipeline_id: str) -> list[dict]:
+        """Get the upstream context chain for a pipeline: its latest run context
+        plus each upstream dependency's latest run context, walking the DAG."""
+        visited = set()
+        chain = []
+        await self._walk_context_chain(pipeline_id, chain, visited)
+        return chain
+
+    async def _walk_context_chain(self, pipeline_id: str, chain: list, visited: set) -> None:
+        """Recursively walk upstream dependencies and collect latest run context."""
+        if pipeline_id in visited:
+            return
+        visited.add(pipeline_id)
+
+        pipeline = await self.get_pipeline(pipeline_id)
+        if not pipeline:
+            return
+
+        last_run = await self.get_last_successful_run(pipeline_id)
+        entry = {
+            "pipeline_id": pipeline_id,
+            "pipeline_name": pipeline.pipeline_name,
+            "tier": pipeline.tier,
+            "auto_propagate_context": pipeline.auto_propagate_context,
+            "last_run": None,
+        }
+        if last_run:
+            quality_summary = {}
+            if last_run.quality_results:
+                qr = last_run.quality_results
+                checks = qr.get("checks", [])
+                quality_summary = {
+                    "decision": qr.get("decision", ""),
+                    "checks_passed": sum(1 for c in checks if c.get("status") == "pass"),
+                    "checks_warned": sum(1 for c in checks if c.get("status") == "warn"),
+                    "checks_failed": sum(1 for c in checks if c.get("status") == "fail"),
+                }
+            entry["last_run"] = {
+                "run_id": last_run.run_id,
+                "status": last_run.status.value,
+                "rows_extracted": last_run.rows_extracted,
+                "watermark_after": last_run.watermark_after,
+                "gate_decision": last_run.gate_decision.value if last_run.gate_decision else None,
+                "quality_summary": quality_summary,
+                "completed_at": last_run.completed_at,
+            }
+
+        chain.append(entry)
+
+        # Walk upstream
+        deps = await self.list_dependencies(pipeline_id)
+        for dep in deps:
+            await self._walk_context_chain(dep.depends_on_id, chain, visited)
+
+    async def load_upstream_context_for_run(self, run: RunRecord) -> dict:
+        """Load full upstream context for a data-triggered run.
+        Returns a dict suitable for template variable rendering."""
+        if not run.triggered_by_run_id:
+            return {}
+
+        upstream_run = await self.get_run(run.triggered_by_run_id)
+        if not upstream_run:
+            return {}
+
+        pipeline = await self.get_pipeline(upstream_run.pipeline_id)
+        p_name = pipeline.pipeline_name if pipeline else ""
+
+        # Gate decision
+        gate_str = ""
+        if upstream_run.gate_decision:
+            gate_str = upstream_run.gate_decision.value if hasattr(upstream_run.gate_decision, "value") else str(upstream_run.gate_decision)
+
+        # Quality summary
+        quality_summary = {}
+        if upstream_run.quality_results:
+            qr = upstream_run.quality_results
+            checks = qr.get("checks", [])
+            quality_summary = {
+                "decision": qr.get("decision", ""),
+                "checks_passed": sum(1 for c in checks if c.get("status") == "pass"),
+                "checks_warned": sum(1 for c in checks if c.get("status") == "warn"),
+                "checks_failed": sum(1 for c in checks if c.get("status") == "fail"),
+            }
+
+        # Upstream pipeline metadata
+        metadata_items = await self.list_metadata(upstream_run.pipeline_id)
+        upstream_metadata = {m.key: m.value_json.get("value", m.value_json) for m in metadata_items}
+
+        return {
+            "upstream_run_id": upstream_run.run_id,
+            "upstream_pipeline_id": upstream_run.pipeline_id,
+            "upstream_pipeline_name": p_name,
+            "upstream_gate_decision": gate_str,
+            "upstream_quality_decision": quality_summary.get("decision", ""),
+            "upstream_quality_checks_passed": str(quality_summary.get("checks_passed", 0)),
+            "upstream_quality_checks_warned": str(quality_summary.get("checks_warned", 0)),
+            "upstream_quality_checks_failed": str(quality_summary.get("checks_failed", 0)),
+            "upstream_watermark_before": upstream_run.watermark_before or "",
+            "upstream_watermark_after": upstream_run.watermark_after or "",
+            "upstream_rows_extracted": str(upstream_run.rows_extracted),
+            "upstream_rows_loaded": str(upstream_run.rows_loaded),
+            "upstream_started_at": upstream_run.started_at or "",
+            "upstream_completed_at": upstream_run.completed_at or "",
+            "upstream_batch_id": upstream_run.run_id[:8],
+            "upstream_metadata": upstream_metadata,
+        }
+
+    # ==================================================================
+    # Build 32: Business Knowledge
+    # ==================================================================
+
+    async def get_business_knowledge(self) -> BusinessKnowledge:
+        """Get the singleton business knowledge record."""
+        row = await self.pool.fetchrow("SELECT * FROM business_knowledge LIMIT 1")
+        if not row:
+            return BusinessKnowledge()
+        return BusinessKnowledge(
+            company_name=row.get("company_name", ""),
+            industry=row.get("industry", ""),
+            business_description=row.get("business_description", ""),
+            datasets_description=row.get("datasets_description", ""),
+            glossary=json.loads(row.get("glossary", "{}") or "{}"),
+            kpi_definitions=json.loads(row.get("kpi_definitions", "[]") or "[]"),
+            custom_instructions=row.get("custom_instructions", ""),
+            updated_at=row.get("updated_at", ""),
+            updated_by=row.get("updated_by", ""),
+        )
+
+    async def save_business_knowledge(self, bk: BusinessKnowledge) -> None:
+        """Upsert the singleton business knowledge record (id=1)."""
+        bk.updated_at = now_iso()
+        await self.pool.execute("""
+            INSERT INTO business_knowledge (
+                id, company_name, industry, business_description,
+                datasets_description, glossary, kpi_definitions,
+                custom_instructions, updated_at, updated_by
+            ) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (id) DO UPDATE SET
+                company_name=EXCLUDED.company_name,
+                industry=EXCLUDED.industry,
+                business_description=EXCLUDED.business_description,
+                datasets_description=EXCLUDED.datasets_description,
+                glossary=EXCLUDED.glossary,
+                kpi_definitions=EXCLUDED.kpi_definitions,
+                custom_instructions=EXCLUDED.custom_instructions,
+                updated_at=EXCLUDED.updated_at,
+                updated_by=EXCLUDED.updated_by
+        """,
+            bk.company_name, bk.industry, bk.business_description,
+            bk.datasets_description, json.dumps(bk.glossary),
+            json.dumps(bk.kpi_definitions), bk.custom_instructions,
+            bk.updated_at, bk.updated_by,
+        )
 
 
 # ======================================================================
@@ -1709,6 +1974,7 @@ def _row_to_pipeline(row: asyncpg.Record) -> PipelineContract:
         semantic_tags=json.loads(row["semantic_tags"]) if row.get("semantic_tags") else {},
         trust_weights=json.loads(row["trust_weights"]) if row.get("trust_weights") else None,
         business_context=json.loads(row["business_context"]) if row.get("business_context") else {},
+        auto_propagate_context=row.get("auto_propagate_context", True),
     )
 
 
@@ -2079,6 +2345,8 @@ def _row_to_metric(row: asyncpg.Record) -> MetricDefinition:
         tags=json.loads(row["tags"]) if row.get("tags") else {},
         created_by=row.get("created_by", "agent"),
         enabled=row.get("enabled", True),
+        reasoning=row.get("reasoning", ""),
+        reasoning_history=json.loads(row["reasoning_history"]) if row.get("reasoning_history") else [],
         created_at=row.get("created_at", ""),
         updated_at=row.get("updated_at", ""),
     )
@@ -2178,7 +2446,8 @@ CREATE TABLE IF NOT EXISTS pipelines (
     approval_notification_channel TEXT NOT NULL DEFAULT '',
     schema_change_policy JSONB NOT NULL DEFAULT '{}',
     post_promotion_hooks JSONB NOT NULL DEFAULT '[]',
-    steps JSONB NOT NULL DEFAULT '[]'
+    steps JSONB NOT NULL DEFAULT '[]',
+    auto_propagate_context BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -2557,6 +2826,8 @@ CREATE TABLE IF NOT EXISTS metrics (
     tags JSONB NOT NULL DEFAULT '{}',
     created_by TEXT NOT NULL DEFAULT 'agent',
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    reasoning TEXT NOT NULL DEFAULT '',
+    reasoning_history JSONB NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -2595,6 +2866,24 @@ ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS trust_weights JSONB;
 ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS business_context JSONB NOT NULL DEFAULT '{}';
 -- Build 30: Run insights
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS insights JSONB;
+-- Build 28: Auto-propagate upstream context flag
+ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS auto_propagate_context BOOLEAN NOT NULL DEFAULT TRUE;
+-- Build 32: Metric reasoning
+ALTER TABLE metrics ADD COLUMN IF NOT EXISTS reasoning TEXT NOT NULL DEFAULT '';
+ALTER TABLE metrics ADD COLUMN IF NOT EXISTS reasoning_history JSONB NOT NULL DEFAULT '[]';
+-- Build 32: Business knowledge (singleton)
+CREATE TABLE IF NOT EXISTS business_knowledge (
+    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    company_name TEXT NOT NULL DEFAULT '',
+    industry TEXT NOT NULL DEFAULT '',
+    business_description TEXT NOT NULL DEFAULT '',
+    datasets_description TEXT NOT NULL DEFAULT '',
+    glossary JSONB NOT NULL DEFAULT '{}',
+    kpi_definitions JSONB NOT NULL DEFAULT '[]',
+    custom_instructions TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL DEFAULT ''
+);
 """
 
 # Alias used by several modules (agent, scheduler, monitor, api).

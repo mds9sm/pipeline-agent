@@ -465,6 +465,9 @@ class PipelineContract:
     # Pipeline business context (Build 26) — captured via guided questions
     business_context: dict = field(default_factory=dict)
 
+    # Build 28: Auto-propagate upstream context to downstream runs
+    auto_propagate_context: bool = True
+
     # Composable step DAG (Build 18) — empty list = legacy mode
     steps: list[StepDefinition] = field(default_factory=list)
 
@@ -994,6 +997,8 @@ class MetricDefinition:
     tags: dict = field(default_factory=dict)
     created_by: str = "agent"
     enabled: bool = True
+    reasoning: str = ""
+    reasoning_history: list = field(default_factory=list)
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
 
@@ -1007,3 +1012,47 @@ class MetricSnapshot:
     value: float = 0.0
     dimension_values: dict = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
+
+
+# ── Build 28: Run Context (cross-pipeline context propagation) ────────
+
+@dataclass
+class RunContext:
+    """Aggregated context for a single run — own data + upstream propagation."""
+    run_id: str = ""
+    pipeline_id: str = ""
+    pipeline_name: str = ""
+    # Own run data
+    status: str = ""
+    rows_extracted: int = 0
+    rows_loaded: int = 0
+    watermark_before: Optional[str] = None
+    watermark_after: Optional[str] = None
+    started_at: str = ""
+    completed_at: Optional[str] = None
+    gate_decision: Optional[str] = None
+    quality_summary: dict = field(default_factory=dict)
+    # Upstream trigger info
+    triggered_by_run_id: Optional[str] = None
+    triggered_by_pipeline_id: Optional[str] = None
+    # Propagated upstream context (recursively merged)
+    upstream_context: dict = field(default_factory=dict)
+    # Pipeline metadata snapshot at run time
+    metadata_snapshot: dict = field(default_factory=dict)
+
+
+# ── Build 32: Business Knowledge (company context for agent reasoning) ──
+
+@dataclass
+class BusinessKnowledge:
+    """Singleton company/business context that the agent uses for reasoning.
+    Stored as a single row in the business_knowledge table."""
+    company_name: str = ""
+    industry: str = ""
+    business_description: str = ""
+    datasets_description: str = ""         # free-text: what data the company works with
+    glossary: dict = field(default_factory=dict)  # term → definition mapping
+    kpi_definitions: list = field(default_factory=list)  # structured KPI defs from business users
+    custom_instructions: str = ""          # additional agent instructions from user
+    updated_at: str = field(default_factory=now_iso)
+    updated_by: str = ""

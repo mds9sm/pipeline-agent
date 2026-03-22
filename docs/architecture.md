@@ -36,14 +36,15 @@ DAPOS runs as a single Python async process with four concurrent event loops, al
                     │  PostgreSQL 16 + pgvector                │
                     │    All state: pipelines, runs, gates,    │
                     │    connectors, alerts, lineage, costs,   │
-                    │    preferences, data contracts, steps    │
+                    │    preferences, contracts, steps,        │
+                    │    transforms, metrics, business_knowledge│
                     └─────────────────────────────────────────┘
 ```
 
 ## Key Principles
 
 1. **Single process, no external dependencies** — No Redis, no Celery, no Kafka. PostgreSQL is the only infrastructure.
-2. **Agent IS the product** — Claude reasons about quality, designs topologies, generates connectors, diagnoses failures, and generates post-run insights. The agent receives a rich system prompt with full platform awareness (architecture, execution flow, two-tier autonomy, quality semantics, data patterns, decision principles) on every call. Not a bolt-on.
+2. **Agent IS the product** — Claude reasons about quality, designs topologies, generates connectors, diagnoses failures, suggests metrics, interprets trends, and maintains per-metric reasoning. The agent receives a dynamic system prompt (~1,500 tokens base + business knowledge appendix) with full platform awareness on every call. Business context (company info, glossary, KPI definitions) is automatically injected. Not a bolt-on.
 3. **Two-tier autonomy** — Runtime decisions (extract/load/promote) are autonomous. Structural changes (connectors, schema, topology) require human approval.
 4. **Database as source of truth** — All state lives in PostgreSQL. Git repo is a derived artifact. UI is a read layer.
 5. **Connector-agnostic quality** — Quality gate types against `TargetEngine` interface, not specific databases.
@@ -86,5 +87,8 @@ Steps execute in topological order with per-step retry:
 | Auth | `auth.py` | JWT + 3 roles |
 | Crypto | `crypto.py` | Fernet encryption for credentials |
 | GitOps | `gitops/repo.py` | Pipeline YAML + connector versioning |
-| UI | `ui/App.jsx` | React 18 SPA (10 views) |
-| CLI | `cli/` | Command-line interface |
+| Transforms | `transforms/engine.py` | SQL transform engine — ref/var resolution, materialization |
+| MCP | `mcp_server.py` | MCP server — 12 resources, 24 tools, 3 prompts |
+| Docs | `docs/` | Structured documentation (quickstart, API, concepts, advanced) |
+| UI | `ui/App.jsx` | React 18 SPA (13 views: Chat, Pipelines, Activity, Freshness, Quality, Alerts, Lineage/DAG, Connectors, Metrics, Settings, Sources, Docs, Agent) |
+| CLI | `cli/__main__.py` | 14-command CLI interface |

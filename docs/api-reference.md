@@ -158,6 +158,51 @@ All endpoints require JWT authentication unless noted. Pass the token as `Author
 |--------|----------|-------------|------|
 | POST | `/api/observability/alerts/{id}/narrative` | Generate alert narrative via AI | viewer+ |
 
+## Context API (Build 28)
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| GET | `/api/runs/{run_id}/context` | Full aggregated run context (upstream chain, quality summary, metadata) | viewer+ |
+| GET | `/api/pipelines/{pipeline_id}/context-chain` | Upstream dependency DAG context chain | viewer+ |
+
+> **Note:** The existing `PATCH /api/pipelines/{pipeline_id}` endpoint also accepts the `auto_propagate_context` boolean field (operator+) to toggle automatic context propagation to downstream pipelines.
+
+## SQL Transforms (Build 29)
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| POST | `/api/transforms` | Create transform | operator+ |
+| GET | `/api/transforms` | List transforms (optional `?pipeline_id=` filter) | viewer+ |
+| GET | `/api/transforms/{transform_id}` | Transform detail | viewer+ |
+| PATCH | `/api/transforms/{transform_id}` | Update transform | operator+ |
+| DELETE | `/api/transforms/{transform_id}` | Delete transform | admin |
+| GET | `/api/transforms/{transform_id}/lineage` | Transform lineage refs | viewer+ |
+| POST | `/api/transforms/generate` | AI-generate transform SQL from description | operator+ |
+| POST | `/api/transforms/{transform_id}/validate` | Validate transform SQL | operator+ |
+| POST | `/api/transforms/{transform_id}/preview` | Preview materialized output | operator+ |
+
+## Metrics / KPIs (Build 31)
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| POST | `/api/metrics/suggest/{pipeline_id}` | Agent suggests metrics for a pipeline | operator+ |
+| POST | `/api/metrics` | Create metric | operator+ |
+| GET | `/api/metrics` | List metrics (optional `?pipeline_id=` filter) | viewer+ |
+| GET | `/api/metrics/{metric_id}` | Metric detail with snapshots and reasoning history | viewer+ |
+| POST | `/api/metrics/{metric_id}/compute` | Execute metric SQL and store snapshot | operator+ |
+| GET | `/api/metrics/{metric_id}/trend` | Agent trend interpretation | viewer+ |
+| PATCH | `/api/metrics/{metric_id}` | Update metric (triggers reasoning refresh) | operator+ |
+| DELETE | `/api/metrics/{metric_id}` | Delete metric and snapshots | admin |
+
+## Business Knowledge & Agent (Build 32)
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| GET | `/api/agent/system-prompt` | Read-only agent system prompt | viewer+ |
+| GET | `/api/settings/business-knowledge` | Get business knowledge (glossary, KPIs, instructions) | viewer+ |
+| PUT | `/api/settings/business-knowledge` | Update business knowledge | admin |
+| POST | `/api/settings/business-knowledge/parse-kpis` | Agent parses free-text KPIs into structured definitions | admin |
+
 ## System
 
 | Method | Endpoint | Auth? | Description |

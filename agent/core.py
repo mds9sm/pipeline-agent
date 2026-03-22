@@ -72,7 +72,10 @@ touches production. Promotion merges or appends staging into the target table.
 - Freshness severity and alert necessity
 - Anomaly detection and cross-pipeline pattern analysis
 - Error budget diagnosis (transient / persistent / degrading)
-- Run insights and suggestions
+- Run insights and post-run suggestions
+- Metric suggestions, SQL generation, trend interpretation
+- Semantic tag inference, trust score computation
+- Context propagation decisions (upstream quality/metadata)
 
 **You PROPOSE (never execute) structural changes — humans approve:**
 - New/updated connector code
@@ -108,14 +111,30 @@ Define freshness SLAs, required columns, and cleanup ownership. Violations trigg
 nullable_change). Actions: auto_add, auto_widen, propose, halt, ignore. Tier 1 defaults are \
 strictest (drops = halt, type changes = propose).
 
-**Post-promotion hooks**: SQL templates executed after successful promotion. Support 34 template \
-variables ({{watermark_after}}, {{run_id}}, {{rows_loaded}}, etc.) for dynamic post-load logic.
+**Post-promotion hooks**: SQL templates executed after successful promotion. Support 42 template \
+variables ({{watermark_after}}, {{run_id}}, {{rows_loaded}}, {{upstream_gate_decision}}, \
+{{upstream_quality_checks_passed}}, {{upstream_metadata.<key>}}, etc.) for dynamic post-load logic.
 
 **Composable steps**: Pipelines can be defined as a DAG of steps (extract, transform, gate, \
 promote, cleanup, hook, notify, custom) instead of the fixed linear flow.
 
 **SQL transforms**: Native SQL transforms with ref() for table references, var() for variables, \
 4 materialization strategies (table, view, incremental, ephemeral). Replaces dbt.
+
+**Metrics / KPIs**: Lightweight metric definitions on pipeline target tables. You suggest metrics \
+from pipeline context, generate SQL from plain English descriptions, and interpret time-series \
+trends. Metrics can be scheduled via cron for automatic computation.
+
+**Run context propagation**: Upstream run context (watermarks, row counts, quality results, gate \
+decisions, pipeline metadata) flows automatically to downstream pipelines. Controlled per-pipeline \
+via `auto_propagate_context` flag. The full context chain is accessible via API.
+
+**Data catalog**: Built-in catalog with AI-inferred semantic tags, trust scores (freshness + \
+quality + error budget + schema stability), business context captured via guided questions, \
+and AI-generated alert narratives explaining root cause and impact.
+
+**MCP server**: DAPOS is exposed to external AI agents via Model Context Protocol — 12 resources, \
+24 tools, 3 prompts. External agents can list pipelines, trigger runs, check quality, etc.
 
 ## Quality Gate — Your Decision
 
@@ -172,13 +191,59 @@ class AgentCore:
         # Per-request token accumulator (reset before each command)
         self._req_input_tokens = 0
         self._req_output_tokens = 0
+        # Build 32: Cached business knowledge context (refreshed every 5 minutes)
+        self._bk_cache: str = ""
+        self._bk_cache_at: float = 0
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _system_prompt(self) -> str:
+        """Base system prompt + cached business knowledge appendix."""
+        if self._bk_cache:
+            return _SYSTEM_PROMPT + self._bk_cache
         return _SYSTEM_PROMPT
+
+    async def _refresh_business_knowledge(self) -> None:
+        """Refresh business knowledge cache every 5 minutes."""
+        import time
+        now = time.time()
+        if now - self._bk_cache_at < 300 and self._bk_cache is not None:
+            return  # still fresh
+        try:
+            bk = await self.store.get_business_knowledge()
+            parts = []
+            if bk.company_name or bk.industry or bk.business_description:
+                parts.append("\n\n## Business Context\n")
+                if bk.company_name:
+                    parts.append(f"Company: {bk.company_name}")
+                if bk.industry:
+                    parts.append(f"Industry: {bk.industry}")
+                if bk.business_description:
+                    parts.append(f"Description: {bk.business_description}")
+            if bk.datasets_description:
+                parts.append(f"\nDatasets: {bk.datasets_description}")
+            if bk.glossary:
+                glossary_lines = [f"  - **{k}**: {v}" for k, v in bk.glossary.items()]
+                parts.append("\nBusiness Glossary:\n" + "\n".join(glossary_lines[:50]))
+            if bk.kpi_definitions:
+                kpi_lines = []
+                for kpi in bk.kpi_definitions[:30]:
+                    name = kpi.get("name", "")
+                    desc = kpi.get("description", "")
+                    formula = kpi.get("formula", "")
+                    line = f"  - **{name}**: {desc}"
+                    if formula:
+                        line += f" (formula: {formula})"
+                    kpi_lines.append(line)
+                parts.append("\nKPI Definitions (from business users):\n" + "\n".join(kpi_lines))
+            if bk.custom_instructions:
+                parts.append(f"\nCustom Instructions: {bk.custom_instructions}")
+            self._bk_cache = "\n".join(parts) if parts else ""
+            self._bk_cache_at = now
+        except Exception:
+            pass  # Keep old cache on error
 
     async def _call_claude(
         self,
@@ -191,6 +256,12 @@ class AgentCore:
         """Call Claude API, track token usage via AgentCostLog, return content text."""
         if not self.has_api:
             raise RuntimeError("No API key configured")
+
+        # Build 32: Refresh business knowledge cache (lazy, every 5 min)
+        await self._refresh_business_knowledge()
+        # If caller passed the base system prompt, append business knowledge
+        if system == _SYSTEM_PROMPT and self._bk_cache:
+            system = _SYSTEM_PROMPT + self._bk_cache
 
         t0 = time.monotonic()
         async with httpx.AsyncClient(timeout=120) as client:
@@ -3456,6 +3527,23 @@ Rules:
                 f"  - {m}" for m in existing_metrics
             )
 
+        # Build 32: Include business KPI definitions if available
+        try:
+            bk = await self.store.get_business_knowledge()
+            if bk.kpi_definitions:
+                kpi_lines = []
+                for kpi in bk.kpi_definitions[:20]:
+                    name = kpi.get("name", "")
+                    desc = kpi.get("description", "")
+                    formula = kpi.get("formula", "")
+                    kpi_lines.append(f"  - {name}: {desc}" + (f" (formula: {formula})" if formula else ""))
+                ctx_text += "\nBusiness KPI definitions (prioritize these when applicable):\n" + "\n".join(kpi_lines)
+            if bk.glossary:
+                glossary_lines = [f"  - {k}: {v}" for k, v in list(bk.glossary.items())[:20]]
+                ctx_text += "\nBusiness glossary:\n" + "\n".join(glossary_lines)
+        except Exception:
+            pass
+
         target_table = f"{contract.target_schema}.{contract.target_table}"
 
         user_prompt = f"""Table "{target_table}" for pipeline "{contract.pipeline_name}" (Tier {contract.tier}).
@@ -3714,3 +3802,159 @@ Respond with JSON:
             "interpretation": f"Metric is {trend}. Mean: {mean:.2f}, StdDev: {stddev:.2f}.",
             "severity": "warning" if is_anomalous else "info",
         }
+
+    # ------------------------------------------------------------------
+    # Build 32: Per-metric reasoning
+    # ------------------------------------------------------------------
+
+    async def explain_metric(
+        self,
+        metric,
+        trigger: str = "created",
+        change_summary: str = "",
+        trend_context: dict = None,
+        pipeline_context: dict = None,
+    ) -> str:
+        """Agent generates/updates reasoning for a metric.
+
+        Args:
+            metric: MetricDefinition instance
+            trigger: What caused this reasoning update (created, updated, trend, computed)
+            change_summary: What changed (for updates)
+            trend_context: Trend analysis dict (for trend triggers)
+            pipeline_context: Pipeline info for richer context
+
+        Returns reasoning string.
+        """
+        if not self.has_api:
+            return self._rule_based_explain_metric(metric, trigger, change_summary)
+
+        ctx_parts = [
+            f"Metric: {metric.metric_name}",
+            f"Description: {metric.description}" if metric.description else "",
+            f"Type: {metric.metric_type.value if hasattr(metric.metric_type, 'value') else metric.metric_type}",
+            f"SQL: {metric.sql_expression}" if metric.sql_expression else "",
+        ]
+        if pipeline_context:
+            ctx_parts.append(f"Pipeline: {pipeline_context.get('pipeline_name', '?')} (Tier {pipeline_context.get('tier', 2)})")
+            if pipeline_context.get("business_context"):
+                ctx_parts.append(f"Business context: {json.dumps(pipeline_context['business_context'])}")
+        if metric.reasoning:
+            ctx_parts.append(f"Previous reasoning: {metric.reasoning}")
+        if change_summary:
+            ctx_parts.append(f"What changed: {change_summary}")
+        if trend_context:
+            ctx_parts.append(f"Latest trend analysis: {json.dumps(trend_context)}")
+
+        context_text = "\n".join(c for c in ctx_parts if c)
+
+        user_prompt = f"""You are maintaining a living reasoning document for a data metric.
+
+Trigger: {trigger}
+
+{context_text}
+
+Write 2-4 sentences explaining:
+1. Why this metric matters for the business
+2. What it currently measures and how
+3. {"What this change means for the metric's interpretation" if trigger == "updated" else ""}
+{"4. What the latest trend suggests" if trend_context else ""}
+
+Be specific and actionable. Reference the actual metric definition and any changes.
+Write ONLY the reasoning text — no JSON, no headers."""
+
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                operation="explain_metric",
+            )
+            return text.strip()[:2000]
+        except Exception as e:
+            log.warning("explain_metric Claude error: %s", e)
+            return self._rule_based_explain_metric(metric, trigger, change_summary)
+
+    def _rule_based_explain_metric(
+        self, metric, trigger: str, change_summary: str = "",
+    ) -> str:
+        """Rule-based fallback for metric reasoning."""
+        mt = metric.metric_type.value if hasattr(metric.metric_type, "value") else metric.metric_type
+        base = f"{metric.metric_name} is a {mt} metric"
+        if metric.description:
+            base += f" that measures {metric.description.lower().rstrip('.')}"
+        base += "."
+        if trigger == "created":
+            return f"{base} Created to track this KPI."
+        elif trigger == "updated" and change_summary:
+            return f"{base} Updated: {change_summary}."
+        elif trigger == "trend":
+            return f"{base} Reasoning updated after trend analysis."
+        elif trigger == "computed":
+            return f"{base} Reasoning refreshed after latest computation."
+        return base
+
+    # ------------------------------------------------------------------
+    # Build 32: KPI definition parsing
+    # ------------------------------------------------------------------
+
+    async def parse_kpi_definitions(self, text: str) -> list[dict]:
+        """Agent parses free-text KPI descriptions into structured definitions.
+
+        Returns list of: {name, description, formula, dimensions, owner, target_value, unit}
+        """
+        if not self.has_api:
+            return self._rule_based_parse_kpis(text)
+
+        user_prompt = f"""Parse the following business KPI definitions into a structured JSON array.
+
+Text from business users:
+---
+{text[:3000]}
+---
+
+For each KPI found, extract:
+- name: short snake_case identifier
+- description: what this KPI measures, in plain language
+- formula: how it's calculated (e.g., "revenue / customers", "COUNT(*) WHERE status='active'")
+- dimensions: list of breakdown dimensions if mentioned (e.g., ["region", "product_line"])
+- owner: who owns this KPI if mentioned (team or person name)
+- target_value: numeric target if mentioned (null if not)
+- unit: measurement unit if mentioned (e.g., "USD", "%", "count")
+
+Return a JSON array. If text is ambiguous, make reasonable assumptions and note them in description."""
+
+        try:
+            resp = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                operation="parse_kpi_definitions",
+            )
+            return self._extract_json(resp) or []
+        except Exception as e:
+            log.warning("Agent KPI parsing failed: %s", e)
+            return self._rule_based_parse_kpis(text)
+
+    def _rule_based_parse_kpis(self, text: str) -> list[dict]:
+        """Rule-based fallback: split text into KPI entries by line."""
+        kpis = []
+        for line in text.strip().split("\n"):
+            line = line.strip().lstrip("-•*0123456789.) ").strip()
+            if not line:
+                continue
+            # Try to split "Name: description" or "Name - description"
+            name = line
+            desc = line
+            for sep in [":", " - ", " – "]:
+                if sep in line:
+                    parts = line.split(sep, 1)
+                    name = parts[0].strip().lower().replace(" ", "_")
+                    desc = parts[1].strip()
+                    break
+            kpis.append({
+                "name": name[:50],
+                "description": desc,
+                "formula": "",
+                "dimensions": [],
+                "owner": "",
+                "target_value": None,
+                "unit": "",
+            })
+        return kpis

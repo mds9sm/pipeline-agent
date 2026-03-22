@@ -26,11 +26,93 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 29 | Native SQL transforms | **Done** | Replace dbt with in-pipeline SQL transforms — ref(), var(), materialization, AI generation |
 | 30 | Fully agentic failure detection & quality | **Done** | Agent decides quality gate, diagnoses failures, reasons about freshness/anomalies/contracts |
 | 31 | Dashboard / metrics layer | **Done** | Lightweight KPI definitions on catalog tables, agentic suggest/generate/interpret |
-| 28 | Context API enrichment | Planned | Auto-context on pipeline runs, cross-pipeline context propagation |
+| 28 | Context API enrichment | **Done** | Auto-context on pipeline runs, cross-pipeline context propagation |
+| 32 | Business context, agent knowledge & metrics reasoning | **Done** | Business knowledge, glossary, KPI definitions feed into agent reasoning |
+| 33 | Pipeline versioning + rollback | Planned | GitOps one-click revert to any prior config, version history UI, diff view, restore with validation |
+| 34 | Webhooks (inbound + outbound) | Planned | Outbound event delivery (run complete, halt, drift) with retry + signatures. Inbound webhook triggers (e.g., Stripe event → trigger sync) |
+| 35 | Freshness SLA dashboards | Planned | Visual SLA burn-down per contract, historical compliance, breach forecasting, per-consumer freshness view |
+| 36 | Multi-worker + resource pools | Planned | Distribute runs across processes/containers + per-source concurrency limits (e.g., max 2 against prod MySQL) |
+| 37 | CDC + streaming ingestion | Planned | Debezium/binlog/WAL capture, micro-batch staging, continuous quality gate, streaming-aware scheduling |
+| 38 | PII detection + column masking | Planned | Agent auto-detects PII via semantic tags (email, SSN, phone), recommends hash/mask at ingest. GDPR/CCPA compliance |
+| 39 | SCD Type 2 + soft deletes | Planned | First-class load strategies: `scd2` (_valid_from/_valid_to columns) and `soft_delete` (_deleted_at). Agent recommends based on table shape |
 
 ---
 
 ## [Unreleased]
+
+### Build 32: Business Context, Agent Knowledge & Metrics Reasoning — 2026-03-22 (Claude Opus 4.6)
+
+**Business users can now teach the agent about their company, glossary, and KPI definitions. The agent's system prompt dynamically incorporates this business context, enabling domain-aware metric suggestions, transform generation, and failure diagnosis.**
+
+#### Added
+- **BusinessKnowledge dataclass** (`contracts/models.py`) — singleton entity: company_name, industry, business_description, datasets_description, glossary (term→definition), kpi_definitions (structured list), custom_instructions
+- **Store layer** (`contracts/store.py`):
+  - `business_knowledge` table with `CHECK (id = 1)` singleton constraint
+  - `get_business_knowledge()`, `save_business_knowledge()` with upsert
+- **Dynamic system prompt** (`agent/core.py`):
+  - `_system_prompt()` now appends cached business knowledge context
+  - `_refresh_business_knowledge()` — loads from DB every 5 min, builds context string with company info, glossary, KPI definitions, custom instructions
+  - Business knowledge injected into all Claude API calls automatically
+- **KPI parsing** (`agent/core.py`):
+  - `parse_kpi_definitions()` — agent parses free-text KPI descriptions into structured format (name, description, formula, unit, frequency, dimensions)
+  - `_rule_based_parse_kpis()` — fallback for "Name: description" patterns
+  - `suggest_metrics()` enriched with KPI definitions and glossary context
+- **REST API** (`api/server.py`):
+  - `GET /api/agent/system-prompt` — read-only system prompt display
+  - `GET /api/settings/business-knowledge` — retrieve business knowledge
+  - `PUT /api/settings/business-knowledge` — update business knowledge (merge fields)
+  - `POST /api/settings/business-knowledge/parse-kpis` — agent parses free-text KPIs
+- **UI** (`ui/App.jsx`):
+  - `AgentKnowledgeView` component with 3 tabs: Business Knowledge, KPI Definitions, System Prompt
+  - Business Knowledge tab: company name, industry, description, datasets, custom instructions, glossary editor (add/remove terms)
+  - KPI Definitions tab: paste free-text → agent parses into structured format, remove individual KPIs, save
+  - System Prompt tab: read-only display of current agent system prompt
+  - New "Agent" nav item (`*` icon) — 13 total nav items
+- **Per-metric reasoning** (`contracts/models.py`, `contracts/store.py`, `agent/core.py`, `api/server.py`):
+  - `reasoning` (str) and `reasoning_history` (list) fields on MetricDefinition — living reasoning document per metric
+  - `explain_metric()` agent method — generates/updates reasoning on create, update, trend analysis, with rule-based fallback
+  - Reasoning auto-generated on metric creation (carries suggestion reasoning or agent-generates)
+  - Reasoning auto-refreshed on metric update (agent re-reasons with change summary)
+  - Reasoning auto-updated on trend analysis (agent incorporates trend insights)
+  - Manual reasoning override supported via PATCH `reasoning` field
+  - Full reasoning history with trigger, timestamp, author, and change summary
+- **UI** (`ui/App.jsx`):
+  - "Agent Reasoning" panel on expanded metric cards with current reasoning
+  - Expandable reasoning history timeline (trigger badges, timestamps, change summaries)
+  - Suggestion reasoning flows through to metric creation
+- **Tests** (`test-pipeline-agent.sh`):
+  - 9 tests: system prompt GET, business knowledge GET/PUT/persist, parse-kpis, metrics suggest reasoning, metric create with reasoning, reasoning_history in detail, reasoning update on PATCH
+
+#### Fixed
+- **Metrics suggestion reasoning not displaying** (`ui/App.jsx`): Changed `s.rationale` to `(s.reasoning || s.rationale)` — agent returns `reasoning` field but UI checked `rationale`
+- **Suggestion description missing**: Added `s.description` display to metrics suggestion cards
+
+#### Changed
+- Agent system prompt updated with Metrics/KPIs, Run context propagation, Data catalog, MCP server sections; template var count updated to 42
+- Cache bust v=49 → v=51
+
+### Build 28: Context API Enrichment — 2026-03-22 (Claude Opus 4.6)
+
+**Cross-pipeline context propagation: upstream run quality, gate decisions, and metadata flow automatically to downstream pipelines. New context API endpoints for inspecting the full context chain.**
+
+#### Added
+- **RunContext dataclass** (`contracts/models.py`) — aggregated context for a run: own data + upstream chain + metadata snapshot
+- **`auto_propagate_context` flag** on PipelineContract (default: `true`) — controls whether upstream quality/gate/metadata auto-flows downstream
+- **Store methods** — `get_run_context()`, `get_context_chain()`, `load_upstream_context_for_run()` with recursive upstream traversal (max depth 5)
+- **API: `GET /api/runs/{run_id}/context`** — full aggregated context for any run including upstream chain and metadata
+- **API: `GET /api/pipelines/{pipeline_id}/context-chain`** — walks the upstream dependency DAG, returning latest run context per pipeline
+- **PATCH support** for `auto_propagate_context` on `/api/pipelines/{pipeline_id}`
+- **Pipeline detail** includes `auto_propagate_context` field
+- **8 new upstream template variables** for hooks: `{{upstream_gate_decision}}`, `{{upstream_pipeline_name}}`, `{{upstream_quality_decision}}`, `{{upstream_quality_checks_passed}}`, `{{upstream_quality_checks_warned}}`, `{{upstream_quality_checks_failed}}`, `{{upstream_metadata.<key>}}`
+- **Auto-propagation in runner** — `_write_run_metadata` now writes `last_gate_decision`, `last_quality_summary`, and upstream quality context to pipeline metadata
+- **Dynamic `{{upstream_metadata.*}}` variables** — hooks can reference any upstream metadata key (e.g., `{{upstream_metadata.last_row_count}}`)
+- **5 curl tests** — context chain, run context, detail field check, PATCH toggle, 404 handling
+
+#### Changed
+- `_render_hook_sql()` now accepts optional `upstream_context` dict for enriched template variables (backward-compatible)
+- `_execute_post_promotion_hooks()` passes enriched upstream context to hook SQL rendering
+- `_write_run_metadata()` writes gate decision and quality summary for every run (not just upstream-triggered)
+- Scheduler logs context propagation flag when triggering downstream
 
 ### Build 31: Dashboard / Metrics Layer — 2026-03-22 (Claude Opus 4.6)
 

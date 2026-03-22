@@ -4,7 +4,7 @@ Template variables are `{{variable_name}}` placeholders available in post-promot
 
 ---
 
-## All Variables (34 Total)
+## All Variables (42 Total)
 
 ### Run Context
 
@@ -42,7 +42,7 @@ Template variables are `{{variable_name}}` placeholders available in post-promot
 | `{{target_port}}` | string | Target connection port |
 | `{{target_ddl}}` | string | Target table CREATE TABLE DDL |
 
-### Upstream Context
+### Upstream Context (9 base + 8 enriched)
 
 Available only when `triggered_by_run_id` is set (dependency-triggered runs):
 
@@ -56,7 +56,32 @@ Available only when `triggered_by_run_id` is set (dependency-triggered runs):
 | `{{upstream_merge_keys}}` | string | Upstream merge keys (comma-separated) |
 | `{{upstream_target_schema}}` | string | Upstream target schema |
 | `{{upstream_target_table}}` | string | Upstream target table |
-| `{{upstream_completed_at}}` | timestamp | Upstream completion time |
+| `{{upstream_completed_at}}` | timestamp | Upstream run completion time |
+
+#### Enriched Upstream Context (Build 28)
+
+These are populated when `auto_propagate_context` is enabled on the pipeline (default: true):
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `{{upstream_pipeline_name}}` | string | Upstream pipeline's human-readable name |
+| `{{upstream_gate_decision}}` | string | Upstream quality gate decision (PROMOTE/HALT/PROMOTE_WITH_WARNING) |
+| `{{upstream_quality_decision}}` | string | Alias for upstream gate decision |
+| `{{upstream_quality_checks_passed}}` | integer | Number of quality checks that passed upstream |
+| `{{upstream_quality_checks_warned}}` | integer | Number of quality checks with warnings upstream |
+| `{{upstream_quality_checks_failed}}` | integer | Number of quality checks that failed upstream |
+| `{{upstream_rows_loaded}}` | integer | Rows loaded in the upstream run |
+| `{{upstream_status}}` | string | Upstream run status |
+
+#### Dynamic Upstream Metadata
+
+Any key stored in the upstream pipeline's metadata can be referenced:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `{{upstream_metadata.<key>}}` | any | Dynamic — resolves to the value of `<key>` in upstream pipeline metadata |
+
+Example: `{{upstream_metadata.last_row_count}}`, `{{upstream_metadata.daily_total}}`
 
 ---
 
@@ -105,7 +130,7 @@ END $$;
 
 ## Resolution
 
-Variables are resolved by the `_render_hook_sql()` method in `agent/autonomous.py` using Python string `replace()`. Unresolved variables (e.g., upstream vars when not triggered by upstream) remain as literal strings.
+Variables are resolved by the `_render_hook_sql()` method in `agent/autonomous.py` using Python string `replace()`. Dynamic `{{upstream_metadata.*}}` patterns are resolved via regex. Unresolved variables (e.g., upstream vars when not triggered by upstream) remain as literal strings.
 
 ---
 

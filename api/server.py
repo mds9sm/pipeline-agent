@@ -192,6 +192,8 @@ class UpdatePipelineRequest(BaseModel):
     post_promotion_hooks: Optional[list[dict]] = None
     # Steps (Build 18)
     steps: Optional[list[dict]] = None
+    # Context propagation (Build 28)
+    auto_propagate_context: Optional[bool] = None
     # Audit
     reason: Optional[str] = None
 
@@ -1906,6 +1908,11 @@ def create_app(
             }
             p.steps = new_steps
 
+        # Build 28: auto_propagate_context
+        if req.auto_propagate_context is not None:
+            changes["auto_propagate_context"] = {"old": p.auto_propagate_context, "new": req.auto_propagate_context}
+            p.auto_propagate_context = req.auto_propagate_context
+
         if not changes:
             return await _pipeline_detail(p, store)
 
@@ -2131,6 +2138,44 @@ def create_app(
             "run_id": run_id,
             "chain_length": len(chain),
             "chain": [_run_summary(r) for r in chain],
+        }
+
+    # -----------------------------------------------------------------------
+    # Build 28: Run context & context chain
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/runs/{run_id}/context")
+    @limiter.limit("100/minute")
+    async def get_run_context(
+        request: Request,
+        run_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Full aggregated context for a run: own data + upstream chain + metadata."""
+        from dataclasses import asdict as _asdict
+        ctx = await store.get_run_context(run_id)
+        if not ctx:
+            raise HTTPException(404, "Run not found")
+        return _asdict(ctx)
+
+    @app.get("/api/pipelines/{pipeline_id}/context-chain")
+    @limiter.limit("100/minute")
+    async def get_context_chain(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Walk the pipeline's upstream dependency DAG, returning latest run context
+        for each pipeline in the chain."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        chain = await store.get_context_chain(pipeline_id)
+        return {
+            "pipeline_id": pipeline_id,
+            "pipeline_name": p.pipeline_name,
+            "chain_length": len(chain),
+            "chain": chain,
         }
 
     @app.get("/api/pipelines/{pipeline_id}/schema-history")
@@ -3775,6 +3820,72 @@ def create_app(
         return {"status": "deleted"}
 
     # -----------------------------------------------------------------------
+    # Build 32: Business Knowledge & Agent Context
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/agent/system-prompt")
+    @limiter.limit("100/minute")
+    async def get_system_prompt(request: Request, caller: dict = Depends(auth_dep)):
+        """Read-only view of the agent's full system prompt (base + business knowledge)."""
+        prompt = agent._system_prompt()
+        return {"system_prompt": prompt}
+
+    @app.get("/api/settings/business-knowledge")
+    @limiter.limit("100/minute")
+    async def get_business_knowledge(request: Request, caller: dict = Depends(auth_dep)):
+        """Get the business knowledge context used by the agent."""
+        from dataclasses import asdict as _asdict
+        bk = await store.get_business_knowledge()
+        return _asdict(bk)
+
+    @app.put("/api/settings/business-knowledge")
+    @limiter.limit("30/minute")
+    async def save_business_knowledge(request: Request, req: dict = Body(...), caller: dict = Depends(auth_dep)):
+        """Update business knowledge — feeds into all agent reasoning."""
+        require_role(caller, "admin", "operator")
+        from contracts.models import BusinessKnowledge
+        bk = await store.get_business_knowledge()
+        # Merge fields
+        if "company_name" in req:
+            bk.company_name = req["company_name"]
+        if "industry" in req:
+            bk.industry = req["industry"]
+        if "business_description" in req:
+            bk.business_description = req["business_description"]
+        if "datasets_description" in req:
+            bk.datasets_description = req["datasets_description"]
+        if "glossary" in req:
+            bk.glossary = req["glossary"]
+        if "kpi_definitions" in req:
+            bk.kpi_definitions = req["kpi_definitions"]
+        if "custom_instructions" in req:
+            bk.custom_instructions = req["custom_instructions"]
+        bk.updated_by = caller.get("username", "")
+        await store.save_business_knowledge(bk)
+        from dataclasses import asdict as _asdict
+        return _asdict(bk)
+
+    @app.post("/api/settings/business-knowledge/parse-kpis")
+    @limiter.limit("10/minute")
+    async def parse_kpi_text(request: Request, req: dict = Body(...), caller: dict = Depends(auth_dep)):
+        """Agent parses free-text KPI definitions into structured format."""
+        require_role(caller, "admin", "operator")
+        text = req.get("text", "")
+        if not text:
+            raise HTTPException(400, "text is required")
+        if agent.has_api:
+            parsed = await agent.parse_kpi_definitions(text)
+            return {"kpi_definitions": parsed}
+        else:
+            # Rule-based fallback: split on newlines, each line is a KPI
+            kpis = []
+            for line in text.strip().split("\n"):
+                line = line.strip().lstrip("-•*").strip()
+                if line:
+                    kpis.append({"name": line, "description": line, "source": "user_text"})
+            return {"kpi_definitions": kpis}
+
+    # -----------------------------------------------------------------------
     # GitOps
     # -----------------------------------------------------------------------
 
@@ -5149,6 +5260,7 @@ def create_app(
         dimensions: list = []
         schedule_cron: str = ""
         tags: dict = {}
+        reasoning: str = ""
 
     @app.post("/api/metrics")
     async def create_metric(
@@ -5208,9 +5320,26 @@ def create_app(
             tags=body.tags,
             created_by=caller.get("username", "api"),
         )
+
+        # Generate initial reasoning (carry from suggestion or agent-generate)
+        from contracts.models import now_iso
+        initial_reasoning = body.reasoning
+        if not initial_reasoning:
+            pipeline_ctx = {"pipeline_name": p.pipeline_name, "tier": p.tier,
+                            "business_context": p.business_context or {}}
+            initial_reasoning = await agent.explain_metric(
+                metric, trigger="created", pipeline_context=pipeline_ctx,
+            )
+        metric.reasoning = initial_reasoning
+        metric.reasoning_history = [
+            {"reasoning": initial_reasoning, "trigger": "created",
+             "at": now_iso(), "by": caller.get("username", "api")}
+        ]
+
         await store.save_metric(metric)
         return {"metric_id": metric.metric_id, "metric_name": metric.metric_name,
-                "sql_expression": sql_expr, "status": "created"}
+                "sql_expression": sql_expr, "reasoning": metric.reasoning,
+                "status": "created"}
 
     @app.get("/api/metrics")
     async def list_metrics(
@@ -5227,6 +5356,7 @@ def create_app(
              "sql_expression": m.sql_expression,
              "dimensions": m.dimensions, "schedule_cron": m.schedule_cron,
              "tags": m.tags, "enabled": m.enabled, "created_by": m.created_by,
+             "reasoning": m.reasoning,
              "created_at": m.created_at}
             for m in metrics
         ]}
@@ -5249,6 +5379,8 @@ def create_app(
             "sql_expression": m.sql_expression,
             "dimensions": m.dimensions, "schedule_cron": m.schedule_cron,
             "tags": m.tags, "enabled": m.enabled, "created_by": m.created_by,
+            "reasoning": m.reasoning,
+            "reasoning_history": m.reasoning_history,
             "created_at": m.created_at,
             "snapshots": [
                 {"snapshot_id": s.snapshot_id, "computed_at": s.computed_at,
@@ -5354,7 +5486,22 @@ def create_app(
             "business_context": p.business_context if p else {},
         }
         analysis = await agent.interpret_metric_trend(m.metric_name, snap_dicts, pipeline_ctx)
-        return {"metric_id": metric_id, "metric_name": m.metric_name, **analysis}
+
+        # Update metric reasoning with trend insights
+        from contracts.models import now_iso
+        new_reasoning = await agent.explain_metric(
+            m, trigger="trend", trend_context=analysis, pipeline_context=pipeline_ctx,
+        )
+        m.reasoning = new_reasoning
+        m.reasoning_history.append({
+            "reasoning": new_reasoning, "trigger": "trend",
+            "at": now_iso(), "by": "agent",
+        })
+        m.updated_at = now_iso()
+        await store.save_metric(m)
+
+        return {"metric_id": metric_id, "metric_name": m.metric_name,
+                "reasoning": m.reasoning, **analysis}
 
     @app.patch("/api/metrics/{metric_id}")
     async def update_metric(
@@ -5363,14 +5510,18 @@ def create_app(
         body: dict = Body(...),
         caller: dict = Depends(auth_dep),
     ):
-        """Update metric fields."""
+        """Update metric fields. Agent re-reasons on meaningful changes."""
         require_role(caller, "admin", "operator")
         from contracts.models import MetricType, now_iso
         m = await store.get_metric(metric_id)
         if not m:
             raise HTTPException(404, "Metric not found")
+
+        # Track what changed for reasoning
+        changes = []
         for field in ("metric_name", "description", "sql_expression", "schedule_cron", "enabled"):
-            if field in body:
+            if field in body and getattr(m, field) != body[field]:
+                changes.append(f"{field}: {getattr(m, field)!r} -> {body[field]!r}")
                 setattr(m, field, body[field])
         if "tags" in body:
             m.tags = body["tags"]
@@ -5379,11 +5530,37 @@ def create_app(
         if "metric_type" in body:
             try:
                 m.metric_type = MetricType(body["metric_type"].lower())
+                changes.append(f"metric_type -> {body['metric_type']}")
             except (ValueError, AttributeError):
                 pass
+
+        # Allow explicit reasoning override
+        if "reasoning" in body and body["reasoning"]:
+            m.reasoning = body["reasoning"]
+            m.reasoning_history.append({
+                "reasoning": body["reasoning"], "trigger": "manual_edit",
+                "at": now_iso(), "by": caller.get("username", "api"),
+            })
+        elif changes:
+            # Agent re-reasons on meaningful changes
+            p = await store.get_pipeline(m.pipeline_id)
+            pipeline_ctx = {"pipeline_name": p.pipeline_name, "tier": p.tier,
+                            "business_context": p.business_context or {}} if p else {}
+            change_summary = "; ".join(changes)
+            new_reasoning = await agent.explain_metric(
+                m, trigger="updated", change_summary=change_summary,
+                pipeline_context=pipeline_ctx,
+            )
+            m.reasoning = new_reasoning
+            m.reasoning_history.append({
+                "reasoning": new_reasoning, "trigger": "updated",
+                "change_summary": change_summary,
+                "at": now_iso(), "by": caller.get("username", "api"),
+            })
+
         m.updated_at = now_iso()
         await store.save_metric(m)
-        return {"metric_id": metric_id, "status": "updated"}
+        return {"metric_id": metric_id, "reasoning": m.reasoning, "status": "updated"}
 
     @app.delete("/api/metrics/{metric_id}")
     async def delete_metric(
@@ -5836,6 +6013,9 @@ async def _pipeline_detail(p, store: Store) -> dict:
             for c in consumed
         ],
     }
+
+    # Build 28: Context propagation flag
+    d["auto_propagate_context"] = p.auto_propagate_context
 
     # Recent changelog
     recent_changes = await store.list_pipeline_changes(p.pipeline_id, limit=10)

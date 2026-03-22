@@ -4,10 +4,11 @@ DAPOS includes a lightweight metrics layer that lets you define, compute, and tr
 
 ## How It Works
 
-1. **Agent suggests metrics** — Given a pipeline's schema and business context, the agent proposes relevant KPIs (row counts, conversion rates, revenue sums, etc.)
+1. **Agent suggests metrics** — Given a pipeline's schema, business context, and KPI definitions, the agent proposes relevant KPIs
 2. **Agent generates SQL** — You describe what you want to measure in plain English; the agent writes the SQL expression
 3. **Scheduled computation** — Metrics with a `schedule_cron` are automatically computed every 5 minutes by the observability loop
 4. **Agent interprets trends** — The agent analyzes time-series snapshots and produces a narrative explaining direction, anomalies, and recommendations
+5. **Per-metric reasoning** — Each metric carries a living reasoning document that the agent updates on creation, edits, and trend analysis
 
 ## Data Model
 
@@ -25,6 +26,8 @@ DAPOS includes a lightweight metrics layer that lets you define, compute, and tr
 | `schedule_cron` | string | Cron expression for automatic computation |
 | `tags` | dict | Arbitrary key-value tags |
 | `enabled` | bool | Whether the metric is active |
+| `reasoning` | string | Current agent reasoning — why this metric matters, what it measures, latest insights |
+| `reasoning_history` | list | Full history of reasoning updates with trigger, timestamp, author, and change summary |
 
 ### MetricSnapshot
 
@@ -113,3 +116,46 @@ All three core operations use agent reasoning via Claude API:
 | Interpret trend | `agent.interpret_metric_trend()` | `_rule_based_interpret_trend()` |
 
 The rule-based fallbacks activate only when no API key is configured. They provide basic metric suggestions (row count, null rate, freshness) and simple trend direction without the agent's contextual understanding.
+
+## Per-Metric Reasoning (Build 32)
+
+Every metric carries a **living reasoning document** that evolves with each interaction:
+
+### How Reasoning Updates
+
+| Trigger | When | What Happens |
+|---------|------|-------------|
+| `created` | Metric is first created | Agent explains why this metric matters and what it measures |
+| `updated` | User or API updates metric fields | Agent re-reasons incorporating the change (e.g., "SQL was updated to filter by status") |
+| `trend` | Trend analysis is requested | Agent updates reasoning with latest trend insights and anomaly context |
+| `manual_edit` | User directly sets reasoning via PATCH | User-provided reasoning is stored as-is |
+
+### Reasoning History
+
+Every reasoning update is appended to `reasoning_history` with:
+- `reasoning` — the full reasoning text
+- `trigger` — what caused the update (created, updated, trend, manual_edit)
+- `at` — ISO timestamp
+- `by` — who triggered it (username or "agent")
+- `change_summary` — what changed (for update triggers)
+
+### API
+
+- **Create** (`POST /api/metrics`): Pass `reasoning` to carry suggestion reasoning; otherwise agent generates it
+- **Update** (`PATCH /api/metrics/{id}`): Agent auto-regenerates reasoning on meaningful changes; pass `reasoning` to override manually
+- **Trend** (`GET /api/metrics/{id}/trend`): Automatically updates the metric's reasoning with trend insights
+- **Detail** (`GET /api/metrics/{id}`): Returns `reasoning` and full `reasoning_history`
+
+### Agent Method
+
+```
+agent.explain_metric(metric, trigger, change_summary, trend_context, pipeline_context)
+```
+Fallback: `_rule_based_explain_metric()` — template-based description.
+
+### Business Knowledge Integration
+
+When suggesting metrics, the agent incorporates:
+- **KPI definitions** from the BusinessKnowledge entity (company-defined KPIs are prioritized)
+- **Glossary terms** for domain-specific language understanding
+- **Business context** from the pipeline's catalog entry

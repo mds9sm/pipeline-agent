@@ -25,6 +25,11 @@ The agent acts independently for:
 - **Freshness evaluation**: Assess SLA realism, determine alert necessity
 - **Anomaly detection**: Per-pipeline contextual evaluation + cross-pipeline pattern analysis
 - **Contract violation assessment**: Evaluate consumer impact, determine severity
+- **Metric suggestions**: Propose KPIs based on pipeline schema and business context
+- **Metric SQL generation**: Write SQL from plain-English metric descriptions
+- **Metric trend interpretation**: Analyze time-series data, detect anomalies, explain trends
+- **Per-metric reasoning**: Generate and evolve living reasoning for each metric
+- **Run context propagation**: Decide what upstream quality/metadata flows downstream
 
 ### Human Approval Required (Structural Changes)
 These always create proposals that require human review:
@@ -42,7 +47,7 @@ This boundary is a **hard constraint** — no configuration can make structural 
 
 ### System Prompt (Platform Context)
 
-Every Claude API call includes a rich system prompt (`_SYSTEM_PROMPT` in `agent/core.py`, ~1,250 tokens) that gives the agent full platform awareness:
+Every Claude API call includes a rich system prompt (`_SYSTEM_PROMPT` in `agent/core.py`, ~1,500 tokens base + business knowledge appendix) that gives the agent full platform awareness:
 
 - **Identity**: DAPOS as a unified data platform replacing Fivetran + dbt + Airflow + Monte Carlo
 - **Architecture**: Single process, 4 async loops, PostgreSQL-only state
@@ -52,6 +57,8 @@ Every Claude API call includes a rich system prompt (`_SYSTEM_PROMPT` in `agent/
 - **Quality gate**: All 7 checks and the agent's role as decision-maker
 - **Data patterns**: 8 supported patterns (consume-and-merge, fan-in, SCD2, quarantine, etc.)
 - **Decision principles**: Idempotent-by-default, never delete unconsumed data, conservative on quality, context over thresholds, downstream awareness, explain reasoning
+
+**Dynamic business knowledge injection**: The system prompt is augmented at runtime with company context, industry glossary, KPI definitions, and custom instructions from the BusinessKnowledge entity. This context is cached for 5 minutes and refreshed lazily on each Claude API call via `_refresh_business_knowledge()`.
 
 This ensures the agent reasons with full context on every call, not just the narrow task prompt.
 
@@ -97,6 +104,11 @@ These methods use Claude to reason about signals in context. Each has a `_rule_b
 | `reason_about_preflight_failure()` | Reasons about why preflight checks failed, recommends action | Rule-based: generic message |
 | `generate_migration_sql()` | Generates ALTER TABLE SQL for schema drift with reasoning | `_rule_based_migration_sql()` — template-based ALTER |
 | `generate_run_insights()` | Post-run analysis: 2-5 contextual suggestions with optional one-click actions | `_rule_based_run_insights()` — condition-based checks |
+| `suggest_metrics()` | Analyzes pipeline schema + business context, proposes 3-5 KPIs with SQL and reasoning | `_rule_based_suggest_metrics()` — basic count/null/freshness metrics |
+| `generate_metric_sql()` | Writes SQL query from plain-English description against target table | `_rule_based_generate_metric_sql()` — generic COUNT query |
+| `interpret_metric_trend()` | Analyzes time-series snapshots, returns trend/anomalies/narrative/severity | `_rule_based_interpret_trend()` — statistical z-score |
+| `explain_metric()` | Generates/updates per-metric reasoning on create, update, trend analysis | `_rule_based_explain_metric()` — template-based description |
+| `parse_kpi_definitions()` | Parses free-text KPI descriptions into structured format | `_rule_based_parse_kpis()` — newline splitting |
 
 ### Conversational & Design Methods
 
@@ -111,6 +123,8 @@ These methods use Claude to reason about signals in context. Each has a `_rule_b
 | `design_topology` | Multi-pipeline architecture from business description |
 | `parse_schedule` | Natural language → cron expression |
 | `guided_pipeline_response` | Multi-turn pipeline creation conversation |
+| `suggest_metrics` | Suggest KPI metrics for a pipeline's target table |
+| `interpret_metric_trend` | Analyze trends in a metric |
 | `generate_digest` | Daily alert digest summarization |
 
 ---
@@ -131,6 +145,11 @@ When the Claude API key is not configured or the API is unavailable, every agent
 | `assess_contract_violation()` | *(inline)* | Hardcoded WARNING severity |
 | `generate_migration_sql()` | `_rule_based_migration_sql()` | Template-based ALTER TABLE statements |
 | `generate_run_insights()` | `_rule_based_run_insights()` | Condition-based: first-run baseline, strategy mismatch, volume deviation, consecutive failures |
+| `suggest_metrics()` | `_rule_based_suggest_metrics()` | Basic metrics: row count, null rate, freshness |
+| `generate_metric_sql()` | `_rule_based_generate_metric_sql()` | Generic COUNT(*) query |
+| `interpret_metric_trend()` | `_rule_based_interpret_trend()` | Statistical: mean, stddev, z-score for anomalies |
+| `explain_metric()` | `_rule_based_explain_metric()` | Template: "{name} is a {type} metric that measures {description}" |
+| `parse_kpi_definitions()` | `_rule_based_parse_kpis()` | Split by newline, match "Name: description" pattern |
 
 ---
 
@@ -148,6 +167,8 @@ When a user sends text to the chat interface, `route_command` classifies intent:
 | "list pipelines", "show active" | List pipelines |
 | "trigger", "run" | Trigger pipeline |
 | "create pipeline", "set up" | Pipeline creation flow |
+| "suggest metrics", "KPI", "what should I track" | `suggest_metrics` |
+| "metric trend", "how is my metric" | `interpret_metric_trend` |
 
 ### LLM Classification
 If keywords don't match, Claude classifies the intent from a predefined action list and extracts parameters.
@@ -179,3 +200,7 @@ Each step is a separate API call. The UI manages session state in `sessionStorag
 | GET | `/api/preferences` | Learned preferences |
 | GET | `/api/interactions` | Chat interaction audit log |
 | GET | `/api/interactions/export` | Export interaction history |
+| GET | `/api/agent/system-prompt` | Read-only system prompt |
+| GET | `/api/settings/business-knowledge` | Business knowledge context |
+| PUT | `/api/settings/business-knowledge` | Update business knowledge |
+| POST | `/api/settings/business-knowledge/parse-kpis` | Parse free-text KPIs |

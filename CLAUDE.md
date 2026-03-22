@@ -89,7 +89,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `sandbox.py` | AST validation + restricted builtins + import whitelist |
 | `auth.py` | JWT auth with 3 roles (admin, operator, viewer) |
 | `crypto.py` | Fernet encryption for credentials at rest |
-| `ui/App.jsx` | React 18 SPA (CDN, no build) - 12 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Metrics (sparklines + agent suggest/trend), Settings, Sources, Docs |
+| `ui/App.jsx` | React 18 SPA (CDN, no build) - 13 views: Chat, Pipelines, Activity (expandable run details + execution logs), Freshness (time-series charts), Quality, Alerts, Lineage/DAG (consolidated with search/zoom/pan), Connectors, Metrics (sparklines + agent suggest/trend), Settings, Sources, Docs, Agent (business knowledge + KPI definitions + system prompt) |
 | `gitops/repo.py` | Separate git repo manager for pipeline YAML + connector code versioning |
 | `cli/__main__.py` | CLI interface — 14 commands, token caching, fuzzy pipeline resolution |
 | `transforms/engine.py` | SQL transform engine — ref/var resolution, materialization, validation, lineage parsing |
@@ -158,8 +158,8 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 **Test script**: `./test-pipeline-agent.sh`
 
 ```bash
-./test-pipeline-agent.sh              # Full suite (~173 tests, ~20 min)
-./test-pipeline-agent.sh --api        # REST API endpoints only (~44 tests, fast)
+./test-pipeline-agent.sh              # Full suite (~187 tests, ~20 min)
+./test-pipeline-agent.sh --api        # REST API endpoints only (~50 tests, fast)
 ./test-pipeline-agent.sh --sources    # Source connector requests + generation
 ./test-pipeline-agent.sh --targets    # Target connector requests + generation
 ./test-pipeline-agent.sh --chat       # Multi-turn conversations + agent understanding
@@ -196,6 +196,8 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | MCP server | 3 | server import, resource listing, tool listing (Build 27) |
 | SQL transforms | 13 | CRUD (create, list, get, update, delete), lineage, AI generate, chat routing x2, demo transforms (count, VIEW, refs, pipeline) (Build 29) |
 | Metrics / KPIs | 8 | suggest, create, list, get, update, trend, delete, chat routing (Build 31) |
+| Context API | 5 | context chain, run context, detail field, PATCH toggle, 404 handling (Build 28) |
+| Business context & agent knowledge | 9 | system prompt, business knowledge GET/PUT/persist, parse-kpis, metrics suggest reasoning, metric create with reasoning, reasoning_history, reasoning update on PATCH (Build 32) |
 
 ### Adding New Tests
 

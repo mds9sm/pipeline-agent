@@ -762,6 +762,7 @@ const NAV = [
   { id: "alerts", label: "Alerts", icon: "!" },
   { id: "metrics", label: "Metrics", icon: "^" },
   { id: "costs", label: "Costs", icon: "$" },
+  { id: "agent", label: "Agent", icon: "*" },
   { id: "docs", label: "Docs", icon: "i" },
 ];
 
@@ -3871,6 +3872,8 @@ function MetricsView() {
   const [editing, setEditing] = useState(null);
   const [editForm, setEditForm] = useState({});
   const [saving, setSaving] = useState(false);
+  const [showHistory, setShowHistory] = useState(null);
+  const [reasoningDetail, setReasoningDetail] = useState({});
 
   const loadMetrics = useCallback(() => {
     const url = selectedPipeline ? `/api/metrics?pipeline_id=${selectedPipeline}` : "/api/metrics";
@@ -3888,6 +3891,7 @@ function MetricsView() {
     setExpanded(mid);
     api("GET", `/api/metrics/${mid}`).then((r) => {
       setSnapshots((p) => ({ ...p, [mid]: r.snapshots || [] }));
+      setReasoningDetail((p) => ({ ...p, [mid]: r.reasoning_history || [] }));
     }).catch(console.error);
     api("GET", `/api/metrics/${mid}/trend`).then((r) => {
       setTrend((p) => ({ ...p, [mid]: r }));
@@ -3912,6 +3916,7 @@ function MetricsView() {
         metric_name: s.metric_name,
         description: s.description || s.rationale || "",
         metric_type: s.metric_type || "custom",
+        reasoning: s.reasoning || s.rationale || "",
       });
       loadMetrics();
       setSuggestions((prev) => prev.filter((x) => x.metric_name !== s.metric_name));
@@ -4013,10 +4018,11 @@ function MetricsView() {
           <div className="space-y-2">
             {suggestions.map((s, i) => (
               <div key={i} className="flex items-center justify-between bg-white rounded-lg px-3 py-2 border border-indigo-100">
-                <div>
+                <div className="flex-1 min-w-0">
                   <span className="text-sm font-medium text-stone-700">{s.metric_name}</span>
                   <span className="text-xs text-stone-400 ml-2">{s.metric_type || "custom"}</span>
-                  {s.rationale && <div className="text-xs text-stone-500 mt-0.5">{s.rationale}</div>}
+                  {s.description && <div className="text-xs text-stone-500 mt-0.5">{s.description}</div>}
+                  {(s.reasoning || s.rationale) && <div className="text-xs text-indigo-500 mt-0.5 italic">{s.reasoning || s.rationale}</div>}
                 </div>
                 <button
                   onClick={() => handleCreateFromSuggestion(s)}
@@ -4107,6 +4113,37 @@ function MetricsView() {
                   ) : (
                     <>
                       <div className="text-xs text-stone-500 mb-2">{m.description}</div>
+                      {m.reasoning && (
+                        <div className="bg-violet-50 border border-violet-200 rounded-lg p-3 mb-3">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-semibold text-violet-800">Agent Reasoning</span>
+                            {reasoningDetail[m.metric_id] && reasoningDetail[m.metric_id].length > 1 && (
+                              <button
+                                onClick={(e) => { e.stopPropagation(); setShowHistory(showHistory === m.metric_id ? null : m.metric_id); }}
+                                className="text-xs text-violet-500 hover:text-violet-700 underline"
+                              >
+                                {showHistory === m.metric_id ? "Hide history" : `History (${reasoningDetail[m.metric_id].length})`}
+                              </button>
+                            )}
+                          </div>
+                          <div className="text-xs text-violet-700">{m.reasoning}</div>
+                          {showHistory === m.metric_id && reasoningDetail[m.metric_id] && (
+                            <div className="mt-2 border-t border-violet-200 pt-2 space-y-2">
+                              {reasoningDetail[m.metric_id].slice().reverse().map((h, i) => (
+                                <div key={i} className="text-xs border-l-2 border-violet-300 pl-2">
+                                  <div className="flex items-center gap-2 text-violet-400 mb-0.5">
+                                    <span className="font-mono">{(h.at || "").slice(0, 16)}</span>
+                                    <span className="px-1.5 py-0.5 rounded bg-violet-100 text-violet-600">{h.trigger}</span>
+                                    {h.by && <span>by {h.by}</span>}
+                                  </div>
+                                  <div className="text-violet-600">{h.reasoning}</div>
+                                  {h.change_summary && <div className="text-violet-400 italic mt-0.5">Changed: {h.change_summary}</div>}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                       {m.sql_expression && (
                         <pre className="text-xs bg-stone-900 text-green-300 rounded-lg p-3 mb-3 overflow-x-auto font-mono">{m.sql_expression}</pre>
                       )}
@@ -4230,6 +4267,207 @@ function simpleMarkdown(md) {
   // Paragraphs (lines that aren't already HTML)
   html = html.replace(/^(?!<[a-z/!]|<!--)(.+)$/gm, '<p class="text-sm text-stone-600 my-2 leading-relaxed">$1</p>');
   return html;
+}
+
+// ---------------------------------------------------------------------------
+// Agent Knowledge View (Build 32)
+// ---------------------------------------------------------------------------
+function AgentKnowledgeView() {
+  const [tab, setTab] = useState("knowledge"); // knowledge | prompt | kpis
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [bk, setBk] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [kpiText, setKpiText] = useState("");
+  const [parsing, setParsing] = useState(false);
+  const [form, setForm] = useState({});
+
+  useEffect(() => {
+    api("GET", "/api/agent/system-prompt")
+      .then((r) => setSystemPrompt(r.system_prompt || r.prompt || ""))
+      .catch((e) => { console.error("Failed to load system prompt:", e); setSystemPrompt("Error loading system prompt. Check console."); });
+    api("GET", "/api/settings/business-knowledge")
+      .then((r) => { setBk(r); setForm(r); })
+      .catch(console.error);
+  }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const r = await api("PUT", "/api/settings/business-knowledge", form);
+      setBk(r);
+      setForm(r);
+    } catch (e) { console.error(e); }
+    setSaving(false);
+  };
+
+  const handleParseKpis = async () => {
+    if (!kpiText.trim()) return;
+    setParsing(true);
+    try {
+      const r = await api("POST", "/api/settings/business-knowledge/parse-kpis", { text: kpiText });
+      const existing = form.kpi_definitions || [];
+      setForm({ ...form, kpi_definitions: [...existing, ...(r.kpi_definitions || [])] });
+      setKpiText("");
+    } catch (e) { console.error(e); }
+    setParsing(false);
+  };
+
+  const removeKpi = (idx) => {
+    const kpis = [...(form.kpi_definitions || [])];
+    kpis.splice(idx, 1);
+    setForm({ ...form, kpi_definitions: kpis });
+  };
+
+  const addGlossaryTerm = () => {
+    const term = prompt("Term name:");
+    if (!term) return;
+    const def = prompt("Definition:");
+    if (!def) return;
+    setForm({ ...form, glossary: { ...(form.glossary || {}), [term]: def } });
+  };
+
+  const removeGlossaryTerm = (term) => {
+    const g = { ...(form.glossary || {}) };
+    delete g[term];
+    setForm({ ...form, glossary: g });
+  };
+
+  const tabs = [
+    { id: "knowledge", label: "Business Knowledge" },
+    { id: "kpis", label: "KPI Definitions" },
+    { id: "prompt", label: "System Prompt" },
+  ];
+
+  return (
+    <div className="px-6 py-4">
+      <h1 className="text-lg font-semibold mb-4 text-stone-800">Agent Knowledge</h1>
+      <p className="text-xs text-stone-400 mb-4">
+        Configure what the agent knows about your business. This context feeds into all agent reasoning — metric suggestions, quality decisions, failure diagnosis, and more.
+      </p>
+
+      <div className="flex gap-1 mb-4 border-b border-stone-200">
+        {tabs.map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className={`text-xs px-3 py-2 font-medium border-b-2 transition ${tab === t.id ? "border-indigo-600 text-indigo-600" : "border-transparent text-stone-400 hover:text-stone-600"}`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "knowledge" && (
+        <div className="space-y-4 max-w-2xl">
+          <div>
+            <label className="text-xs font-medium text-stone-500 block mb-1">Company Name</label>
+            <input value={form.company_name || ""} onChange={(e) => setForm({ ...form, company_name: e.target.value })}
+              className="w-full text-sm border border-stone-200 rounded-lg px-3 py-2 bg-white" placeholder="Acme Corp" />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-stone-500 block mb-1">Industry</label>
+            <input value={form.industry || ""} onChange={(e) => setForm({ ...form, industry: e.target.value })}
+              className="w-full text-sm border border-stone-200 rounded-lg px-3 py-2 bg-white" placeholder="E-commerce, SaaS, Fintech..." />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-stone-500 block mb-1">Business Description</label>
+            <textarea value={form.business_description || ""} onChange={(e) => setForm({ ...form, business_description: e.target.value })}
+              rows={3} className="w-full text-sm border border-stone-200 rounded-lg px-3 py-2 bg-white" placeholder="Describe your business, what you do, who your customers are..." />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-stone-500 block mb-1">Datasets Description</label>
+            <textarea value={form.datasets_description || ""} onChange={(e) => setForm({ ...form, datasets_description: e.target.value })}
+              rows={3} className="w-full text-sm border border-stone-200 rounded-lg px-3 py-2 bg-white" placeholder="Describe your data sources, what each dataset contains, key tables..." />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-stone-500 block mb-1">Custom Agent Instructions</label>
+            <textarea value={form.custom_instructions || ""} onChange={(e) => setForm({ ...form, custom_instructions: e.target.value })}
+              rows={2} className="w-full text-sm border border-stone-200 rounded-lg px-3 py-2 bg-white" placeholder="Any additional instructions for the agent..." />
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-xs font-medium text-stone-500">Business Glossary</label>
+              <button onClick={addGlossaryTerm} className="text-xs px-2 py-1 rounded bg-stone-100 text-stone-600 hover:bg-stone-200">+ Add Term</button>
+            </div>
+            {form.glossary && Object.keys(form.glossary).length > 0 ? (
+              <div className="space-y-1">
+                {Object.entries(form.glossary).map(([term, def]) => (
+                  <div key={term} className="flex items-center justify-between bg-stone-50 rounded-lg px-3 py-1.5 text-xs">
+                    <div><span className="font-semibold text-stone-700">{term}</span>: <span className="text-stone-500">{def}</span></div>
+                    <button onClick={() => removeGlossaryTerm(term)} className="text-red-400 hover:text-red-600 ml-2">x</button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-stone-400 italic">No glossary terms defined yet.</div>
+            )}
+          </div>
+
+          <button onClick={handleSave} disabled={saving}
+            className="text-xs px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50">
+            {saving ? "Saving..." : "Save Business Knowledge"}
+          </button>
+          {bk?.updated_at && <div className="text-xs text-stone-400">Last updated: {bk.updated_at?.slice(0, 16)} by {bk.updated_by || "—"}</div>}
+        </div>
+      )}
+
+      {tab === "kpis" && (
+        <div className="max-w-2xl">
+          <p className="text-xs text-stone-400 mb-3">
+            Define your business KPIs here. Paste text from documents, Slack, or email — the agent will parse it into structured definitions.
+            These KPIs feed into metric suggestions and transform generation.
+          </p>
+
+          <div className="mb-4">
+            <textarea value={kpiText} onChange={(e) => setKpiText(e.target.value)}
+              rows={5} className="w-full text-sm border border-stone-200 rounded-lg px-3 py-2 bg-white font-mono"
+              placeholder={"Paste KPI definitions here, e.g.:\n- Monthly Active Users: count of unique users with at least 1 login in 30 days\n- Revenue per customer: total_revenue / active_customers\n- Churn rate: customers lost / total customers * 100"} />
+            <button onClick={handleParseKpis} disabled={parsing || !kpiText.trim()}
+              className="mt-2 text-xs px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50">
+              {parsing ? "Parsing..." : "Parse with Agent"}
+            </button>
+          </div>
+
+          <div className="text-xs font-medium text-stone-500 mb-2">Defined KPIs ({(form.kpi_definitions || []).length})</div>
+          {(form.kpi_definitions || []).length > 0 ? (
+            <div className="space-y-2 mb-4">
+              {(form.kpi_definitions || []).map((kpi, i) => (
+                <div key={i} className="bg-white border border-stone-200 rounded-lg px-4 py-3">
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-medium text-stone-700">{kpi.name}</div>
+                    <button onClick={() => removeKpi(i)} className="text-xs text-red-400 hover:text-red-600">Remove</button>
+                  </div>
+                  <div className="text-xs text-stone-500 mt-1">{kpi.description}</div>
+                  {kpi.formula && <div className="text-xs text-indigo-500 mt-1 font-mono">Formula: {kpi.formula}</div>}
+                  {kpi.dimensions && kpi.dimensions.length > 0 && (
+                    <div className="text-xs text-stone-400 mt-1">Dimensions: {kpi.dimensions.join(", ")}</div>
+                  )}
+                  {kpi.unit && <div className="text-xs text-stone-400 mt-1">Unit: {kpi.unit}</div>}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-xs text-stone-400 italic mb-4">No KPI definitions yet. Paste text above and click "Parse with Agent".</div>
+          )}
+
+          <button onClick={handleSave} disabled={saving}
+            className="text-xs px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50">
+            {saving ? "Saving..." : "Save KPI Definitions"}
+          </button>
+        </div>
+      )}
+
+      {tab === "prompt" && (
+        <div className="max-w-3xl">
+          <p className="text-xs text-stone-400 mb-3">
+            This is the system prompt the agent uses for all reasoning. It is read-only — configured by the platform.
+            Business knowledge (left tab) is appended automatically.
+          </p>
+          <pre className="text-xs bg-stone-900 text-green-300 rounded-xl p-4 overflow-auto max-h-[70vh] font-mono whitespace-pre-wrap leading-relaxed">
+            {systemPrompt || "Loading..."}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function DocsView() {
@@ -4450,6 +4688,7 @@ function App() {
     alerts: <AlertsView tierFilter={tierFilter} searchQuery={sq} />,
     metrics: <MetricsView />,
     costs: <CostsView />,
+    agent: <AgentKnowledgeView />,
     docs: <DocsView />,
   };
 

@@ -259,8 +259,14 @@ class PipelineRunner:
 
             # Build 15: Load upstream run context for data-triggered runs
             upstream_run = None
+            upstream_context = {}
             if run.triggered_by_run_id:
                 upstream_run = await self.store.get_run(run.triggered_by_run_id)
+                # Build 28: Load enriched upstream context (quality, gate, metadata)
+                try:
+                    upstream_context = await self.store.load_upstream_context_for_run(run)
+                except Exception as uc_err:
+                    log.warning("Failed to load upstream context: %s", uc_err)
 
             # Resolve connectors
             src_params, tgt_params = self._connector_params(contract, "both")
@@ -378,12 +384,12 @@ class PipelineRunner:
             await self._track_column_lineage(contract)
             self._log_step(run, "column_lineage", "tracked")
 
-            # Write pipeline metadata (XCom-style)
-            await self._write_run_metadata(contract, run, extract_result, upstream_run)
+            # Write pipeline metadata (XCom-style) + Build 28 upstream context propagation
+            await self._write_run_metadata(contract, run, extract_result, upstream_run, upstream_context)
             self._log_step(run, "metadata", "run metadata written")
 
-            # Execute post-promotion SQL hooks
-            await self._execute_post_promotion_hooks(contract, run, target, upstream_run)
+            # Execute post-promotion SQL hooks (with enriched upstream context)
+            await self._execute_post_promotion_hooks(contract, run, target, upstream_run, upstream_context)
             self._log_step(run, "hooks", "post-promotion hooks executed")
 
             # 9. Mark COMPLETE
@@ -779,6 +785,7 @@ class PipelineRunner:
         run: RunRecord,
         extract_result,
         upstream_run: RunRecord = None,
+        upstream_context: dict = None,
     ) -> None:
         """Persist execution metadata for downstream consumption."""
         try:
@@ -803,8 +810,24 @@ class PipelineRunner:
                 pid, "last_staging_size_bytes",
                 {"value": run.staging_size_bytes}, rid,
             )
-            # Build 15: Write upstream context for data-triggered runs
+            # Build 28: Write gate decision and quality summary
+            gate_str = ""
+            if run.gate_decision:
+                gate_str = run.gate_decision.value if hasattr(run.gate_decision, "value") else str(run.gate_decision)
+            await self.store.set_metadata(
+                pid, "last_gate_decision", {"value": gate_str}, rid,
+            )
+            if run.quality_results:
+                await self.store.set_metadata(
+                    pid, "last_quality_summary", {
+                        "decision": run.quality_results.get("decision", ""),
+                        "checks": run.quality_results.get("checks", []),
+                    }, rid,
+                )
+
+            # Build 15 + 28: Write upstream context for data-triggered runs
             if upstream_run:
+                uc = upstream_context or {}
                 await self.store.set_metadata(
                     pid, "upstream_run_id",
                     {"value": upstream_run.run_id}, rid, namespace="upstream",
@@ -825,6 +848,33 @@ class PipelineRunner:
                     pid, "upstream_completed_at",
                     {"value": upstream_run.completed_at}, rid, namespace="upstream",
                 )
+                # Build 28: Propagate upstream quality and gate context
+                if contract.auto_propagate_context:
+                    await self.store.set_metadata(
+                        pid, "upstream_gate_decision",
+                        {"value": uc.get("upstream_gate_decision", "")},
+                        rid, namespace="upstream",
+                    )
+                    await self.store.set_metadata(
+                        pid, "upstream_quality_decision",
+                        {"value": uc.get("upstream_quality_decision", "")},
+                        rid, namespace="upstream",
+                    )
+                    await self.store.set_metadata(
+                        pid, "upstream_quality_checks_passed",
+                        {"value": uc.get("upstream_quality_checks_passed", "0")},
+                        rid, namespace="upstream",
+                    )
+                    await self.store.set_metadata(
+                        pid, "upstream_quality_checks_warned",
+                        {"value": uc.get("upstream_quality_checks_warned", "0")},
+                        rid, namespace="upstream",
+                    )
+                    await self.store.set_metadata(
+                        pid, "upstream_quality_checks_failed",
+                        {"value": uc.get("upstream_quality_checks_failed", "0")},
+                        rid, namespace="upstream",
+                    )
         except Exception as e:
             log.warning("Failed to write pipeline metadata: %s", e)
 
@@ -838,10 +888,11 @@ class PipelineRunner:
         contract: PipelineContract,
         run: RunRecord,
         upstream_run: RunRecord = None,
+        upstream_context: dict = None,
     ) -> str:
         """Replace {{variable}} placeholders with run context values.
 
-        Supported variables (24 run context + 10 connection + 9 upstream = 43 total):
+        Supported variables (15 run + 10 connection + 17 upstream = 42 total):
 
         Run context (15):
           {{pipeline_id}}, {{pipeline_name}},
@@ -859,13 +910,20 @@ class PipelineRunner:
           {{target_host}}, {{target_database}}, {{target_user}}, {{target_port}},
           {{target_ddl}}
 
-        Upstream (9):
-          {{upstream_run_id}}, {{upstream_pipeline_id}},
+        Upstream (17 — Build 15 + Build 28):
+          {{upstream_run_id}}, {{upstream_pipeline_id}}, {{upstream_pipeline_name}},
           {{upstream_watermark_before}}, {{upstream_watermark_after}},
           {{upstream_rows_extracted}}, {{upstream_rows_loaded}},
           {{upstream_started_at}}, {{upstream_completed_at}},
-          {{upstream_batch_id}}
+          {{upstream_batch_id}},
+          {{upstream_gate_decision}},
+          {{upstream_quality_decision}}, {{upstream_quality_checks_passed}},
+          {{upstream_quality_checks_warned}}, {{upstream_quality_checks_failed}},
+          {{upstream_metadata.<key>}} (dynamic, from upstream pipeline metadata)
         """
+        # Start with upstream_context if provided (Build 28 enriched context)
+        uc = upstream_context or {}
+
         replacements = {
             "pipeline_id": contract.pipeline_id,
             "pipeline_name": contract.pipeline_name,
@@ -882,7 +940,7 @@ class PipelineRunner:
             "target_schema": contract.target_schema,
             "target_table": contract.target_table,
             "batch_id": run.run_id[:8],
-            # Connection/environment variables — same SQL works across test/stg/prod
+            # Connection/environment variables
             "environment": contract.environment,
             "source_host": contract.source_host,
             "source_database": contract.source_database,
@@ -893,20 +951,38 @@ class PipelineRunner:
             "target_user": contract.target_user,
             "target_port": str(contract.target_port),
             "target_ddl": contract.target_ddl or "",
-            # Build 15: upstream context variables
-            "upstream_run_id": upstream_run.run_id if upstream_run else "",
-            "upstream_pipeline_id": upstream_run.pipeline_id if upstream_run else "",
-            "upstream_watermark_before": (upstream_run.watermark_before or "") if upstream_run else "",
-            "upstream_watermark_after": (upstream_run.watermark_after or "") if upstream_run else "",
-            "upstream_rows_extracted": str(upstream_run.rows_extracted) if upstream_run else "0",
-            "upstream_rows_loaded": str(upstream_run.rows_loaded) if upstream_run else "0",
-            "upstream_started_at": (upstream_run.started_at or "") if upstream_run else "",
-            "upstream_completed_at": (upstream_run.completed_at or "") if upstream_run else "",
-            "upstream_batch_id": upstream_run.run_id[:8] if upstream_run else "",
+            # Upstream context (Build 28 enriched; falls back to Build 15 upstream_run)
+            "upstream_run_id": uc.get("upstream_run_id", upstream_run.run_id if upstream_run else ""),
+            "upstream_pipeline_id": uc.get("upstream_pipeline_id", upstream_run.pipeline_id if upstream_run else ""),
+            "upstream_pipeline_name": uc.get("upstream_pipeline_name", ""),
+            "upstream_watermark_before": uc.get("upstream_watermark_before", (upstream_run.watermark_before or "") if upstream_run else ""),
+            "upstream_watermark_after": uc.get("upstream_watermark_after", (upstream_run.watermark_after or "") if upstream_run else ""),
+            "upstream_rows_extracted": uc.get("upstream_rows_extracted", str(upstream_run.rows_extracted) if upstream_run else "0"),
+            "upstream_rows_loaded": uc.get("upstream_rows_loaded", str(upstream_run.rows_loaded) if upstream_run else "0"),
+            "upstream_started_at": uc.get("upstream_started_at", (upstream_run.started_at or "") if upstream_run else ""),
+            "upstream_completed_at": uc.get("upstream_completed_at", (upstream_run.completed_at or "") if upstream_run else ""),
+            "upstream_batch_id": uc.get("upstream_batch_id", upstream_run.run_id[:8] if upstream_run else ""),
+            # Build 28: upstream quality and gate context
+            "upstream_gate_decision": uc.get("upstream_gate_decision", ""),
+            "upstream_quality_decision": uc.get("upstream_quality_decision", ""),
+            "upstream_quality_checks_passed": uc.get("upstream_quality_checks_passed", "0"),
+            "upstream_quality_checks_warned": uc.get("upstream_quality_checks_warned", "0"),
+            "upstream_quality_checks_failed": uc.get("upstream_quality_checks_failed", "0"),
         }
+
         rendered = sql
         for key, value in replacements.items():
             rendered = rendered.replace("{{" + key + "}}", str(value))
+
+        # Build 28: Dynamic upstream_metadata.* variables
+        upstream_meta = uc.get("upstream_metadata", {})
+        if upstream_meta:
+            import re
+            for match in re.finditer(r"\{\{upstream_metadata\.(\w+)\}\}", rendered):
+                meta_key = match.group(1)
+                meta_val = upstream_meta.get(meta_key, "")
+                rendered = rendered.replace(match.group(0), str(meta_val))
+
         return rendered
 
     async def _execute_post_promotion_hooks(
@@ -915,6 +991,7 @@ class PipelineRunner:
         run: RunRecord,
         target,
         upstream_run: RunRecord = None,
+        upstream_context: dict = None,
     ) -> None:
         """Execute SQL hooks against the target and store results as metadata."""
         hooks = [h for h in contract.post_promotion_hooks if h.enabled]
@@ -923,7 +1000,7 @@ class PipelineRunner:
 
         log.info("Executing %d post-promotion hook(s)", len(hooks))
         for hook in hooks:
-            rendered_sql = self._render_hook_sql(hook.sql, contract, run, upstream_run)
+            rendered_sql = self._render_hook_sql(hook.sql, contract, run, upstream_run, upstream_context)
 
             # Build 16: Cleanup guard — check data contracts before DELETE/TRUNCATE
             if any(kw in rendered_sql.upper() for kw in ("DELETE", "TRUNCATE")):
@@ -1150,8 +1227,14 @@ class PipelineRunner:
 
         # Load upstream run context
         upstream_run = None
+        upstream_context = {}
         if run.triggered_by_run_id:
             upstream_run = await self.store.get_run(run.triggered_by_run_id)
+            # Build 28: Load enriched upstream context
+            try:
+                upstream_context = await self.store.load_upstream_context_for_run(run)
+            except Exception as uc_err:
+                log.warning("Failed to load upstream context: %s", uc_err)
 
         # Step context: shared dict passed between steps (XCom equivalent)
         ctx: dict = {
@@ -1160,6 +1243,7 @@ class PipelineRunner:
             "contract": contract,
             "run": run,
             "upstream_run": upstream_run,
+            "upstream_context": upstream_context,
             "extract_result": None,
             "gate_record": None,
         }
@@ -1225,7 +1309,7 @@ class PipelineRunner:
             await self._update_baselines(contract, run)
             await self.store.save_pipeline(contract)
             await self._track_column_lineage(contract)
-            await self._write_run_metadata(contract, run, extract_result, upstream_run)
+            await self._write_run_metadata(contract, run, extract_result, upstream_run, upstream_context)
 
             self._log_step(run, "complete", f"{run.rows_extracted} rows, {len(ordered)} steps executed")
             await self._generate_insights(contract, run)

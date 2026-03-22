@@ -2877,6 +2877,241 @@ fi # FIRST_PID check
 fi # --api (Build 31)
 
 # ============================================================================
+# Build 28: Context API Enrichment
+# ============================================================================
+
+if [ -z "$SKIP_API" ]; then
+
+echo ""
+echo -e "${BOLD}${CYAN}--- Context API Enrichment (Build 28) ---${NC}"
+
+FIRST_PID=$(curl -s "$API_URL/api/pipelines" -H "Authorization: Bearer $TOKEN" | jq -r '.[0].pipeline_id // empty' 2>/dev/null)
+
+if [ -z "$FIRST_PID" ]; then
+    skip "No pipelines found, skipping context tests"
+else
+
+# Test 1: Get context chain for a pipeline
+test_name "GET /api/pipelines/{pipeline_id}/context-chain"
+echo -n "  Context chain... "
+CODE=$(curl -s -o /tmp/pa_ctx_chain.json -w '%{http_code}' \
+    "$API_URL/api/pipelines/$FIRST_PID/context-chain" \
+    -H "Authorization: Bearer $TOKEN")
+if [ "$CODE" = "200" ]; then
+    CHAIN_LEN=$(jq '.chain_length' /tmp/pa_ctx_chain.json 2>/dev/null)
+    pass "Context chain returned ($CHAIN_LEN pipeline(s))"
+else
+    fail "Context chain returned HTTP $CODE"
+fi
+
+# Test 2: Get run context for latest run
+FIRST_RUN=$(curl -s "$API_URL/api/pipelines/$FIRST_PID/runs?limit=1" -H "Authorization: Bearer $TOKEN" | jq -r '.[0].run_id // empty' 2>/dev/null)
+if [ -n "$FIRST_RUN" ]; then
+test_name "GET /api/runs/{run_id}/context"
+echo -n "  Run context... "
+CODE=$(curl -s -o /tmp/pa_run_ctx.json -w '%{http_code}' \
+    "$API_URL/api/runs/$FIRST_RUN/context" \
+    -H "Authorization: Bearer $TOKEN")
+if [ "$CODE" = "200" ]; then
+    CTX_PID=$(jq -r '.pipeline_id' /tmp/pa_run_ctx.json 2>/dev/null)
+    CTX_STATUS=$(jq -r '.status' /tmp/pa_run_ctx.json 2>/dev/null)
+    pass "Run context: status=$CTX_STATUS"
+else
+    fail "Run context returned HTTP $CODE"
+fi
+fi
+
+# Test 3: auto_propagate_context in pipeline detail
+test_name "Pipeline detail includes auto_propagate_context"
+echo -n "  Detail field check... "
+CODE=$(curl -s -o /tmp/pa_ctx_detail.json -w '%{http_code}' \
+    "$API_URL/api/pipelines/$FIRST_PID" \
+    -H "Authorization: Bearer $TOKEN")
+if [ "$CODE" = "200" ]; then
+    APC=$(jq '.auto_propagate_context' /tmp/pa_ctx_detail.json 2>/dev/null)
+    if [ "$APC" = "true" ] || [ "$APC" = "false" ]; then
+        pass "auto_propagate_context=$APC"
+    else
+        fail "auto_propagate_context field missing"
+    fi
+else
+    fail "Pipeline detail returned HTTP $CODE"
+fi
+
+# Test 4: PATCH auto_propagate_context
+test_name "PATCH auto_propagate_context"
+echo -n "  Toggle context propagation... "
+CODE=$(curl -s -o /tmp/pa_ctx_patch.json -w '%{http_code}' \
+    -X PATCH "$API_URL/api/pipelines/$FIRST_PID" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"auto_propagate_context": false, "reason": "test toggle"}')
+if [ "$CODE" = "200" ]; then
+    NEW_APC=$(jq '.auto_propagate_context' /tmp/pa_ctx_patch.json 2>/dev/null)
+    if [ "$NEW_APC" = "false" ]; then
+        pass "Toggled to false"
+        # Reset back to true
+        curl -s -o /dev/null -X PATCH "$API_URL/api/pipelines/$FIRST_PID" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            -d '{"auto_propagate_context": true, "reason": "reset after test"}'
+    else
+        warn "Patched but value unexpected: $NEW_APC"
+    fi
+else
+    fail "PATCH returned HTTP $CODE"
+fi
+
+# Test 5: Run context returns 404 for non-existent run
+test_name "GET /api/runs/{bad_id}/context returns 404"
+echo -n "  Context 404... "
+CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+    "$API_URL/api/runs/nonexistent-run-id/context" \
+    -H "Authorization: Bearer $TOKEN")
+if [ "$CODE" = "404" ]; then
+    pass "404 for non-existent run"
+else
+    fail "Expected 404, got HTTP $CODE"
+fi
+
+fi # FIRST_PID check
+
+fi # --api (Build 28)
+
+# Build 32: Business Context, Agent Knowledge & Metrics Reasoning
+# ============================================================================
+if [[ "$TEST_MODE" == "all" || "$TEST_MODE" == "--api" ]]; then
+
+echo ""
+echo -e "${BOLD}${CYAN}--- Business Context & Agent Knowledge (Build 32) ---${NC}"
+section "Business Context & Agent Knowledge (Build 32)"
+
+# Test: GET system prompt
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    "$API_URL/api/agent/system-prompt")
+if [ "$CODE" = "200" ]; then
+    pass "GET /api/agent/system-prompt returns 200"
+else
+    fail "Expected 200 for system prompt, got $CODE"
+fi
+
+# Test: GET business knowledge (initially empty or default)
+RESP=$(curl -s -m 10 \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    "$API_URL/api/settings/business-knowledge")
+CODE=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok')" 2>/dev/null)
+if [ "$CODE" = "ok" ]; then
+    pass "GET /api/settings/business-knowledge returns valid JSON"
+else
+    fail "Business knowledge response not valid JSON"
+fi
+
+# Test: PUT business knowledge
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
+    -X PUT \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"company_name":"Test Corp","industry":"Technology","business_description":"We sell widgets"}' \
+    "$API_URL/api/settings/business-knowledge")
+if [ "$CODE" = "200" ]; then
+    pass "PUT /api/settings/business-knowledge saves successfully"
+else
+    fail "Expected 200 for PUT business knowledge, got $CODE"
+fi
+
+# Test: GET business knowledge returns saved data
+COMPANY=$(curl -s -m 10 \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    "$API_URL/api/settings/business-knowledge" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('company_name',''))" 2>/dev/null)
+if [ "$COMPANY" = "Test Corp" ]; then
+    pass "Business knowledge persists company_name"
+else
+    fail "Expected company_name='Test Corp', got '$COMPANY'"
+fi
+
+# Test: POST parse-kpis
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 30 \
+    -X POST \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"text":"Monthly Revenue: Total revenue calculated monthly\nChurn Rate: Percentage of customers lost per month"}' \
+    "$API_URL/api/settings/business-knowledge/parse-kpis")
+if [ "$CODE" = "200" ]; then
+    pass "POST /api/settings/business-knowledge/parse-kpis returns 200"
+else
+    fail "Expected 200 for parse-kpis, got $CODE"
+fi
+
+# Test: Verify suggestion reasoning field in metrics suggest
+# (This tests the s.reasoning fix - just verify the endpoint still works)
+if [ -n "$FIRST_PID" ]; then
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 30 \
+        -X POST \
+        -H "Authorization: Bearer $AUTH_TOKEN" \
+        "$API_URL/api/metrics/suggest/$FIRST_PID")
+    if [ "$CODE" = "200" ]; then
+        pass "Metrics suggest still works after reasoning field fix"
+    else
+        warn "Metrics suggest returned $CODE (may need running pipeline)"
+    fi
+else
+    skip "No pipeline available for metrics suggest test"
+fi
+
+# Test: Create metric includes reasoning field
+if [ -n "$FIRST_PID" ]; then
+    METRIC_RESP=$(curl -s -m 30 \
+        -X POST \
+        -H "Authorization: Bearer $AUTH_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"pipeline_id\":\"$FIRST_PID\",\"metric_name\":\"test_reasoning_metric\",\"description\":\"Count of all rows\",\"sql_expression\":\"SELECT COUNT(*) AS value FROM test_table\"}" \
+        "$API_URL/api/metrics")
+    HAS_REASONING=$(echo "$METRIC_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('reasoning') else 'no')" 2>/dev/null)
+    if [ "$HAS_REASONING" = "yes" ]; then
+        pass "Created metric includes agent reasoning"
+    else
+        warn "Created metric missing reasoning (agent may be unavailable)"
+    fi
+
+    # Get metric detail and check reasoning_history
+    TEST_MID=$(echo "$METRIC_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('metric_id',''))" 2>/dev/null)
+    if [ -n "$TEST_MID" ]; then
+        DETAIL=$(curl -s -m 10 \
+            -H "Authorization: Bearer $AUTH_TOKEN" \
+            "$API_URL/api/metrics/$TEST_MID")
+        HIST_LEN=$(echo "$DETAIL" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('reasoning_history',[])))" 2>/dev/null)
+        if [ "$HIST_LEN" -ge 1 ] 2>/dev/null; then
+            pass "Metric detail includes reasoning_history"
+        else
+            warn "reasoning_history empty or missing"
+        fi
+
+        # Update metric and check reasoning updates
+        UPD_RESP=$(curl -s -m 30 \
+            -X PATCH \
+            -H "Authorization: Bearer $AUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"description":"Updated count of all rows in table"}' \
+            "$API_URL/api/metrics/$TEST_MID")
+        UPD_REASONING=$(echo "$UPD_RESP" | python3 -c "import sys,json; print('yes' if json.load(sys.stdin).get('reasoning') else 'no')" 2>/dev/null)
+        if [ "$UPD_REASONING" = "yes" ]; then
+            pass "Updated metric has refreshed reasoning"
+        else
+            warn "Updated metric missing refreshed reasoning"
+        fi
+
+        # Cleanup test metric
+        curl -s -m 10 -X DELETE \
+            -H "Authorization: Bearer $AUTH_TOKEN" \
+            "$API_URL/api/metrics/$TEST_MID" > /dev/null 2>&1
+    fi
+else
+    skip "No pipeline available for metric reasoning tests"
+fi
+
+fi # --api (Build 32)
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -2945,6 +3180,8 @@ echo "  - Metrics / KPIs: suggest, create, list, get, update, trend, delete, cha
 echo "  - GitOps API: status, log, diff, pipeline history, restore dry-run (Build 23)"
 echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21)"
 echo "  - Interaction audit: list, export (Build 21)"
+echo "  - Context API: context chain, run context, detail field, PATCH toggle, 404 (Build 28)"
+echo "  - Business context & agent knowledge: system prompt, business knowledge CRUD, parse-kpis, metric reasoning (Build 32)"
 echo ""
 
 exit $FAIL_COUNT

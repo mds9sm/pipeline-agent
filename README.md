@@ -2,7 +2,7 @@
 
 An AI-powered data pipeline platform where the agent is the product.
 
-The agent discovers schemas, proposes ingestion strategies, runs pipelines autonomously, validates every load through a 7-check quality gate, monitors for drift and freshness issues, generates its own connector code for new sources and targets on demand, and learns from every human approval and rejection. Ships with 8 seed connectors and 4 demo pipelines that run end-to-end on first startup. Additional connectors are generated through conversation.
+The agent discovers schemas, proposes ingestion strategies, runs pipelines autonomously, validates every load through a 7-check quality gate, monitors for drift and freshness issues, generates its own connector code for new sources and targets on demand, executes native SQL transforms (replacing dbt), tracks KPI metrics with agentic trend interpretation, and learns from every human approval and rejection. Ships with 8 seed connectors and 4 demo pipelines that run end-to-end on first startup. Additional connectors are generated through conversation.
 
 ---
 
@@ -21,6 +21,10 @@ The agent discovers schemas, proposes ingestion strategies, runs pipelines auton
 - Tracks column-level lineage for impact analysis
 - Logs agent cost (tokens, latency) per Claude API call
 - Learns from every human approval and rejection -- accumulates `AgentPreference` entries over time
+- Executes native SQL transforms with ref(), var(), and 4 materialization strategies
+- Suggests, generates, and interprets KPI metrics on pipeline data
+- Propagates upstream run context (quality, watermarks, metadata) to downstream pipelines
+- Maintains per-metric agent reasoning that evolves with each interaction
 
 ### Gated (requires human approval)
 
@@ -449,6 +453,46 @@ When pgvector embeddings are enabled (set `VOYAGE_API_KEY`), preferences are emb
 | `GET` | `/api/agent-costs` | Paginated cost log (filter: pipeline_id, date range) |
 | `GET` | `/api/agent-costs/summary` | Aggregated cost summary by operation |
 
+### Context API (Build 28)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/runs/{run_id}/context` | Full aggregated run context |
+| `GET` | `/api/pipelines/{id}/context-chain` | Upstream dependency DAG context |
+
+### SQL Transforms (Build 29)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/transforms` | Create transform |
+| `GET` | `/api/transforms` | List transforms |
+| `GET` | `/api/transforms/{id}` | Transform detail |
+| `PATCH` | `/api/transforms/{id}` | Update transform |
+| `DELETE` | `/api/transforms/{id}` | Delete transform |
+| `POST` | `/api/transforms/generate` | AI-generate transform SQL |
+
+### Metrics / KPIs (Build 31)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/metrics/suggest/{pipeline_id}` | Agent suggests metrics |
+| `POST` | `/api/metrics` | Create metric |
+| `GET` | `/api/metrics` | List metrics |
+| `GET` | `/api/metrics/{metric_id}` | Metric detail with snapshots |
+| `POST` | `/api/metrics/{metric_id}/compute` | Compute metric now |
+| `GET` | `/api/metrics/{metric_id}/trend` | Agent trend interpretation |
+| `PATCH` | `/api/metrics/{metric_id}` | Update metric |
+| `DELETE` | `/api/metrics/{metric_id}` | Delete metric |
+
+### Business Knowledge (Build 32)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/agent/system-prompt` | Read-only agent system prompt |
+| `GET` | `/api/settings/business-knowledge` | Get business knowledge |
+| `PUT` | `/api/settings/business-knowledge` | Update business knowledge |
+| `POST` | `/api/settings/business-knowledge/parse-kpis` | Parse free-text KPIs |
+
 ### Connector Migrations
 
 | Method | Path | Description |
@@ -491,6 +535,7 @@ pipeline-agent/
 ├── agent/
 │   ├── core.py               # Claude API: propose_strategy, analyze_drift, generate_connector,
 │   │                         #   reason_about_quality, learn_from_rejection, generate_digest
+│   │                         #   metrics, topology, transforms, business knowledge
 │   ├── conversation.py       # 10-step onboarding flow (stateless)
 │   └── autonomous.py         # Pipeline execution state machine: PENDING -> COMPLETE/HALTED
 │
@@ -523,14 +568,27 @@ pipeline-agent/
 ├── scheduler/
 │   └── manager.py            # Cron scheduler + topological dependency sort + backfill + retry
 │
+├── transforms/
+│   └── engine.py            # SQL transform engine — ref/var resolution, materialization
+│
+├── mcp_server.py            # MCP server — 12 resources, 24 tools, 3 prompts
+│
+├── docs/                    # Structured documentation
+│   ├── index.md
+│   ├── api-reference.md
+│   └── ...
+│
+├── cli/
+│   └── __main__.py          # CLI — 14 commands, pipeline management
+│
 ├── api/
 │   └── server.py             # FastAPI: all REST endpoints with JWT auth + rate limiting
 │
 ├── ui/
 │   ├── index.html
-│   └── App.jsx               # React SPA: 9 views (CDN React 18 + Tailwind)
+│   └── App.jsx               # React SPA: 13 views (CDN React 18 + Tailwind)
 │
-├── test-pipeline-agent.sh    # Comprehensive curl-based test suite (127 tests)
+├── test-pipeline-agent.sh    # Comprehensive curl-based test suite (~187 tests)
 ├── CLAUDE.md                 # Product context for Claude Code sessions
 ├── CHANGELOG.md              # Change log across builds
 │
@@ -573,6 +631,14 @@ Connection pooling is managed via asyncpg with configurable min/max pool sizes (
 | `agent_cost_logs` | Token usage and latency per Claude API call |
 | `connector_migrations` | Version migration records with affected pipelines |
 | `users` | User accounts with bcrypt password hashes and roles |
+| `data_contracts` | Producer/consumer relationships, SLA, cleanup guards |
+| `sources` | Source registry for analyst discovery |
+| `transforms` | SQL transform definitions with ref/var resolution |
+| `metrics` | KPI definitions with SQL expressions and agent reasoning |
+| `metric_snapshots` | Time-series metric computation results |
+| `business_knowledge` | Company context, glossary, KPI definitions (singleton) |
+| `interactions` | Chat interaction audit log |
+| `changelog` | Pipeline change history with reasons |
 
 ### Migrations
 
@@ -589,7 +655,7 @@ The test strategy is to test the real running app via curl API calls -- no mocks
 docker compose up -d
 ANTHROPIC_API_KEY=sk-... python main.py
 
-# Full test suite (~127 tests, ~20 min with LLM calls)
+# Full test suite (~187 tests, ~20 min with LLM calls)
 ./test-pipeline-agent.sh
 
 # Targeted test modes
@@ -610,8 +676,18 @@ ANTHROPIC_API_KEY=sk-... python main.py
 - **20 Multi-turn pipeline conversations** -- e.g., Oracle->Snowflake, Stripe->Snowflake, Salesforce->Databricks
 - **10 Agent understanding tests** -- capabilities, scheduling, refresh strategy, quality gates, error budgets, schema drift
 - **9 Connector generation via API** -- Oracle, SQL Server, Stripe, Google Ads, Facebook, Snowflake, BigQuery, Redshift, Databricks
-- **10 Pipeline CRUD** -- create, get, update, pause, resume, preview, runs, quality, lineage, error budgets
+- **18 Pipeline CRUD** -- create, get, update (expanded PATCH), pause, resume, preview, runs, quality, lineage, error budgets
 - **Approval workflow** -- list pending proposals, approve connectors
+- **6 YAML contract-as-code** -- single export, bulk export, status filter, import, GitOps sync
+- **11 Data contracts** -- create, list, get, validate, update, violations, auto-dep, delete
+- **5 Step DAG** -- steps definition, validate, cycle detection, preview, PATCH
+- **8 Agent diagnostics** -- diagnose, impact, anomalies, chat routing
+- **15 Data catalog** -- search, trust, tags, context, weights, alert narratives
+- **3 MCP server** -- import, resources, tools
+- **13 SQL transforms** -- CRUD, lineage, generate, chat routing, demo transforms
+- **8 Metrics / KPIs** -- suggest, create, list, get, update, trend, delete, chat
+- **5 Context API** -- context chain, run context, detail field, PATCH toggle, 404
+- **9 Business context** -- system prompt, business knowledge CRUD, parse-kpis, metric reasoning
 
 ---
 
