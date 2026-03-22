@@ -5171,11 +5171,24 @@ def create_app(
         if not sql_expr and body.description:
             columns = [
                 {"target_column": cm.target_column, "source_column": cm.source_column,
-                 "target_type": cm.target_type}
+                 "target_type": cm.target_type, "is_nullable": cm.is_nullable,
+                 "is_primary_key": cm.is_primary_key}
                 for cm in (p.column_mappings or [])
             ]
             target_table = f"{p.target_schema}.{p.target_table}"
-            generated = await agent.generate_metric_sql(body.description, target_table, columns)
+            # Build rich context for the agent
+            existing = await store.list_metrics(body.pipeline_id)
+            pipeline_ctx = {
+                "pipeline_name": p.pipeline_name,
+                "source_type": p.source_type if hasattr(p, "source_type") else "",
+                "semantic_tags": p.semantic_tags or {},
+                "business_context": p.business_context or {},
+                "existing_metrics": [m.metric_name for m in existing],
+                "tier": p.tier,
+            }
+            generated = await agent.generate_metric_sql(
+                body.description, target_table, columns, pipeline_context=pipeline_ctx,
+            )
             sql_expr = generated.get("sql_expression", "")
             metric_type = generated.get("metric_type", metric_type)
 

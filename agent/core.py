@@ -271,19 +271,26 @@ class AgentCore:
             log.warning("Voyage embedding error: %s", exc)
             return []
 
-    def _extract_json(self, text: str) -> dict:
-        """Extract the first JSON object from a Claude response."""
+    def _extract_json(self, text: str) -> dict | list:
+        """Extract the first JSON object or array from a Claude response."""
         text = text.strip()
         # Try direct parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
-        # Find JSON block in markdown fences
-        fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]+?\})\s*```", text)
+        # Find JSON block in markdown fences (object or array)
+        fence_match = re.search(r"```(?:json)?\s*([\[{][\s\S]+?[\]}])\s*```", text)
         if fence_match:
             try:
                 return json.loads(fence_match.group(1))
+            except json.JSONDecodeError:
+                pass
+        # Find any JSON array first (for suggest_metrics etc.)
+        arr_match = re.search(r"\[[\s\S]+\]", text)
+        if arr_match:
+            try:
+                return json.loads(arr_match.group(0))
             except json.JSONDecodeError:
                 pass
         # Find any JSON object
@@ -3434,6 +3441,20 @@ Rules:
             ctx_text = "\nBusiness context:\n" + "\n".join(
                 f"  - {k}: {v}" for k, v in business_context.items()
             )
+        if hasattr(contract, "semantic_tags") and contract.semantic_tags:
+            ctx_text += "\nSemantic tags: " + json.dumps(contract.semantic_tags)
+
+        # Include existing metrics so agent doesn't suggest duplicates
+        existing_metrics = []
+        try:
+            existing = await self.store.list_metrics(contract.pipeline_id)
+            existing_metrics = [m.metric_name for m in existing]
+        except Exception:
+            pass
+        if existing_metrics:
+            ctx_text += "\nExisting metrics (do NOT re-suggest):\n" + "\n".join(
+                f"  - {m}" for m in existing_metrics
+            )
 
         target_table = f"{contract.target_schema}.{contract.target_table}"
 
@@ -3445,6 +3466,7 @@ Columns:
 
 Suggest 3-5 useful KPI metrics for this table. Each metric should be a single SELECT query \
 that returns a numeric value (with optional GROUP BY for dimensions).
+IMPORTANT: Use ONLY columns listed above in your SQL — do NOT guess or invent column names.
 
 For each metric provide:
 - metric_name: short snake_case name
@@ -3518,10 +3540,13 @@ Respond with a JSON array:
         description: str,
         target_table: str,
         columns: list[dict],
+        pipeline_context: dict | None = None,
     ) -> dict:
         """Agent generates SQL for a metric from a natural language description.
 
         Returns dict with: sql_expression, metric_type, dimensions, description.
+        pipeline_context may include: pipeline_name, source_type, semantic_tags,
+        business_context, existing_metrics, refresh_type, tier.
         """
         if not self.has_api:
             return self._rule_based_generate_metric_sql(target_table)
@@ -3529,18 +3554,39 @@ Respond with a JSON array:
         col_summary = "\n".join(
             f"  - {c.get('target_column', c.get('source_column', '?'))}: "
             f"{c.get('target_type', 'unknown')}"
+            f"{' (PK)' if c.get('is_primary_key') else ''}"
+            f"{' (nullable)' if c.get('is_nullable') else ''}"
             for c in columns[:30]
         )
+
+        ctx = pipeline_context or {}
+        extra_context = ""
+        if ctx.get("pipeline_name"):
+            extra_context += f"\nPipeline: {ctx['pipeline_name']}"
+        if ctx.get("source_type"):
+            extra_context += f" (source: {ctx['source_type']})"
+        if ctx.get("semantic_tags"):
+            extra_context += f"\nSemantic tags: {json.dumps(ctx['semantic_tags'])}"
+        if ctx.get("business_context"):
+            extra_context += "\nBusiness context:\n" + "\n".join(
+                f"  - {k}: {v}" for k, v in ctx["business_context"].items()
+            )
+        if ctx.get("existing_metrics"):
+            extra_context += "\nExisting metrics on this table:\n" + "\n".join(
+                f"  - {m}" for m in ctx["existing_metrics"]
+            )
 
         user_prompt = f"""Generate a SQL metric query for: "{description}"
 
 Target table: {target_table}
 Columns:
 {col_summary}
+{extra_context}
 
 Requirements:
 - Single SELECT statement that returns one numeric value (or one per dimension group)
 - Reference the table as {target_table}
+- Use ONLY columns listed above — do NOT guess column names
 - Use standard SQL (PostgreSQL-compatible)
 - Column alias the result as "value"
 
