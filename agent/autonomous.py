@@ -601,12 +601,13 @@ class PipelineRunner:
                 )
                 self._log_step(run, "agent_diagnosis", diag_detail)
 
-                # Enrich run error with agent diagnosis
-                run.error = (
-                    f"Quality gate HALT — {diagnosis.get('root_cause', 'unknown')} "
-                    f"[{diagnosis.get('category', 'unknown')}] "
-                    f"→ {diagnosis.get('recommended_action', '')}"
-                )
+                # Enrich run error with short summary (full diagnosis in diagnosis panel)
+                root = diagnosis.get('root_cause', 'unknown')
+                # Truncate long LLM root causes to first sentence
+                if len(root) > 150:
+                    root = root[:root.find('. ', 50) + 1] if '. ' in root[50:] else root[:150] + '…'
+                category = diagnosis.get('category', 'unknown')
+                run.error = f"Quality gate HALT — {root} [{category}]"
             except Exception as diag_err:
                 log.warning("Agent halt diagnosis error: %s", diag_err)
                 run.error = "Quality gate HALT — review failed checks"
