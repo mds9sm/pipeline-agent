@@ -186,8 +186,8 @@ function RunRow({ r }) {
         {r.rows_loaded > 0 && <span className="text-slate-500">{r.rows_loaded?.toLocaleString()} loaded</span>}
         {fmtBytes(r.staging_size_bytes) && <span className="text-slate-400">{fmtBytes(r.staging_size_bytes)}</span>}
         <Pill
-          label={r.gate_decision || r.status}
-          color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
+          label={r.status}
+          color={r.status === "complete" ? "green" : r.status === "failed" ? "red" : r.status === "halted" ? "red" : "amber"}
         />
       </div>
       {(r.watermark_before || r.watermark_after) && (
@@ -2121,12 +2121,10 @@ function ActivityRunDetail({ r, onNavigate }) {
         <span className="text-slate-400 font-mono text-xs w-32">{r.started_at?.slice(0, 16)}</span>
         <span className="font-mono font-medium flex-1 text-slate-700">{r.pipeline_name}</span>
         <span className="text-slate-400 text-xs">{r.rows_extracted?.toLocaleString()} rows</span>
-        {r.gate_decision && (
-          <Pill
-            label={r.gate_decision}
-            color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
-          />
-        )}
+        <Pill
+          label={r.status}
+          color={r.status === "complete" ? "green" : r.status === "failed" ? "red" : r.status === "halted" ? "red" : "amber"}
+        />
         {r.error && <span className="text-xs text-red-600 truncate max-w-[200px]">{r.error}</span>}
         <span className="text-slate-300 text-xs">{expanded ? "\u25B2" : "\u25BC"}</span>
       </div>
@@ -2540,7 +2538,7 @@ function ActivityView({ searchQuery, onNavigate }) {
 
   const searched = searchQuery ? runs.filter((r) => r.pipeline_name?.toLowerCase().includes(searchQuery)) : runs;
   const filtered = searched
-    .filter((r) => filter === "all" ? true : filter === "failed" ? (r.status === "failed" || r.status === "halted") : r.status === filter)
+    .filter((r) => filter === "all" ? true : filter === "running" ? ["pending", "extracting", "staging", "loading", "quality_gate", "promoting"].includes(r.status) : r.status === filter)
     .filter((r) => pipelineFilter === "all" || r.pipeline_name === pipelineFilter);
 
   return (
@@ -2559,7 +2557,7 @@ function ActivityView({ searchQuery, onNavigate }) {
             </select>
           )}
           <div className="flex gap-1">
-            {["all", "complete", "failed"].map((f) => (
+            {["all", "complete", "failed", "halted", "running"].map((f) => (
               <button
                 key={f}
                 onClick={() => setFilter(f)}
@@ -2569,7 +2567,11 @@ function ActivityView({ searchQuery, onNavigate }) {
                     : "bg-slate-100 text-slate-500 hover:bg-slate-200"
                 }`}
               >
-                {f === "all" ? `All (${runs.length})` : f === "complete" ? "Completed" : "Failed/Halted"}
+                {f === "all" ? `All (${runs.length})`
+                  : f === "complete" ? "Completed"
+                  : f === "failed" ? "Failed"
+                  : f === "halted" ? "Halted"
+                  : "Running"}
               </button>
             ))}
           </div>
