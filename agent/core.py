@@ -3205,7 +3205,17 @@ Respond naturally. Guide toward the next step or propose the final pipeline if r
             for v in volume[:10]
         ) or "  No volume history"
 
+        # Pull out last run error prominently
+        last_error = ""
+        last_status = ""
+        if runs:
+            last = runs[0]
+            last_status = last.status.value if hasattr(last.status, "value") else last.status
+            last_error = last.error or ""
+
         user_prompt = f"""Diagnose this pipeline and identify the root cause of its issues.
+
+IMPORTANT: Focus on the ACTUAL error from the latest run, not the error budget status. Error budget exhaustion is a SYMPTOM of repeated failures, not the root cause. The root cause is whatever is making individual runs fail or halt.
 
 Pipeline: {p.pipeline_name} ({p.pipeline_id[:8]})
 Status: {p.status.value if hasattr(p.status, 'value') else p.status}
@@ -3213,6 +3223,9 @@ Schedule: {p.schedule_cron}
 Source: {p.source_schema}.{p.source_table} (connector: {src_conn.connector_name if src_conn else 'unknown'}, status: {src_conn.status.value if src_conn and hasattr(src_conn.status, 'value') else 'unknown'})
 Target: {p.target_schema}.{p.target_table}
 Environment: {p.environment}
+
+**Latest run status: {last_status}**
+**Latest run error: {last_error or '(none)'}**
 
 Recent runs (newest first):
 {runs_text}
@@ -3262,26 +3275,41 @@ Respond with JSON:
         evidence = []
         category = "unknown"
         root_cause = "Unable to determine root cause without more data"
+        recommended_actions = []
 
-        # Check last run
+        # Check last run FIRST — this is always the priority
         if runs:
             last = runs[0]
             status = last.status.value if hasattr(last.status, "value") else last.status
             if status == "failed" and last.error:
                 evidence.append(f"Last run failed: {last.error}")
-                if "connector" in last.error.lower() or "connection" in last.error.lower():
+                error_lower = last.error.lower()
+                if "does not exist" in error_lower or "column" in error_lower or "relation" in error_lower:
+                    category = "schema"
+                    root_cause = last.error
+                    recommended_actions.append({"action": "Check if source schema changed — a column may have been added or renamed", "priority": "critical", "automated": False})
+                elif "connector" in error_lower or "connection" in error_lower or "timeout" in error_lower:
                     category = "connector_issue"
-                    root_cause = f"Connection failure: {last.error}"
-                elif "upstream" in last.error.lower():
-                    category = "upstream_dependency"
-                    root_cause = f"Upstream dependency issue: {last.error}"
+                    root_cause = last.error
+                    recommended_actions.append({"action": "Test source connection and check credentials", "priority": "critical", "automated": False})
+                elif "permission" in error_lower or "auth" in error_lower or "denied" in error_lower:
+                    category = "configuration"
+                    root_cause = last.error
+                    recommended_actions.append({"action": "Check credentials and permissions", "priority": "critical", "automated": False})
                 else:
                     category = "data_issue"
                     root_cause = last.error
+                    recommended_actions.append({"action": "Review the error message and check source data", "priority": "high", "automated": False})
+            elif status == "halted" and last.error:
+                evidence.append(f"Last run halted: {last.error}")
+                category = "quality_regression"
+                root_cause = last.error
+                recommended_actions.append({"action": "Click 'Diagnose with Agent' on the halted run for a specific fix proposal", "priority": "critical", "automated": False})
             elif status == "halted":
                 evidence.append("Last run halted by quality gate")
                 category = "quality_regression"
-                root_cause = "Quality gate halted the last run — data quality check failed"
+                root_cause = "Quality gate halted — expand the run in Activity to see which checks failed"
+                recommended_actions.append({"action": "Click 'Diagnose with Agent' on the halted run for a specific fix proposal", "priority": "critical", "automated": False})
 
             # Count recent failures
             fail_count = sum(1 for r in runs if (r.status.value if hasattr(r.status, "value") else r.status) in ("failed", "halted"))
@@ -3292,8 +3320,6 @@ Respond with JSON:
         for u in upstream_info:
             if u["status"] != "active":
                 evidence.append(f"Upstream '{u['name']}' is {u['status']}")
-                category = "upstream_dependency"
-                root_cause = f"Upstream pipeline '{u['name']}' is {u['status']}"
             for r in u["recent_runs"]:
                 if r["status"] in ("failed", "halted"):
                     evidence.append(f"Upstream '{u['name']}' has recent {r['status']}")
@@ -3303,24 +3329,24 @@ Respond with JSON:
             conn_status = src_conn.status.value if hasattr(src_conn.status, "value") else src_conn.status
             if conn_status != "active":
                 evidence.append(f"Source connector '{src_conn.connector_name}' is {conn_status}")
-                category = "connector_issue"
-                root_cause = f"Source connector is {conn_status}"
 
-        # Check error budget
+        # Error budget is a SYMPTOM — append to evidence but never override root_cause
         if budget and budget.escalated:
-            evidence.append(f"Error budget exhausted: {budget.success_rate:.1%} success rate")
+            evidence.append(f"Error budget exhausted: {budget.success_rate:.1%} success rate ({budget.failed_runs}/{budget.total_runs} failed in {budget.window_days}d)")
+            recommended_actions.append({"action": "Reset error budget after fixing the root cause: POST /api/error-budgets/{id}/reset", "priority": "medium", "automated": True})
+
+        if not recommended_actions:
+            recommended_actions.append({"action": "Check pipeline logs and recent run errors", "priority": "high", "automated": False})
 
         return {
             "root_cause": root_cause,
             "category": category,
             "confidence": 0.5,
             "evidence": evidence or ["No specific evidence found — pipeline may be healthy"],
-            "recommended_actions": [
-                {"action": "Check pipeline logs and recent run errors", "priority": "high", "automated": False},
-            ],
+            "recommended_actions": recommended_actions,
             "upstream_health": "unknown",
             "pattern_detected": None,
-            "summary": f"Rule-based diagnosis for {p.pipeline_name}: {root_cause}",
+            "summary": f"{p.pipeline_name}: {root_cause}",
         }
 
     async def analyze_impact(self, pipeline_id: str) -> dict:

@@ -4151,6 +4151,30 @@ def create_app(
             ),
         }
 
+    @app.post("/api/error-budgets/{pipeline_id}/reset")
+    @limiter.limit("10/minute")
+    async def reset_error_budget(
+        request: Request,
+        pipeline_id: str,
+        caller: dict = Depends(require_role("operator")),
+    ):
+        """Reset error budget — clears escalation and resets counters."""
+        p = await store.get_pipeline(pipeline_id)
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        budget = await store.get_error_budget(pipeline_id)
+        if not budget:
+            return {"message": "No error budget to reset", "pipeline_id": pipeline_id}
+        budget.escalated = False
+        budget.success_rate = 1.0
+        budget.budget_remaining = 1.0 - budget.budget_threshold
+        budget.total_runs = 0
+        budget.successful_runs = 0
+        budget.failed_runs = 0
+        budget.last_calculated = now_iso()
+        await store.save_error_budget(budget)
+        return {"message": "Error budget reset", "pipeline_id": pipeline_id, "escalated": False}
+
     # -----------------------------------------------------------------------
     # Agent Costs
     # -----------------------------------------------------------------------
