@@ -4156,9 +4156,10 @@ def create_app(
     async def reset_error_budget(
         request: Request,
         pipeline_id: str,
-        caller: dict = Depends(require_role("operator")),
+        caller: dict = Depends(auth_dep),
     ):
         """Reset error budget — clears escalation and resets counters."""
+        require_role(caller, "admin", "operator")
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
