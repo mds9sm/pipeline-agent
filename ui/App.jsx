@@ -2200,7 +2200,20 @@ function ActivityRunDetail({ r, onNavigate }) {
                         e.stopPropagation();
                         setDiagnosing(true);
                         api("POST", `/api/pipelines/${r.pipeline_id}/diagnose`)
-                          .then((d) => setDiagnosis(d))
+                          .then((d) => {
+                            setDiagnosis(d);
+                            // Refresh proposals if one was created
+                            if (d.proposal_created) {
+                              api("GET", "/api/approvals?status=pending")
+                                .then((proposals) => {
+                                  const fix = (proposals || []).find(p =>
+                                    p.change_type === "quality_fix" && p.pipeline_id === r.pipeline_id
+                                  );
+                                  if (fix) setHaltProposal(fix);
+                                })
+                                .catch(() => {});
+                            }
+                          })
                           .catch((err) => setDiagnosis({ error: err.message }))
                           .finally(() => setDiagnosing(false));
                       }}
@@ -2297,7 +2310,19 @@ function ActivityRunDetail({ r, onNavigate }) {
                       e.stopPropagation();
                       setDiagnosing(true);
                       api("POST", `/api/pipelines/${r.pipeline_id}/diagnose`)
-                        .then((d) => setDiagnosis(d))
+                        .then((d) => {
+                          setDiagnosis(d);
+                          if (d.proposal_created) {
+                            api("GET", "/api/approvals?status=pending")
+                              .then((proposals) => {
+                                const fix = (proposals || []).find(p =>
+                                  p.change_type === "quality_fix" && p.pipeline_id === r.pipeline_id
+                                );
+                                if (fix) setHaltProposal(fix);
+                              })
+                              .catch(() => {});
+                          }
+                        })
                         .catch((err) => setDiagnosis({ error: err.message }))
                         .finally(() => setDiagnosing(false));
                     }}
@@ -2319,6 +2344,7 @@ function ActivityRunDetail({ r, onNavigate }) {
               {diagnosis.classification && (
                 <div className="flex items-center gap-2 mb-2">
                   <Pill label={diagnosis.classification} color={diagnosis.is_transient ? "amber" : "red"} />
+                  {diagnosis.fix_type && <Pill label={diagnosis.fix_type} color="blue" />}
                   {diagnosis.is_transient != null && <span className="text-xs text-slate-500">{diagnosis.is_transient ? "Transient — may auto-recover" : "Persistent — needs attention"}</span>}
                 </div>
               )}
@@ -2328,10 +2354,44 @@ function ActivityRunDetail({ r, onNavigate }) {
                   <div className="text-xs text-slate-600">{diagnosis.root_cause}</div>
                 </div>
               )}
+              {diagnosis.evidence && diagnosis.evidence.length > 0 && (
+                <div className="mb-2">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-0.5">Evidence</div>
+                  <div className="space-y-0.5">
+                    {diagnosis.evidence.map((e, i) => (
+                      <div key={i} className="text-xs text-slate-600 flex items-start gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-red-400 mt-1.5 flex-shrink-0" />
+                        <span>{e}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {diagnosis.fix_sql && diagnosis.fix_sql.length > 0 && (
+                <div className="mb-2">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-1">Proposed Fix SQL</div>
+                  <pre className="text-[11px] bg-white border border-indigo-100 rounded px-2 py-1.5 text-slate-700 overflow-x-auto">
+                    {diagnosis.fix_sql.join("\n")}
+                  </pre>
+                </div>
+              )}
+              {diagnosis.fix_config && Object.keys(diagnosis.fix_config).length > 0 && (
+                <div className="mb-2">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-1">Proposed Config Changes</div>
+                  <pre className="text-[11px] bg-white border border-indigo-100 rounded px-2 py-1.5 text-slate-700">
+                    {JSON.stringify(diagnosis.fix_config, null, 2)}
+                  </pre>
+                </div>
+              )}
               {diagnosis.recommended_action && (
                 <div className="mb-2">
                   <div className="text-[10px] text-slate-400 font-semibold mb-0.5">Recommended Action</div>
                   <div className="text-xs text-slate-600">{diagnosis.recommended_action}</div>
+                </div>
+              )}
+              {diagnosis.proposal_created && (
+                <div className="text-xs text-green-600 font-medium mt-1">
+                  Fix proposal created — check below to approve & re-run
                 </div>
               )}
               {diagnosis.reasoning && (

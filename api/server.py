@@ -4925,10 +4925,88 @@ def create_app(
         pipeline_id: str,
         caller: dict = Depends(auth_dep),
     ):
-        """Root-cause diagnosis for a pipeline."""
+        """Root-cause diagnosis for a pipeline. For halted runs, also proposes a fix."""
         p = await store.get_pipeline(pipeline_id)
         if not p:
             raise HTTPException(404, "Pipeline not found")
+
+        # Check if last run is halted — use halt-specific diagnosis with gate checks
+        runs = await store.list_runs(pipeline_id, limit=1)
+        last_run = runs[0] if runs else None
+        last_status = (last_run.status.value if last_run and hasattr(last_run.status, "value")
+                       else (last_run.status if last_run else ""))
+
+        if last_status == "halted" and last_run:
+            # Get the gate record for this run
+            gates = await store.get_quality_trend(pipeline_id, limit=5)
+            gate = next((g for g in gates if g.run_id == last_run.run_id), None)
+            if gate and gate.checks:
+                # Run halt-specific diagnosis
+                halt_diag = await agent.diagnose_halt(
+                    p, gate.checks, gate.agent_reasoning or "",
+                )
+
+                # Create a QUALITY_FIX proposal if fix available and none pending
+                proposal_created = False
+                if halt_diag.get("fix_sql") or halt_diag.get("fix_config"):
+                    existing = await store.list_proposals(status="pending")
+                    has_existing = any(
+                        prop.pipeline_id == pipeline_id
+                        and prop.change_type.value == "quality_fix"
+                        for prop in existing
+                    )
+                    if not has_existing:
+                        fix_sql = halt_diag.get("fix_sql", [])
+                        fix_config = halt_diag.get("fix_config", {})
+                        proposed = {}
+                        if fix_sql:
+                            proposed["sql"] = fix_sql
+                        if fix_config:
+                            proposed["quality_config"] = fix_config
+                        proposal = ContractChangeProposal(
+                            pipeline_id=pipeline_id,
+                            trigger_type=TriggerType.QUALITY_ALERT,
+                            change_type=ChangeType.QUALITY_FIX,
+                            current_state={
+                                "run_id": last_run.run_id,
+                                "gate_decision": gate.decision.value if hasattr(gate.decision, "value") else gate.decision,
+                                "failed_checks": [
+                                    {"name": c.check_name, "status": c.status.value, "detail": c.detail}
+                                    for c in gate.checks if c.status.value == "fail"
+                                ],
+                            },
+                            proposed_state=proposed,
+                            reasoning=halt_diag.get("recommended_action", "Agent-proposed fix for quality gate halt"),
+                            confidence=halt_diag.get("confidence", 0.5),
+                            impact_analysis={
+                                "category": halt_diag.get("category", "unknown"),
+                                "fix_type": halt_diag.get("fix_type", "manual"),
+                                "auto_fixable": halt_diag.get("auto_fixable", False),
+                            },
+                            rollback_plan="Revert ALTER TABLE changes or restore quality config" if fix_sql else "",
+                        )
+                        await store.save_proposal(proposal)
+                        proposal_created = True
+
+                # Return halt-specific result with richer detail
+                return {
+                    "root_cause": halt_diag.get("root_cause", "Quality gate halt"),
+                    "category": halt_diag.get("category", "quality_regression"),
+                    "classification": halt_diag.get("category", "quality_regression"),
+                    "confidence": halt_diag.get("confidence", 0.5),
+                    "is_transient": False,
+                    "fix_type": halt_diag.get("fix_type", "manual"),
+                    "fix_sql": halt_diag.get("fix_sql", []),
+                    "fix_config": halt_diag.get("fix_config", {}),
+                    "recommended_action": halt_diag.get("recommended_action", "Review failed quality checks"),
+                    "proposal_created": proposal_created,
+                    "evidence": [
+                        f"{c.check_name}: {c.status.value} — {c.detail}"
+                        for c in gate.checks if c.status.value in ("fail", "warn")
+                    ],
+                    "summary": f"Halt diagnosis for {p.pipeline_name}: {halt_diag.get('root_cause', 'unknown')}",
+                }
+
         result = await agent.diagnose_pipeline(pipeline_id)
         return result
 
