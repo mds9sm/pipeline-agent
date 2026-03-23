@@ -1615,6 +1615,137 @@ Persistent examples: schema mismatch, missing table, authentication failure, dis
                 "should_retry": False, "should_alert": True}
 
     # ------------------------------------------------------------------
+    # Agentic halt diagnosis (Build 35)
+    # ------------------------------------------------------------------
+
+    async def diagnose_halt(
+        self,
+        contract: PipelineContract,
+        checks: list[CheckResult],
+        gate_reasoning: str,
+    ) -> dict:
+        """Agent diagnoses why the quality gate halted a run and proposes a fix.
+
+        Returns dict with:
+            root_cause: what specifically failed
+            category: schema | volume | nulls | uniqueness | reconciliation | unknown
+            fix_type: alter_schema | adjust_quality_config | fix_source | manual
+            fix_sql: SQL statements to fix (if applicable, e.g. ALTER TABLE)
+            fix_config: config changes to fix (if applicable)
+            recommended_action: human-readable next step
+            should_alert: whether this needs human attention
+            confidence: 0.0-1.0 how confident the agent is in the fix
+        """
+        checks_summary = "\n".join(
+            f"- {c.check_name}: {c.status.value} — {c.detail}"
+            for c in checks
+        )
+        failed_checks = [c for c in checks if c.status.value == "fail"]
+        warned_checks = [c for c in checks if c.status.value == "warn"]
+
+        if not self.has_api:
+            return self._rule_based_halt_diagnosis(checks)
+
+        user_prompt = f"""Pipeline "{contract.pipeline_name}" was HALTED by the quality gate.
+
+Gate reasoning: {gate_reasoning}
+
+Quality check results:
+{checks_summary}
+
+Failed checks ({len(failed_checks)}):
+{chr(10).join(f"  - {c.check_name}: {c.detail}" for c in failed_checks) or "  (none)"}
+
+Warning checks ({len(warned_checks)}):
+{chr(10).join(f"  - {c.check_name}: {c.detail}" for c in warned_checks) or "  (none)"}
+
+Pipeline context:
+- Source: {contract.source_schema}.{contract.source_table} via connector {contract.source_connector_id[:8]}
+- Target: {contract.target_schema}.{contract.target_table} via connector {contract.target_connector_id[:8]}
+- Target schema: {contract.target_schema}
+- Refresh type: {contract.refresh_type.value if hasattr(contract.refresh_type, 'value') else contract.refresh_type}
+- Tier: {contract.tier}
+- Schema change policy: {getattr(contract, 'schema_change_policy', 'manual')}
+
+Diagnose this halt and propose a concrete fix.
+
+For schema mismatches (type mismatches like DECIMAL vs NUMERIC, missing columns):
+- Generate ALTER TABLE statements to fix the target table
+- Consider PostgreSQL type equivalencies (DECIMAL=NUMERIC, SERIAL=INTEGER, etc.)
+
+For volume/null/uniqueness issues:
+- Suggest quality config adjustments (thresholds) or source investigation
+
+Respond with JSON:
+{{
+  "root_cause": "specific diagnosis of what caused the halt",
+  "category": "schema|volume|nulls|uniqueness|reconciliation|unknown",
+  "fix_type": "alter_schema|adjust_quality_config|fix_source|manual",
+  "fix_sql": ["ALTER TABLE ...", ...] or [],
+  "fix_config": {{}},
+  "recommended_action": "human-readable description of the fix",
+  "should_alert": true/false,
+  "confidence": 0.0-1.0,
+  "auto_fixable": true/false
+}}
+"""
+        try:
+            text = await self._call_claude(
+                self._system_prompt(), user_prompt,
+                pipeline_id=contract.pipeline_id,
+                operation="diagnose_halt",
+                temperature=0.1,
+            )
+            return self._extract_json(text)
+        except Exception as e:
+            log.warning("diagnose_halt Claude error: %s", e)
+            return self._rule_based_halt_diagnosis(checks)
+
+    def _rule_based_halt_diagnosis(self, checks: list) -> dict:
+        """Fallback halt diagnosis when API is unavailable."""
+        failed = [c for c in checks if c.status.value == "fail"]
+        if not failed:
+            return {"root_cause": "Quality gate halted with warnings only",
+                    "category": "unknown", "fix_type": "manual",
+                    "fix_sql": [], "fix_config": {},
+                    "recommended_action": "Review warning checks and adjust thresholds if acceptable",
+                    "should_alert": True, "confidence": 0.3, "auto_fixable": False}
+
+        # Check for schema issues
+        schema_fails = [c for c in failed if "schema" in c.check_name.lower()]
+        if schema_fails:
+            detail = schema_fails[0].detail
+            return {"root_cause": f"Schema inconsistency: {detail}",
+                    "category": "schema", "fix_type": "alter_schema",
+                    "fix_sql": [], "fix_config": {},
+                    "recommended_action": "Review type mismatches and apply ALTER TABLE to align target schema",
+                    "should_alert": True, "confidence": 0.5, "auto_fixable": False}
+
+        # Volume issues
+        volume_fails = [c for c in failed if "volume" in c.check_name.lower() or "count" in c.check_name.lower()]
+        if volume_fails:
+            return {"root_cause": f"Volume anomaly: {volume_fails[0].detail}",
+                    "category": "volume", "fix_type": "adjust_quality_config",
+                    "fix_sql": [], "fix_config": {"volume_threshold": 3.0},
+                    "recommended_action": "Adjust volume z-score threshold or investigate source data",
+                    "should_alert": True, "confidence": 0.4, "auto_fixable": False}
+
+        # Null issues
+        null_fails = [c for c in failed if "null" in c.check_name.lower()]
+        if null_fails:
+            return {"root_cause": f"Null rate anomaly: {null_fails[0].detail}",
+                    "category": "nulls", "fix_type": "adjust_quality_config",
+                    "fix_sql": [], "fix_config": {},
+                    "recommended_action": "Investigate source data quality or adjust null thresholds",
+                    "should_alert": True, "confidence": 0.4, "auto_fixable": False}
+
+        return {"root_cause": failed[0].detail if failed else "Unknown quality issue",
+                "category": "unknown", "fix_type": "manual",
+                "fix_sql": [], "fix_config": {},
+                "recommended_action": "Investigate failed quality checks manually",
+                "should_alert": True, "confidence": 0.3, "auto_fixable": False}
+
+    # ------------------------------------------------------------------
     # Agentic run insights (Build 30)
     # ------------------------------------------------------------------
 

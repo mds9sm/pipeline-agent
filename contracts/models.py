@@ -103,6 +103,7 @@ class ChangeType(str, Enum):
     UPDATE_CONNECTOR = "update_connector"
     NEW_TRANSFORM = "new_transform"
     UPDATE_TRANSFORM = "update_transform"
+    QUALITY_FIX = "quality_fix"
 
 
 class MaterializationType(str, Enum):

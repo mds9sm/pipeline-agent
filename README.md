@@ -185,6 +185,8 @@ When a connector is regenerated or updated, a `ConnectorMigration` record is cre
 
 After the gate, Claude produces a natural language explanation of what happened and why, stored in `GateRecord.agent_reasoning`. The decision is one of: **PROMOTE**, **PROMOTE_WITH_WARNING**, or **HALT**.
 
+When a run is **HALTED**, the agent automatically diagnoses the root cause via `diagnose_halt()`, proposes a fix (ALTER TABLE SQL or quality config adjustment) as an approval proposal, and the user can one-click **"Approve Fix & Re-run"** from the Activity view.
+
 ---
 
 ## Error Budgets

@@ -95,6 +95,59 @@ The agent receives the error message, pipeline context, and recent run history, 
 
 ---
 
+## Halt Diagnosis
+
+**Agentic**: When the quality gate halts a run, the agent automatically diagnoses the halt via `diagnose_halt()` and proposes a concrete fix.
+
+### What the Agent Does
+
+The agent receives the failed quality checks, gate reasoning, and pipeline context, then:
+
+1. **Identifies root cause** — e.g., "DECIMAL(10,2) vs NUMERIC type mismatch on subtotal, tax, shipping, total columns"
+2. **Classifies the halt** — `schema`, `volume`, `nulls`, `uniqueness`, `reconciliation`, or `unknown`
+3. **Proposes a fix** — For schema issues: generates `ALTER TABLE` SQL. For config issues: suggests quality threshold adjustments
+4. **Creates an approval proposal** — `QUALITY_FIX` change type with the fix SQL/config in `proposed_state`
+5. **Enriches the run** — `run.error` includes root cause + recommended action. Execution log includes `agent_diagnosis` step.
+6. **Dispatches an alert** — With tier-based severity and the root cause as the narrative
+
+### Response Format
+```json
+{
+  "root_cause": "Type mismatches: subtotal, tax, shipping, total are DECIMAL(10,2) in source but NUMERIC in target. PostgreSQL treats these as equivalent but the schema check flags the name difference.",
+  "category": "schema",
+  "fix_type": "alter_schema",
+  "fix_sql": [
+    "ALTER TABLE public.demo_orders ALTER COLUMN subtotal TYPE DECIMAL(10,2)",
+    "ALTER TABLE public.demo_orders ALTER COLUMN tax TYPE DECIMAL(10,2)"
+  ],
+  "fix_config": {},
+  "recommended_action": "Apply ALTER TABLE to align target column types with source types",
+  "should_alert": true,
+  "confidence": 0.9,
+  "auto_fixable": true
+}
+```
+
+### UI Flow
+
+In the Activity view, halted runs show:
+1. The agent diagnosis inline (root cause, category)
+2. The proposed fix (SQL code block or config JSON)
+3. **"Approve Fix & Re-run"** button — one click to apply + trigger a new run
+4. **"View in Approvals"** link for detailed review
+
+### Rule-Based Fallback
+
+> **⚠️ RULE-BASED**: `_rule_based_halt_diagnosis()` classifies by check name:
+> - Schema check failures → `alter_schema` fix type, generic recommendation
+> - Volume/count failures → `adjust_quality_config` fix type
+> - Null failures → investigate source
+> - Default → `manual` fix type
+>
+> No fix SQL is generated in fallback mode.
+
+---
+
 ## Preflight Failure Reasoning
 
 **Agentic**: When preflight checks fail (missing connector, inactive pipeline, etc.), the agent calls `reason_about_preflight_failure()` to explain why and recommend action.

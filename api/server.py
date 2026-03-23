@@ -6513,6 +6513,37 @@ async def _apply_proposal(
                     m for m in pipeline.column_mappings if m.source_column != col_name
                 ]
 
+        elif proposal.change_type == ChangeType.QUALITY_FIX:
+            # Execute fix SQL from agent diagnosis (ALTER TABLE, etc.)
+            fix_sql = proposal.proposed_state.get("sql", [])
+            if fix_sql:
+                try:
+                    tgt_params = {
+                        "host": pipeline.target_host, "port": pipeline.target_port,
+                        "database": pipeline.target_database,
+                        "user": pipeline.target_user, "password": pipeline.target_password,
+                        "default_schema": pipeline.target_schema,
+                    }
+                    if config and config.has_encryption_key:
+                        tgt_params = decrypt_dict(tgt_params, config.encryption_key, CREDENTIAL_FIELDS)
+                    target = await registry.get_target(pipeline.target_connector_id, tgt_params)
+                    for stmt in fix_sql:
+                        await target.execute_sql(stmt)
+                    if hasattr(target, "close"):
+                        await target.close()
+                    log.info("Executed %d quality fix SQL statement(s) for proposal %s",
+                             len(fix_sql), proposal.proposal_id[:8])
+                except Exception as e:
+                    log.error("Failed to execute quality fix SQL for proposal %s: %s",
+                              proposal.proposal_id[:8], e)
+
+            # Apply quality config changes if any
+            fix_config = proposal.proposed_state.get("quality_config", {})
+            if fix_config:
+                existing_qc = pipeline.quality_config or {}
+                existing_qc.update(fix_config)
+                pipeline.quality_config = existing_qc
+
         pipeline.version += 1
         proposal.contract_version_after = pipeline.version
         await store.save_pipeline(pipeline)

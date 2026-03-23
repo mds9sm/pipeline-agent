@@ -97,6 +97,7 @@ These methods use Claude to reason about signals in context. Each has a `_rule_b
 |-----------|--------------|----------|
 | `decide_quality_gate()` | Evaluates 7 check signals with pipeline context → PROMOTE/HALT decision with reasoning | `_fallback_decision()` — threshold-based |
 | `diagnose_run_failure()` | Classifies failures (connector/source/target/network/schema/config/resource), determines transience | `_rule_based_failure_diagnosis()` — keyword matching |
+| `diagnose_halt()` | Diagnoses quality gate halts, proposes fix SQL/config, creates approval proposal | `_rule_based_halt_diagnosis()` — check-type matching |
 | `diagnose_error_budget()` | Analyzes failure pattern (transient/persistent/degrading), recommends recovery | `_rule_based_budget_diagnosis()` — keyword matching |
 | `reason_about_freshness()` | Evaluates SLA realism, determines severity, decides whether to alert | `_rule_based_freshness()` — tier-based thresholds |
 | `evaluate_anomaly_signals()` | Per-pipeline contextual anomaly evaluation with cross-pipeline patterns | `_rule_based_anomaly_evaluation()` — fixed thresholds |
@@ -140,6 +141,7 @@ When the Claude API key is not configured or the API is unavailable, every agent
 |----------------|-----------------|-------------------|
 | `decide_quality_gate()` | `_fallback_decision()` | Any FAIL → HALT; WARN + promote_on_warn → PROMOTE_WITH_WARNING |
 | `diagnose_run_failure()` | `_rule_based_failure_diagnosis()` | Keyword matching (timeout → transient, auth → persistent) |
+| `diagnose_halt()` | `_rule_based_halt_diagnosis()` | Check-type matching (schema → alter_schema, volume → adjust_config) |
 | `diagnose_error_budget()` | `_rule_based_budget_diagnosis()` | Keyword matching for pattern classification |
 | `reason_about_freshness()` | `_rule_based_freshness()` | Tier-based static thresholds (15m/2h/24h warn) |
 | `evaluate_anomaly_signals()` | `_rule_based_anomaly_evaluation()` | Fixed thresholds (30% volume, 2+ failures, 5% budget) |

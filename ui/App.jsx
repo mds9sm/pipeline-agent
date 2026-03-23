@@ -2080,6 +2080,22 @@ function ActivityRunDetail({ r, onNavigate }) {
   const [expanded, setExpanded] = useState(false);
   const [diagnosis, setDiagnosis] = useState(null);
   const [diagnosing, setDiagnosing] = useState(false);
+  const [haltProposal, setHaltProposal] = useState(null);
+  const [applyingFix, setApplyingFix] = useState(false);
+
+  // Auto-fetch pending quality_fix proposals for halted runs
+  useEffect(() => {
+    if (r.status === "halted" && expanded) {
+      api("GET", "/api/approvals?status=pending")
+        .then((proposals) => {
+          const fix = (proposals || []).find(p =>
+            p.change_type === "quality_fix" && p.pipeline_id === r.pipeline_id
+          );
+          if (fix) setHaltProposal(fix);
+        })
+        .catch(() => {});
+    }
+  }, [r.status, r.pipeline_id, expanded]);
   const duration = r.started_at && r.completed_at
     ? Math.round((new Date(r.completed_at) - new Date(r.started_at)) / 1000)
     : null;
@@ -2329,6 +2345,68 @@ function ActivityRunDetail({ r, onNavigate }) {
           {diagnosis && diagnosis.error && (
             <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-700">
               Diagnosis failed: {diagnosis.error}
+            </div>
+          )}
+
+          {/* Halt fix proposal */}
+          {haltProposal && (
+            <div className="bg-green-50 border border-green-200 rounded-lg px-3 py-2">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-[10px] uppercase text-green-600 font-semibold">Agent Proposed Fix</div>
+                <Pill label={haltProposal.impact_analysis?.fix_type || "fix"} color="green" />
+              </div>
+              <div className="text-xs text-slate-600 mb-2">{haltProposal.reasoning}</div>
+              {haltProposal.proposed_state?.sql && haltProposal.proposed_state.sql.length > 0 && (
+                <div className="mb-2">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-1">Fix SQL</div>
+                  <pre className="text-[11px] bg-white border border-green-100 rounded px-2 py-1.5 text-slate-700 overflow-x-auto">
+                    {haltProposal.proposed_state.sql.join("\n")}
+                  </pre>
+                </div>
+              )}
+              {haltProposal.proposed_state?.quality_config && Object.keys(haltProposal.proposed_state.quality_config).length > 0 && (
+                <div className="mb-2">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-1">Config Changes</div>
+                  <pre className="text-[11px] bg-white border border-green-100 rounded px-2 py-1.5 text-slate-700">
+                    {JSON.stringify(haltProposal.proposed_state.quality_config, null, 2)}
+                  </pre>
+                </div>
+              )}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setApplyingFix(true);
+                    api("POST", `/api/approvals/${haltProposal.proposal_id}`, { action: "approve", note: "Approved halt fix from activity view" })
+                      .then(() => {
+                        setHaltProposal(null);
+                        // Re-run after applying fix
+                        return api("POST", `/api/pipelines/${r.pipeline_id}/trigger`);
+                      })
+                      .then(() => {
+                        setTimeout(() => window.dispatchEvent(new CustomEvent("dapos-activity-refresh")), 1000);
+                      })
+                      .catch((err) => alert("Error: " + err.message))
+                      .finally(() => setApplyingFix(false));
+                  }}
+                  disabled={applyingFix}
+                  className="text-xs px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium disabled:opacity-50"
+                >
+                  {applyingFix ? "Applying..." : "Approve Fix & Re-run"}
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (onNavigate) onNavigate("approvals");
+                  }}
+                  className="text-xs px-2.5 py-1 text-slate-500 hover:text-slate-700 font-medium"
+                >
+                  View in Approvals
+                </button>
+                <span className="text-[10px] text-slate-400 ml-auto">
+                  Confidence: {Math.round((haltProposal.confidence || 0) * 100)}%
+                </span>
+              </div>
             </div>
           )}
 

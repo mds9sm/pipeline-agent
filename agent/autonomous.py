@@ -580,11 +580,108 @@ class PipelineRunner:
         gate: GateRecord,
         target,
     ) -> RunRecord:
-        """Mark run as HALTED and preserve staging for investigation."""
-        log.warning("Quality gate HALT. Preserving staging.")
+        """Agentic halt handling: diagnose, propose fix, create alert, generate insights."""
+        log.warning("Quality gate HALT. Diagnosing with agent...")
         run.status = RunStatus.HALTED
         run.completed_at = now_iso()
+
+        # --- Agent diagnoses the halt and proposes a fix ---
+        diagnosis = {}
+        if self.agent:
+            try:
+                diagnosis = await self.agent.diagnose_halt(
+                    contract,
+                    gate.checks,
+                    gate.agent_reasoning or "",
+                )
+                diag_detail = (
+                    f"Category: {diagnosis.get('category', 'unknown')}. "
+                    f"{diagnosis.get('root_cause', '')} "
+                    f"Fix: {diagnosis.get('recommended_action', '')}"
+                )
+                self._log_step(run, "agent_diagnosis", diag_detail)
+
+                # Enrich run error with agent diagnosis
+                run.error = (
+                    f"Quality gate HALT — {diagnosis.get('root_cause', 'unknown')} "
+                    f"[{diagnosis.get('category', 'unknown')}] "
+                    f"→ {diagnosis.get('recommended_action', '')}"
+                )
+            except Exception as diag_err:
+                log.warning("Agent halt diagnosis error: %s", diag_err)
+                run.error = "Quality gate HALT — review failed checks"
+
+        if not diagnosis:
+            run.error = "Quality gate HALT — review failed checks"
+
+        # --- Create approval proposal with the fix ---
+        if diagnosis.get("fix_sql") or diagnosis.get("fix_config"):
+            try:
+                fix_sql = diagnosis.get("fix_sql", [])
+                fix_config = diagnosis.get("fix_config", {})
+                proposed = {}
+                if fix_sql:
+                    proposed["sql"] = fix_sql
+                if fix_config:
+                    proposed["quality_config"] = fix_config
+
+                proposal = ContractChangeProposal(
+                    pipeline_id=contract.pipeline_id,
+                    trigger_type=TriggerType.QUALITY_ALERT,
+                    change_type=ChangeType.QUALITY_FIX,
+                    current_state={
+                        "run_id": run.run_id,
+                        "gate_decision": gate.decision.value,
+                        "failed_checks": [
+                            {"name": c.check_name, "status": c.status.value, "detail": c.detail}
+                            for c in gate.checks if c.status.value == "fail"
+                        ],
+                    },
+                    proposed_state=proposed,
+                    reasoning=diagnosis.get("recommended_action", "Agent-proposed fix for quality gate halt"),
+                    confidence=diagnosis.get("confidence", 0.5),
+                    impact_analysis={
+                        "category": diagnosis.get("category", "unknown"),
+                        "fix_type": diagnosis.get("fix_type", "manual"),
+                        "auto_fixable": diagnosis.get("auto_fixable", False),
+                    },
+                    rollback_plan="Revert ALTER TABLE changes or restore quality config" if fix_sql else "",
+                )
+                await self.store.save_proposal(proposal)
+                self._log_step(run, "proposal_created",
+                               f"Fix proposal {proposal.proposal_id[:8]} created for approval")
+                log.info("Created halt fix proposal %s for pipeline %s",
+                         proposal.proposal_id[:8], contract.pipeline_id[:8])
+            except Exception as prop_err:
+                log.warning("Failed to create halt fix proposal: %s", prop_err)
+
+        # --- Generate insights ---
+        await self._generate_insights(contract, run)
+
         await self.store.save_run(run)
+
+        # --- Create alert ---
+        if diagnosis.get("should_alert", True):
+            try:
+                alert = AlertRecord(
+                    severity=AlertSeverity.CRITICAL if contract.tier == 1 else AlertSeverity.WARNING,
+                    tier=contract.tier,
+                    pipeline_id=contract.pipeline_id,
+                    pipeline_name=contract.pipeline_name,
+                    summary=f"Quality gate HALT: {diagnosis.get('root_cause', 'check failures')[:100]}",
+                    detail={
+                        "gate_decision": gate.decision.value,
+                        "category": diagnosis.get("category", "unknown"),
+                        "fix_type": diagnosis.get("fix_type", "manual"),
+                        "recommended_action": diagnosis.get("recommended_action", ""),
+                        "failed_checks": [c.check_name for c in gate.checks if c.status.value == "fail"],
+                    },
+                    narrative=diagnosis.get("root_cause", ""),
+                )
+                await self.store.save_alert(alert)
+            except Exception:
+                pass
+
         # Staging table preserved for investigation -- DO NOT drop
         return run
 

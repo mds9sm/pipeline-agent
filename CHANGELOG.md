@@ -30,17 +30,42 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 32 | Business context, agent knowledge & metrics reasoning | **Done** | Business knowledge, glossary, KPI definitions feed into agent reasoning |
 | 33 | UI redesign, branding & platform usage | **Done** | Dark sidebar, SVG icons, tier labels, custom branding, GitHub-style usage dashboard |
 | 34 | Airflow migration — context, custom steps, Jinja, YAML parsing | **Done** | Additional context uploads, Python/Bash→custom steps, Jinja conversion, YAML template DAGs, auto-create on execute |
-| 35 | Pipeline versioning + rollback | Planned | GitOps one-click revert to any prior config, version history UI, diff view, restore with validation |
-| 36 | Webhooks (inbound + outbound) | Planned | Outbound event delivery (run complete, halt, drift) with retry + signatures. Inbound webhook triggers (e.g., Stripe event → trigger sync) |
-| 37 | Freshness SLA dashboards | Planned | Visual SLA burn-down per contract, historical compliance, breach forecasting, per-consumer freshness view |
-| 38 | Multi-worker + resource pools | Planned | Distribute runs across processes/containers + per-source concurrency limits (e.g., max 2 against prod MySQL) |
-| 39 | CDC + streaming ingestion | Planned | Debezium/binlog/WAL capture, micro-batch staging, continuous quality gate, streaming-aware scheduling |
-| 40 | PII detection + column masking | Planned | Agent auto-detects PII via semantic tags (email, SSN, phone), recommends hash/mask at ingest. GDPR/CCPA compliance |
-| 41 | SCD Type 2 + soft deletes | Planned | First-class load strategies: `scd2` (_valid_from/_valid_to columns) and `soft_delete` (_deleted_at). Agent recommends based on table shape |
+| 35 | Agentic halt handling | **Done** | Agent diagnoses quality gate halts, proposes fixes as approval proposals, one-click approve & re-run |
+| 36 | Pipeline versioning + rollback | Planned | GitOps one-click revert to any prior config, version history UI, diff view, restore with validation |
+| 37 | Webhooks (inbound + outbound) | Planned | Outbound event delivery (run complete, halt, drift) with retry + signatures. Inbound webhook triggers (e.g., Stripe event → trigger sync) |
+| 38 | Freshness SLA dashboards | Planned | Visual SLA burn-down per contract, historical compliance, breach forecasting, per-consumer freshness view |
+| 39 | Multi-worker + resource pools | Planned | Distribute runs across processes/containers + per-source concurrency limits (e.g., max 2 against prod MySQL) |
+| 40 | CDC + streaming ingestion | Planned | Debezium/binlog/WAL capture, micro-batch staging, continuous quality gate, streaming-aware scheduling |
+| 41 | PII detection + column masking | Planned | Agent auto-detects PII via semantic tags (email, SSN, phone), recommends hash/mask at ingest. GDPR/CCPA compliance |
+| 42 | SCD Type 2 + soft deletes | Planned | First-class load strategies: `scd2` (_valid_from/_valid_to columns) and `soft_delete` (_deleted_at). Agent recommends based on table shape |
 
 ---
 
 ## [Unreleased]
+
+### Build 35: Agentic Halt Handling — Diagnose, Propose, Approve & Re-run — 2026-03-22 (Claude Opus 4.6)
+
+**Quality gate halts are now fully agentic. When a run is halted, the agent diagnoses the root cause, proposes a concrete fix (SQL or config change) as an approval proposal, and the user can one-click approve the fix and re-run — all from the activity view.**
+
+#### Added
+- **`diagnose_halt()` agent method** — New agentic decision method in `agent/core.py`. Receives failed quality checks + pipeline context, returns structured diagnosis: root cause, category (schema/volume/nulls/uniqueness/reconciliation), fix type, fix SQL (e.g., ALTER TABLE for type mismatches), config changes, confidence score, and auto-fixability assessment.
+- **`_rule_based_halt_diagnosis()` fallback** — Rule-based fallback when API key is unavailable. Classifies by check type (schema → alter_schema, volume → adjust_quality_config, null → investigate source).
+- **`QUALITY_FIX` change type** — New enum value in `ChangeType` for quality gate fix proposals, distinguishing them from schema drift proposals.
+- **Agentic halt flow in `_handle_halt()`** — Expanded from 4 lines to full agentic handling: agent diagnosis → enriched run error → approval proposal creation → insight generation → alert dispatch. Mirrors the existing failure handling path but adds the proposal step since halts are recoverable.
+- **`QUALITY_FIX` proposal application** — `_apply_proposal()` in `api/server.py` now handles `QUALITY_FIX` proposals: executes agent-generated fix SQL on the target database and applies quality config changes.
+- **Halt fix proposal UI** — Activity run detail auto-fetches pending `quality_fix` proposals for halted runs. Shows proposed fix inline: SQL statements in a code block, config changes as JSON, confidence score, fix type badge.
+- **"Approve Fix & Re-run" button** — One-click action in activity view: approves the halt fix proposal, applies the fix (SQL/config), and triggers a new pipeline run. Activity auto-refreshes to show the new run.
+- **"View in Approvals" link** — Navigate from the inline halt fix to the full approvals view for detailed review.
+
+#### Changed
+- `_handle_halt()` in `agent/autonomous.py` is now fully agentic (was 4 lines of status-setting). Now: diagnoses with agent, enriches run.error with root cause + recommended action, creates approval proposal with fix SQL/config, generates insights, creates alerts with tier-based severity.
+- Halt runs now produce execution log entries: `agent_diagnosis` step with root cause detail, `proposal_created` step when a fix proposal is generated.
+- Halted runs now have enriched `run.error` with the format: `Quality gate HALT — {root_cause} [{category}] → {recommended_action}`
+
+#### Tests
+- No new test script entries (halt handling is runtime behavior triggered by quality gate decisions)
+
+---
 
 ### Build 34: Airflow Migration — Additional Context, Custom Steps, Jinja Conversion — 2026-03-22 (Claude Opus 4.6)
 

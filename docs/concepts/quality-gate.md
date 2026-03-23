@@ -143,6 +143,32 @@ The gate record includes `agent_reasoning` — a natural language explanation of
 
 ---
 
+## Agentic Halt Handling
+
+When the quality gate **halts** a run, the agent doesn't just stop — it diagnoses the problem and proposes a fix:
+
+1. **Agent diagnoses** — `diagnose_halt()` analyzes the failed checks, pipeline context, and gate reasoning to identify the root cause (schema mismatch, volume anomaly, null spike, etc.)
+2. **Proposes a fix** — For schema issues: generates `ALTER TABLE` SQL. For threshold issues: suggests quality config adjustments. The fix is stored as a `QUALITY_FIX` approval proposal.
+3. **Enriches the run** — `run.error` is enriched with the diagnosis (root cause, category, recommended action), execution log includes `agent_diagnosis` and `proposal_created` steps
+4. **Creates an alert** — Tier-based severity (CRITICAL for Tier 1, WARNING otherwise)
+5. **User approves** — The fix appears inline in the Activity view with an **"Approve Fix & Re-run"** button. One click applies the SQL/config fix and triggers a new run.
+
+### Halt Diagnosis Categories
+
+| Category | Fix Type | Example |
+|----------|----------|---------|
+| `schema` | `alter_schema` — ALTER TABLE SQL | DECIMAL vs NUMERIC type mismatch |
+| `volume` | `adjust_quality_config` — threshold change | Z-score threshold too strict for seasonal data |
+| `nulls` | `adjust_quality_config` or `fix_source` | Null rate spike on non-critical column |
+| `uniqueness` | `fix_source` or `manual` | Duplicate merge keys from source |
+| `reconciliation` | `fix_source` or `manual` | Row count mismatch between extract and staging |
+
+### Rule-Based Halt Fallback
+
+> **⚠️ RULE-BASED**: `_rule_based_halt_diagnosis()` classifies by check type (schema fails → suggest ALTER TABLE, volume fails → suggest threshold adjustment). No fix SQL is generated — only generic recommendations.
+
+---
+
 ## Rule-Based Fallback
 
 > **⚠️ RULE-BASED**: When the Claude API key is unavailable, the quality gate falls back to `_fallback_decision()` — a static threshold-based decision engine. This is explicitly marked as non-agentic behavior.
