@@ -3168,10 +3168,10 @@ Respond naturally. Guide toward the next step or propose the final pipeline if r
         if not self.has_api:
             return self._rule_based_diagnosis(p, runs, gates, budget, upstream_info, src_conn)
 
-        # Format context for Claude
+        # Format context for Claude — clean enriched error strings
         runs_text = "\n".join(
             f"  {r.started_at}: {r.status.value if hasattr(r.status, 'value') else r.status}"
-            f" | rows={r.rows_extracted} | error={r.error or 'none'}"
+            f" | rows={r.rows_extracted} | error={self._clean_error(r.error or '') or 'none'}"
             for r in runs
         ) or "  No recent runs"
 
@@ -3205,13 +3205,20 @@ Respond naturally. Guide toward the next step or propose the final pipeline if r
             for v in volume[:10]
         ) or "  No volume history"
 
-        # Pull out last run error prominently
+        # Pull out last run error prominently — strip agent enrichment suffix
         last_error = ""
         last_status = ""
         if runs:
             last = runs[0]
             last_status = last.status.value if hasattr(last.status, "value") else last.status
-            last_error = last.error or ""
+            raw_err = last.error or ""
+            # Strip "| Agent: ..." enrichment added by _handle_halt
+            if " | Agent: " in raw_err:
+                raw_err = raw_err.split(" | Agent: ")[0].strip()
+            # Strip "Quality gate HALT — " prefix
+            if raw_err.startswith("Quality gate HALT"):
+                raw_err = raw_err.split("→")[-1].strip() if "→" in raw_err else raw_err
+            last_error = raw_err
 
         user_prompt = f"""Diagnose this pipeline and identify the root cause of its issues.
 
@@ -3244,14 +3251,16 @@ Recent alerts:
 Volume history:
 {volume_text}
 
+Provide a USEFUL diagnosis — don't just repeat the error message back. Explain WHY it happened and give concrete fix steps (including SQL if applicable, e.g. ALTER TABLE to add missing columns).
+
 Respond with JSON:
 {{
-  "root_cause": "concise description of the primary issue",
-  "category": "source_issue|connector_issue|upstream_dependency|quality_regression|scheduling|configuration|data_issue|unknown",
+  "root_cause": "explain the underlying cause — NOT just the error text",
+  "category": "source_issue|connector_issue|upstream_dependency|quality_regression|scheduling|configuration|schema|data_issue|unknown",
   "confidence": 0.0-1.0,
   "evidence": ["list of specific evidence points"],
   "recommended_actions": [
-    {{"action": "description", "priority": "critical|high|medium|low", "automated": true/false}}
+    {{"action": "concrete step with SQL/command if applicable", "priority": "critical|high|medium|low", "automated": true/false}}
   ],
   "upstream_health": "healthy|degraded|failing",
   "pattern_detected": "description of any recurring pattern or null",
@@ -3270,8 +3279,22 @@ Respond with JSON:
             log.warning("diagnose_pipeline Claude error: %s. Using rule-based fallback.", e)
             return self._rule_based_diagnosis(p, runs, gates, budget, upstream_info, src_conn)
 
+    @staticmethod
+    def _clean_error(error: str) -> str:
+        """Strip agent enrichment from run error strings."""
+        if not error:
+            return error
+        # Strip "| Agent: ..." enrichment added by _handle_halt
+        if " | Agent: " in error:
+            error = error.split(" | Agent: ")[0].strip()
+        # Strip "Quality gate HALT — " prefix
+        if error.startswith("Quality gate HALT"):
+            error = error.split("→")[-1].strip() if "→" in error else error
+        return error
+
     def _rule_based_diagnosis(self, p, runs, gates, budget, upstream_info, src_conn) -> dict:
         """Simple heuristic diagnosis when no API key is available."""
+        import re
         evidence = []
         category = "unknown"
         root_cause = "Unable to determine root cause without more data"
@@ -3281,30 +3304,42 @@ Respond with JSON:
         if runs:
             last = runs[0]
             status = last.status.value if hasattr(last.status, "value") else last.status
-            if status == "failed" and last.error:
-                evidence.append(f"Last run failed: {last.error}")
-                error_lower = last.error.lower()
-                if "does not exist" in error_lower or "column" in error_lower or "relation" in error_lower:
+            raw_error = self._clean_error(last.error or "")
+            if status in ("failed", "halted") and raw_error:
+                evidence.append(f"Last run {status}: {raw_error}")
+                error_lower = raw_error.lower()
+
+                # Schema mismatch — column/relation doesn't exist
+                if "does not exist" in error_lower or ("column" in error_lower and "relation" in error_lower):
                     category = "schema"
-                    root_cause = last.error
-                    recommended_actions.append({"action": "Check if source schema changed — a column may have been added or renamed", "priority": "critical", "automated": False})
+                    # Extract column and table names for actionable diagnosis
+                    col_match = re.search(r'column\s+"([^"]+)"', raw_error)
+                    rel_match = re.search(r'relation\s+"([^"]+)"', raw_error)
+                    col_name = col_match.group(1) if col_match else "unknown"
+                    rel_name = rel_match.group(1) if rel_match else "unknown"
+                    root_cause = (
+                        f"Schema mismatch: the source extracts a column '{col_name}' "
+                        f"that doesn't exist in the target staging table '{rel_name}'. "
+                        f"The source schema likely changed (new column added) since the "
+                        f"target table was first created."
+                    )
+                    recommended_actions.extend([
+                        {"action": f"ALTER TABLE {rel_name} ADD COLUMN \"{col_name}\" TEXT — adds the missing column to the target", "priority": "critical", "automated": True},
+                        {"action": f"DROP TABLE IF EXISTS {rel_name} — forces full re-creation on next run (loses staging data)", "priority": "high", "automated": True},
+                        {"action": "Check if the source connector's column list has changed and regenerate if needed", "priority": "medium", "automated": False},
+                    ])
                 elif "connector" in error_lower or "connection" in error_lower or "timeout" in error_lower:
                     category = "connector_issue"
-                    root_cause = last.error
-                    recommended_actions.append({"action": "Test source connection and check credentials", "priority": "critical", "automated": False})
+                    root_cause = f"Connection failure: {raw_error}"
+                    recommended_actions.append({"action": "Test source connection and verify credentials are valid", "priority": "critical", "automated": False})
                 elif "permission" in error_lower or "auth" in error_lower or "denied" in error_lower:
                     category = "configuration"
-                    root_cause = last.error
-                    recommended_actions.append({"action": "Check credentials and permissions", "priority": "critical", "automated": False})
+                    root_cause = f"Authentication/permission error: {raw_error}"
+                    recommended_actions.append({"action": "Verify credentials and database permissions for the target user", "priority": "critical", "automated": False})
                 else:
                     category = "data_issue"
-                    root_cause = last.error
-                    recommended_actions.append({"action": "Review the error message and check source data", "priority": "high", "automated": False})
-            elif status == "halted" and last.error:
-                evidence.append(f"Last run halted: {last.error}")
-                category = "quality_regression"
-                root_cause = last.error
-                recommended_actions.append({"action": "Click 'Diagnose with Agent' on the halted run for a specific fix proposal", "priority": "critical", "automated": False})
+                    root_cause = raw_error
+                    recommended_actions.append({"action": "Review the error details and check source data integrity", "priority": "high", "automated": False})
             elif status == "halted":
                 evidence.append("Last run halted by quality gate")
                 category = "quality_regression"

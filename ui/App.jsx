@@ -2339,10 +2339,11 @@ function ActivityRunDetail({ r, onNavigate }) {
           {diagnosis && !diagnosis.error && (
             <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
               <div className="text-[10px] uppercase text-indigo-400 font-semibold mb-2">Agent Diagnosis</div>
-              {diagnosis.classification && (
+              {(diagnosis.classification || diagnosis.category) && (
                 <div className="flex items-center gap-2 mb-2">
-                  <Pill label={diagnosis.classification} color={diagnosis.is_transient ? "amber" : "red"} />
+                  <Pill label={diagnosis.classification || diagnosis.category} color={diagnosis.is_transient ? "amber" : "red"} />
                   {diagnosis.fix_type && <Pill label={diagnosis.fix_type} color="blue" />}
+                  {diagnosis.confidence != null && <span className="text-xs text-slate-500">confidence: {Math.round(diagnosis.confidence * 100)}%</span>}
                   {diagnosis.is_transient != null && <span className="text-xs text-slate-500">{diagnosis.is_transient ? "Transient — may auto-recover" : "Persistent — needs attention"}</span>}
                 </div>
               )}
@@ -2385,6 +2386,19 @@ function ActivityRunDetail({ r, onNavigate }) {
                 <div className="mb-2">
                   <div className="text-[10px] text-slate-400 font-semibold mb-0.5">Recommended Action</div>
                   <div className="text-xs text-slate-600">{diagnosis.recommended_action}</div>
+                </div>
+              )}
+              {diagnosis.recommended_actions && diagnosis.recommended_actions.length > 0 && (
+                <div className="mb-2">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-0.5">Recommended Actions</div>
+                  <div className="space-y-1">
+                    {diagnosis.recommended_actions.map((a, i) => (
+                      <div key={i} className="text-xs flex items-start gap-1.5">
+                        <span className={`mt-0.5 px-1 rounded text-[9px] font-semibold ${a.priority === 'critical' ? 'bg-red-100 text-red-700' : a.priority === 'high' ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'}`}>{a.priority}</span>
+                        <span className="text-slate-600">{a.action}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
               {diagnosis.proposal_created && (
