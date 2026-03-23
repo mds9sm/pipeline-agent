@@ -277,6 +277,11 @@ class QualityGate:
                 "BOOL": "BOOLEAN",
                 "TIMESTAMPTZ": "TIMESTAMP WITH TIME ZONE",
                 "TIMESTAMP WITHOUT TIME ZONE": "TIMESTAMP",
+                "DECIMAL": "NUMERIC",
+                "DEC": "NUMERIC",
+                "SERIAL": "INTEGER",
+                "BIGSERIAL": "BIGINT",
+                "SMALLSERIAL": "SMALLINT",
             }
 
             def _normalize_type(t: str) -> str:

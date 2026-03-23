@@ -1131,7 +1131,7 @@ function CommandView() {
 // ---------------------------------------------------------------------------
 
 
-function PipelinesView({ tierFilter, searchQuery }) {
+function PipelinesView({ tierFilter, searchQuery, focusPipelineId, onFocusClear }) {
   const [pipelines, setPipelines] = useState([]);
   const [expanded, setExpanded] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -1143,8 +1143,20 @@ function PipelinesView({ tierFilter, searchQuery }) {
 
   useEffect(() => {
     const tierParam = tierFilter !== "All" ? `&tier=${tierFilter[1]}` : "";
-    api("GET", `/api/pipelines?${tierParam}`).then(setPipelines).catch(console.error);
-  }, [tierFilter]);
+    api("GET", `/api/pipelines?${tierParam}`).then((data) => {
+      setPipelines(data);
+      // Auto-expand focused pipeline from navigation
+      if (focusPipelineId) {
+        const target = data.find((p) => p.pipeline_id === focusPipelineId);
+        if (target) {
+          setExpanded(focusPipelineId);
+          api("GET", `/api/pipelines/${focusPipelineId}`).then(setDetail).catch(() => {});
+          api("GET", `/api/pipelines/${focusPipelineId}/runs?limit=10`).then(setRuns).catch(() => setRuns([]));
+        }
+        if (onFocusClear) onFocusClear();
+      }
+    }).catch(console.error);
+  }, [tierFilter, focusPipelineId]);
 
   const filteredPipelines = searchQuery
     ? pipelines.filter((p) => p.pipeline_name?.toLowerCase().includes(searchQuery))
@@ -2162,13 +2174,31 @@ function ActivityRunDetail({ r, onNavigate }) {
 
           {/* Quality gate checks */}
           {checks.length > 0 && (
-            <div className="bg-white border border-slate-200 rounded-lg px-3 py-2">
+            <div className={`border rounded-lg px-3 py-2 ${r.gate_decision === "halt" ? "bg-red-50/50 border-red-200" : "bg-white border-slate-200"}`}>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-[10px] uppercase text-slate-400 font-semibold">Quality Gate</span>
-                <Pill
-                  label={r.quality_results.decision || r.gate_decision || "unknown"}
-                  color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
-                />
+                <div className="flex items-center gap-2">
+                  {r.gate_decision === "halt" && !diagnosis && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDiagnosing(true);
+                        api("POST", `/api/pipelines/${r.pipeline_id}/diagnose`)
+                          .then((d) => setDiagnosis(d))
+                          .catch((err) => setDiagnosis({ error: err.message }))
+                          .finally(() => setDiagnosing(false));
+                      }}
+                      disabled={diagnosing}
+                      className="text-xs px-2.5 py-1 bg-red-100 text-red-700 border border-red-200 rounded-lg hover:bg-red-200 font-medium disabled:opacity-50"
+                    >
+                      {diagnosing ? "Diagnosing..." : "Diagnose with Agent"}
+                    </button>
+                  )}
+                  <Pill
+                    label={r.quality_results.decision || r.gate_decision || "unknown"}
+                    color={r.gate_decision === "halt" ? "red" : r.gate_decision === "promote_with_warning" ? "amber" : "green"}
+                  />
+                </div>
               </div>
               <div className="space-y-1">
                 {checks.map((c, i) => (
@@ -2182,6 +2212,13 @@ function ActivityRunDetail({ r, onNavigate }) {
                   </div>
                 ))}
               </div>
+              {/* Quality gate reasoning from agent */}
+              {r.quality_results?.reasoning && (
+                <div className="mt-2 pt-2 border-t border-slate-100">
+                  <div className="text-[10px] uppercase text-slate-400 font-semibold mb-1">Agent Reasoning</div>
+                  <div className="text-xs text-slate-600 whitespace-pre-wrap">{r.quality_results.reasoning}</div>
+                </div>
+              )}
             </div>
           )}
 
@@ -2300,18 +2337,21 @@ function ActivityRunDetail({ r, onNavigate }) {
             <div className="flex items-center gap-2">
               {onNavigate && (
                 <button
-                  onClick={(e) => { e.stopPropagation(); onNavigate("pipelines"); }}
+                  onClick={(e) => { e.stopPropagation(); onNavigate("pipelines", { pipelineId: r.pipeline_id }); }}
                   className="text-xs px-2.5 py-1 bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200 font-medium"
                 >
-                  View Pipeline
+                  View Pipeline Settings
                 </button>
               )}
-              {(r.status === "failed" || r.status === "halted") && (
+              {(r.status === "failed" || r.status === "halted") && onNavigate && (
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     api("POST", `/api/pipelines/${r.pipeline_id}/trigger`)
-                      .then(() => alert("Pipeline triggered for re-run"))
+                      .then(() => {
+                        // Trigger parent refresh after short delay for the run to be created
+                        setTimeout(() => window.dispatchEvent(new CustomEvent("dapos-activity-refresh")), 1000);
+                      })
                       .catch((err) => alert("Error: " + err.message));
                   }}
                   className="text-xs px-2.5 py-1 bg-blue-50 text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-100 font-medium"
@@ -2332,7 +2372,8 @@ function ActivityView({ searchQuery, onNavigate }) {
   const [runs, setRuns] = useState([]);
   const [filter, setFilter] = useState("all");
   const [pipelineFilter, setPipelineFilter] = useState("all");
-  useEffect(() => {
+
+  const loadRuns = useCallback(() => {
     api("GET", "/api/pipelines")
       .then(async (pipelines) => {
         const allRuns = await Promise.all(
@@ -2347,6 +2388,15 @@ function ActivityView({ searchQuery, onNavigate }) {
       })
       .catch(console.error);
   }, []);
+
+  useEffect(() => { loadRuns(); }, [loadRuns]);
+
+  // Listen for refresh events (e.g., after re-run trigger)
+  useEffect(() => {
+    const handler = () => loadRuns();
+    window.addEventListener("dapos-activity-refresh", handler);
+    return () => window.removeEventListener("dapos-activity-refresh", handler);
+  }, [loadRuns]);
 
   const pipelineNames = [...new Set(runs.map((r) => r.pipeline_name).filter(Boolean))].sort();
 
@@ -5815,6 +5865,7 @@ function App() {
   });
   const [tierFilter, setTierFilter] = useState(() => sessionStorage.getItem("pa_tier") || "All");
   const [searchQuery, setSearchQuery] = useState("");
+  const [focusPipelineId, setFocusPipelineId] = useState(null);
   const [authState, setAuthState] = useState(() => {
     const token = getToken();
     const userStr = localStorage.getItem("pa_user");
@@ -5918,8 +5969,11 @@ function App() {
   // Other views render on demand.
   const sq = searchQuery.toLowerCase();
   const otherViews = {
-    pipelines: <PipelinesView tierFilter={tierFilter} searchQuery={sq} />,
-    activity: <ActivityView searchQuery={sq} onNavigate={setView} />,
+    pipelines: <PipelinesView tierFilter={tierFilter} searchQuery={sq} focusPipelineId={focusPipelineId} onFocusClear={() => setFocusPipelineId(null)} />,
+    activity: <ActivityView searchQuery={sq} onNavigate={(viewId, opts) => {
+      setView(viewId);
+      if (opts?.pipelineId) setFocusPipelineId(opts.pipelineId);
+    }} />,
     freshness: <FreshnessView tierFilter={tierFilter} searchQuery={sq} />,
     quality: <QualityView tierFilter={tierFilter} searchQuery={sq} />,
     approvals: <ApprovalsView searchQuery={sq} />,
