@@ -2511,10 +2511,10 @@ def create_app(
     @limiter.limit("100/minute")
     async def list_approvals(
         request: Request,
-        status: str = Query("pending"),
+        status: str = Query(None),
         caller: dict = Depends(auth_dep),
     ):
-        proposals = await store.list_proposals(status=status)
+        proposals = await store.list_proposals(status=status or None)
         results = []
         for p in proposals:
             s = _proposal_summary(p)

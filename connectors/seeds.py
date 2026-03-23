@@ -477,7 +477,10 @@ class RedshiftEngine(TargetEngine):
                     if not os.path.exists(fpath):
                         raise FileNotFoundError(f"Batch file missing: {fpath}")
                     with open(fpath, "r", encoding="utf-8") as csvf:
-                        cur.copy_expert(f\'COPY "{schema}"."{staging}" FROM STDIN CSV HEADER\', csvf)
+                        header_line = csvf.readline().strip()
+                        col_names = [c.strip().strip(\'"\') for c in header_line.split(",")]
+                        col_list = ", ".join(f\'"{c}"\' for c in col_names)
+                        cur.copy_expert(f\'COPY "{schema}"."{staging}" ({col_list}) FROM STDIN WITH CSV\', csvf)
                     rows_loaded += batch.get("rows", 0)
                 conn.commit()
             run.rows_loaded = rows_loaded
@@ -959,8 +962,14 @@ class PostgresTargetEngine(TargetEngine):
                     if not os.path.exists(fpath):
                         raise FileNotFoundError(f"Batch file missing: {fpath}")
                     with open(fpath, "r", encoding="utf-8") as csvf:
+                        # Read header to build explicit column list — prevents
+                        # position mismatch when schema drift adds columns to the
+                        # target table that the CSV does not contain.
+                        header_line = csvf.readline().strip()
+                        col_names = [c.strip().strip(\'"\') for c in header_line.split(",")]
+                        col_list = ", ".join(f\'"{c}"\' for c in col_names)
                         cur.copy_expert(
-                            f\'COPY "{schema}"."{staging}" FROM STDIN WITH CSV HEADER\',
+                            f\'COPY "{schema}"."{staging}" ({col_list}) FROM STDIN WITH CSV\',
                             csvf,
                         )
                     rows_loaded += batch.get("rows", 0)
