@@ -344,33 +344,49 @@ class AgentCore:
             log.warning("Voyage embedding error: %s", exc)
             return []
 
+    @staticmethod
+    def _tag_rule_based(result):
+        """Tag a rule-based fallback result with agent_mode."""
+        if isinstance(result, dict):
+            result["agent_mode"] = "rule_based"
+        return result
+
     def _extract_json(self, text: str) -> dict | list:
         """Extract the first JSON object or array from a Claude response."""
         text = text.strip()
+        parsed = None
         # Try direct parse
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
         except json.JSONDecodeError:
             pass
-        # Find JSON block in markdown fences (object or array)
-        fence_match = re.search(r"```(?:json)?\s*([\[{][\s\S]+?[\]}])\s*```", text)
-        if fence_match:
-            try:
-                return json.loads(fence_match.group(1))
-            except json.JSONDecodeError:
-                pass
-        # Find any JSON array first (for suggest_metrics etc.)
-        arr_match = re.search(r"\[[\s\S]+\]", text)
-        if arr_match:
-            try:
-                return json.loads(arr_match.group(0))
-            except json.JSONDecodeError:
-                pass
-        # Find any JSON object
-        match = re.search(r"\{[\s\S]+\}", text)
-        if match:
-            return json.loads(match.group(0))
-        raise ValueError(f"No JSON found in response: {text[:200]}")
+        if parsed is None:
+            # Find JSON block in markdown fences (object or array)
+            fence_match = re.search(r"```(?:json)?\s*([\[{][\s\S]+?[\]}])\s*```", text)
+            if fence_match:
+                try:
+                    parsed = json.loads(fence_match.group(1))
+                except json.JSONDecodeError:
+                    pass
+        if parsed is None:
+            # Find any JSON array first (for suggest_metrics etc.)
+            arr_match = re.search(r"\[[\s\S]+\]", text)
+            if arr_match:
+                try:
+                    parsed = json.loads(arr_match.group(0))
+                except json.JSONDecodeError:
+                    pass
+        if parsed is None:
+            # Find any JSON object
+            match = re.search(r"\{[\s\S]+\}", text)
+            if match:
+                parsed = json.loads(match.group(0))
+        if parsed is None:
+            raise ValueError(f"No JSON found in response: {text[:200]}")
+        # Tag LLM-sourced results
+        if isinstance(parsed, dict):
+            parsed["agent_mode"] = "llm"
+        return parsed
 
     # ------------------------------------------------------------------
     # propose_strategy
@@ -463,6 +479,7 @@ Respond with a JSON object containing exactly these keys:
         dist_key = merge_keys[0] if merge_keys else None
 
         return {
+            "agent_mode": "rule_based",
             "refresh_type": refresh_type,
             "replication_method": "watermark",
             "incremental_column": inc_col,
@@ -513,6 +530,7 @@ Respond with a JSON object containing exactly these keys:
         """
         if not self.has_api:
             return {
+                "agent_mode": "rule_based",
                 "error": "Topology reasoning requires an API key.",
                 "pipelines": [],
                 "dependencies": [],
@@ -601,6 +619,7 @@ Design the topology and respond with JSON:
         except Exception as e:
             log.warning("Claude API error in design_topology: %s", e)
             return {
+                "agent_mode": "rule_based",
                 "error": str(e),
                 "pipelines": [],
                 "dependencies": [],
@@ -998,6 +1017,7 @@ IMPORTANT:
                 # omit and sensor/hook handled separately
 
         return {
+            "agent_mode": "rule_based",
             "summary": f"Rule-based analysis: {len(parsed_dags)} DAGs parsed. API key required for full agent analysis.",
             "confidence": 0.3,
             "proposed_pipelines": proposed_pipelines,
@@ -1077,6 +1097,7 @@ Use "halt" for dropped columns or type narrowing (e.g. BIGINT -> INT).
 
         if dropped_cols or type_changes:
             return {
+                "agent_mode": "rule_based",
                 "action": "halt",
                 "confidence": 0.9,
                 "reasoning": (
@@ -1092,6 +1113,7 @@ Use "halt" for dropped columns or type narrowing (e.g. BIGINT -> INT).
         all_nullable = all(c.get("nullable", True) for c in new_cols)
         if new_cols and all_nullable:
             return {
+                "agent_mode": "rule_based",
                 "action": "auto_adapt",
                 "confidence": 0.95,
                 "reasoning": (
@@ -1105,6 +1127,7 @@ Use "halt" for dropped columns or type narrowing (e.g. BIGINT -> INT).
             }
 
         return {
+            "agent_mode": "rule_based",
             "action": "propose_change",
             "confidence": 0.8,
             "reasoning": "Schema changes detected. Requires review.",
@@ -1227,6 +1250,7 @@ Rules:
             reasons.append(f"Drop column '{col_name}' (no longer in source)")
 
         return {
+            "agent_mode": "rule_based",
             "migration_sql": migration_sql,
             "reasoning": "; ".join(reasons) if reasons else "No changes needed",
             "risk_assessment": "Rule-based generation — review SQL before approval",
@@ -1321,6 +1345,7 @@ Decision guidelines:
 
         if is_first_run and not failed:
             return {
+                "agent_mode": "rule_based",
                 "decision": "promote_with_warning" if warned else "promote",
                 "reasoning": "First run — establishing baselines. Warnings are expected.",
                 "root_cause": "No prior baselines to compare against",
@@ -1330,6 +1355,7 @@ Decision guidelines:
 
         if failed:
             return {
+                "agent_mode": "rule_based",
                 "decision": "halt",
                 "reasoning": f"Failed checks: {[c.check_name for c in failed]}. Data quality below threshold.",
                 "root_cause": "; ".join(c.detail for c in failed),
@@ -1341,6 +1367,7 @@ Decision guidelines:
             qc = contract.quality_config
             decision = "promote_with_warning" if qc.promote_on_warn else "halt"
             return {
+                "agent_mode": "rule_based",
                 "decision": decision,
                 "reasoning": f"Warning checks: {[c.check_name for c in warned]}. {'Promoting per policy.' if decision == 'promote_with_warning' else 'Halting per policy.'}",
                 "root_cause": "; ".join(c.detail for c in warned),
@@ -1349,6 +1376,7 @@ Decision guidelines:
             }
 
         return {
+            "agent_mode": "rule_based",
             "decision": "promote",
             "reasoning": "All quality checks passed.",
             "root_cause": "None — all checks healthy",
@@ -1428,6 +1456,7 @@ Respond with JSON:
         is_same_error = len(unique_errors) == 1 and len(errors) > 1
 
         return {
+            "agent_mode": "rule_based",
             "diagnosis": f"{'Same error repeating' if is_same_error else 'Multiple failure types'}: {unique_errors[:2]}",
             "pattern": "persistent" if is_same_error else "degrading",
             "recommended_actions": [
@@ -1518,6 +1547,7 @@ Consider:
         else:
             severity = "info"
         return {
+            "agent_mode": "rule_based",
             "severity": severity,
             "is_sla_realistic": True,
             "reasoning": f"Staleness {staleness:.0f}m vs SLA warn={sla_warn}m, critical={sla_critical}m",
@@ -1595,22 +1625,22 @@ Persistent examples: schema mismatch, missing table, authentication failure, dis
     def _rule_based_failure_diagnosis(self, error: str) -> dict:
         error_lower = (error or "").lower()
         if any(w in error_lower for w in ("timeout", "timed out", "connection reset")):
-            return {"root_cause": error, "category": "network", "is_transient": True,
+            return {"agent_mode": "rule_based", "root_cause": error, "category": "network", "is_transient": True,
                     "recommended_action": "Retry — likely transient network issue",
                     "should_retry": True, "should_alert": False}
         if any(w in error_lower for w in ("permission", "authentication", "access denied", "password")):
-            return {"root_cause": error, "category": "config", "is_transient": False,
+            return {"agent_mode": "rule_based", "root_cause": error, "category": "config", "is_transient": False,
                     "recommended_action": "Check credentials and permissions",
                     "should_retry": False, "should_alert": True}
         if any(w in error_lower for w in ("no such table", "relation", "does not exist", "column")):
-            return {"root_cause": error, "category": "schema", "is_transient": False,
+            return {"agent_mode": "rule_based", "root_cause": error, "category": "schema", "is_transient": False,
                     "recommended_action": "Schema mismatch — review source and target table definitions",
                     "should_retry": False, "should_alert": True}
         if any(w in error_lower for w in ("disk", "space", "no space")):
-            return {"root_cause": error, "category": "resource", "is_transient": False,
+            return {"agent_mode": "rule_based", "root_cause": error, "category": "resource", "is_transient": False,
                     "recommended_action": "Free disk space or increase storage",
                     "should_retry": False, "should_alert": True}
-        return {"root_cause": error, "category": "unknown", "is_transient": False,
+        return {"agent_mode": "rule_based", "root_cause": error, "category": "unknown", "is_transient": False,
                 "recommended_action": "Investigate error manually",
                 "should_retry": False, "should_alert": True}
 
@@ -1705,7 +1735,7 @@ Respond with JSON:
         """Fallback halt diagnosis when API is unavailable."""
         failed = [c for c in checks if c.status.value == "fail"]
         if not failed:
-            return {"root_cause": "Quality gate halted with warnings only",
+            return {"agent_mode": "rule_based", "root_cause": "Quality gate halted with warnings only",
                     "category": "unknown", "fix_type": "manual",
                     "fix_sql": [], "fix_config": {},
                     "recommended_action": "Review warning checks and adjust thresholds if acceptable",
@@ -1715,7 +1745,7 @@ Respond with JSON:
         schema_fails = [c for c in failed if "schema" in c.check_name.lower()]
         if schema_fails:
             detail = schema_fails[0].detail
-            return {"root_cause": f"Schema inconsistency: {detail}",
+            return {"agent_mode": "rule_based", "root_cause": f"Schema inconsistency: {detail}",
                     "category": "schema", "fix_type": "alter_schema",
                     "fix_sql": [], "fix_config": {},
                     "recommended_action": "Review type mismatches and apply ALTER TABLE to align target schema",
@@ -1724,7 +1754,7 @@ Respond with JSON:
         # Volume issues
         volume_fails = [c for c in failed if "volume" in c.check_name.lower() or "count" in c.check_name.lower()]
         if volume_fails:
-            return {"root_cause": f"Volume anomaly: {volume_fails[0].detail}",
+            return {"agent_mode": "rule_based", "root_cause": f"Volume anomaly: {volume_fails[0].detail}",
                     "category": "volume", "fix_type": "adjust_quality_config",
                     "fix_sql": [], "fix_config": {"volume_threshold": 3.0},
                     "recommended_action": "Adjust volume z-score threshold or investigate source data",
@@ -1733,13 +1763,13 @@ Respond with JSON:
         # Null issues
         null_fails = [c for c in failed if "null" in c.check_name.lower()]
         if null_fails:
-            return {"root_cause": f"Null rate anomaly: {null_fails[0].detail}",
+            return {"agent_mode": "rule_based", "root_cause": f"Null rate anomaly: {null_fails[0].detail}",
                     "category": "nulls", "fix_type": "adjust_quality_config",
                     "fix_sql": [], "fix_config": {},
                     "recommended_action": "Investigate source data quality or adjust null thresholds",
                     "should_alert": True, "confidence": 0.4, "auto_fixable": False}
 
-        return {"root_cause": failed[0].detail if failed else "Unknown quality issue",
+        return {"agent_mode": "rule_based", "root_cause": failed[0].detail if failed else "Unknown quality issue",
                 "category": "unknown", "fix_type": "manual",
                 "fix_sql": [], "fix_config": {},
                 "recommended_action": "Investigate failed quality checks manually",
@@ -2210,6 +2240,7 @@ Respond with JSON:
                 "reasoning": "Error budget below 5% remaining",
             })
         return {
+            "agent_mode": "rule_based",
             "is_anomalous": len(signals) > 0,
             "signals": signals,
             "reasoning": f"{len(signals)} anomaly signal(s) detected" if signals else "No anomalies",
@@ -3374,6 +3405,7 @@ Respond with JSON:
             recommended_actions.append({"action": "Check pipeline logs and recent run errors", "priority": "high", "automated": False})
 
         return {
+            "agent_mode": "rule_based",
             "root_cause": root_cause,
             "category": category,
             "confidence": 0.5,
@@ -3388,7 +3420,7 @@ Respond with JSON:
         """Analyze downstream impact if a pipeline goes down."""
         p = await self.store.get_pipeline(pipeline_id)
         if not p:
-            return {"error": "Pipeline not found", "impact_severity": "unknown"}
+            return {"error": "Pipeline not found", "impact_severity": "unknown", "agent_mode": "rule_based"}
 
         downstream = await self.store.get_all_downstream_recursive(pipeline_id)
         contracts = await self.store.list_data_contracts(producer_id=pipeline_id)
@@ -3477,6 +3509,7 @@ Respond with JSON:
             severity = "medium"
 
         return {
+            "agent_mode": "rule_based",
             "impact_severity": severity,
             "affected_pipelines": [
                 {
@@ -3583,6 +3616,7 @@ Respond with JSON:
 
         if not all_anomalies:
             return {
+                "agent_mode": "rule_based",
                 "anomalies": [],
                 "cross_pipeline_patterns": [],
                 "platform_health": "healthy",
@@ -3617,6 +3651,7 @@ Respond with JSON: {{"cross_pipeline_patterns": ["pattern 1", ...], "platform_he
             summary = f"{len(all_anomalies)} anomalies detected. {len(recent_failures)} failures in last 24h."
 
         return {
+            "agent_mode": "rule_based",
             "anomalies": all_anomalies,
             "cross_pipeline_patterns": cross_patterns,
             "platform_health": health,
@@ -4071,6 +4106,7 @@ Rules:
         """Simple fallback when no API key available."""
         name = target_table or "transform_output"
         return {
+            "agent_mode": "rule_based",
             "sql": f"-- TODO: Implement transform\n-- Description: {description}\nSELECT 1 AS placeholder",
             "target_table": name,
             "description": description,
@@ -4295,6 +4331,7 @@ Respond with JSON:
 
     def _rule_based_generate_metric_sql(self, target_table: str) -> dict:
         return {
+            "agent_mode": "rule_based",
             "sql_expression": f"SELECT COUNT(*) AS value FROM {target_table}",
             "metric_type": "count",
             "dimensions": [],
@@ -4356,6 +4393,7 @@ Respond with JSON:
         """Rule-based fallback: basic statistical trend detection."""
         if len(snapshots) < 2:
             return {
+                "agent_mode": "rule_based",
                 "trend": "stable",
                 "is_anomalous": False,
                 "anomalies": [],
@@ -4393,6 +4431,7 @@ Respond with JSON:
                 is_anomalous = True
 
         return {
+            "agent_mode": "rule_based",
             "trend": trend,
             "is_anomalous": is_anomalous,
             "anomalies": anomalies,

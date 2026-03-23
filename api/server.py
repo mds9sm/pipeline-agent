@@ -428,6 +428,7 @@ def create_app(
         return {
             "status": "ok",
             "auth_enabled": config.auth_enabled,
+            "agent_mode": "llm" if config.has_api_key else "rule_based",
             "pipelines": len(pipelines),
             "active": len(active),
             "pg_connected": pg_ok,

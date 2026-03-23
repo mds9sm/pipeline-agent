@@ -823,7 +823,7 @@ const NAV = [
   { id: "docs", label: "Docs" },
 ];
 
-function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSearchQuery, user, onLogout, guideStep, onGuideNav, branding, isDark }) {
+function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSearchQuery, user, onLogout, guideStep, onGuideNav, branding, isDark, agentMode }) {
   const guideId = guideStep !== null ? GUIDE_ORDER[guideStep] : null;
   const appName = branding?.app_name || "DAPOS";
   const logoUrl = branding?.logo_url || "";
@@ -925,8 +925,18 @@ function Sidebar({ view, setView, tierFilter, setTierFilter, searchQuery, setSea
           ))}
         </div>
       </div>
+      {agentMode && (
+        <div className={`px-3 pt-2 pb-1 border-t ${sb.border}`}>
+          <div className="flex items-center gap-1.5">
+            <span className={`w-1.5 h-1.5 rounded-full ${agentMode === "llm" ? "bg-green-400" : "bg-amber-400"}`} />
+            <span className={`text-[10px] ${sb.roleText}`}>
+              Agent: {agentMode === "llm" ? "LLM-powered" : "Rule-based"}
+            </span>
+          </div>
+        </div>
+      )}
       {user && (
-        <div className={`px-3 py-3 border-t ${sb.border}`}>
+        <div className={`px-3 py-3 ${agentMode ? "" : "border-t"} ${agentMode ? "" : sb.border}`}>
           <div className="flex items-center justify-between">
             <div>
               <div className={`text-xs ${sb.userText} font-medium`}>{user.username}</div>
@@ -2338,7 +2348,14 @@ function ActivityRunDetail({ r, onNavigate }) {
           {/* Agent diagnosis result */}
           {diagnosis && !diagnosis.error && (
             <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
-              <div className="text-[10px] uppercase text-indigo-400 font-semibold mb-2">Agent Diagnosis</div>
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-[10px] uppercase text-indigo-400 font-semibold">Agent Diagnosis</div>
+                {diagnosis.agent_mode && (
+                  <span className={`text-[9px] px-1.5 py-0.5 rounded font-medium ${diagnosis.agent_mode === "llm" ? "bg-green-100 text-green-700 border border-green-200" : "bg-amber-100 text-amber-700 border border-amber-200"}`}>
+                    {diagnosis.agent_mode === "llm" ? "LLM" : "Rule-based"}
+                  </span>
+                )}
+              </div>
               {(diagnosis.classification || diagnosis.category) && (
                 <div className="flex items-center gap-2 mb-2">
                   <Pill label={diagnosis.classification || diagnosis.category} color={diagnosis.is_transient ? "amber" : "red"} />
@@ -6033,6 +6050,7 @@ function App() {
     return { loggedIn: false, user: null };
   });
   const [authEnabled, setAuthEnabled] = useState(null);
+  const [agentMode, setAgentMode] = useState(null);
   const [guideStep, setGuideStep] = useState(null);
   const [branding, setBranding] = useState({ app_name: "DAPOS", logo_url: "" });
   const [theme, setTheme] = useState(getThemePref);
@@ -6077,6 +6095,7 @@ function App() {
       .then((r) => r.json())
       .then((data) => {
         setAuthEnabled(data.auth_enabled === true);
+        setAgentMode(data.agent_mode || "unknown");
         if (!data.auth_enabled) {
           setAuthState({ loggedIn: true, user: { user_id: "anonymous", username: "anonymous", role: "admin" } });
           if (!localStorage.getItem("pa_onboarding_done")) {
@@ -6164,6 +6183,7 @@ function App() {
         onGuideNav={handleGuideNav}
         branding={branding}
         isDark={resolvedDark}
+        agentMode={agentMode}
       />
       <main className={`flex-1 overflow-y-auto ${resolvedDark ? "bg-slate-900" : "bg-slate-50"}`}>
         <div style={{ display: view === "command" ? "flex" : "none", flexDirection: "column", height: "100%" }}>
