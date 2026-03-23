@@ -1085,6 +1085,12 @@ class ParsedAirflowDag:
     python_imports: list = field(default_factory=list)
     raw_code: str = ""
     parse_warnings: list = field(default_factory=list)
+    # YAML template DAG metadata (Build 34)
+    template_type: str = ""  # "transform", "domo_refresh", "dq_sync", "yaml_template", ""
+    tags: list = field(default_factory=list)
+    env_params: dict = field(default_factory=dict)
+    refill_days: int = 0
+    delta_load: bool = False
 
 
 @dataclass
@@ -1103,6 +1109,7 @@ class MigrationRecord:
     analysis: dict = field(default_factory=dict)
     proposed_pipelines: list = field(default_factory=list)
     proposed_transforms: list = field(default_factory=list)
+    proposed_custom_steps: list = field(default_factory=list)
     proposed_connectors: list = field(default_factory=list)
     proposed_dependencies: list = field(default_factory=list)
     unmapped_tasks: list = field(default_factory=list)
@@ -1111,6 +1118,7 @@ class MigrationRecord:
     created_pipeline_ids: list = field(default_factory=list)
     created_transform_ids: list = field(default_factory=list)
     created_connector_ids: list = field(default_factory=list)
+    additional_context: str = ""
     execution_log: list = field(default_factory=list)
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)

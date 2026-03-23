@@ -49,6 +49,12 @@
 | [Topology Design](agent/topology.md) | Agent-designed multi-pipeline architectures |
 | [Connector Generation](agent/connector-generation.md) | AI-generated source/target connectors |
 
+## Migration
+
+| Topic | Description |
+|-------|-------------|
+| [Airflow Migration](migration/airflow.md) | Migrate Airflow DAGs to DAPOS — upload, analyze, review, execute |
+
 ## Advanced
 
 | Topic | Description |

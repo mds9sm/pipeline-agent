@@ -35,6 +35,8 @@ from contracts.models import (
     StepDefinition, StepType, CheckStatus,
     SqlTransform, MaterializationType,
     MigrationRecord, MigrationStatus,
+    ConnectorRecord, ConnectorType,
+    PipelineContract,
     now_iso, new_id,
 )
 from contracts.store import Store
@@ -3361,6 +3363,7 @@ def create_app(
         from migration.airflow_parser import parse_archive
 
         content_type = request.headers.get("content-type", "")
+        additional_context = ""
         if "multipart/form-data" in content_type:
             form = await request.form()
             upload = form.get("file")
@@ -3368,14 +3371,26 @@ def create_app(
                 raise HTTPException(400, "No file uploaded. Use multipart form with 'file' field.")
             file_bytes = await upload.read()
             filename = getattr(upload, "filename", "upload.zip") or "upload.zip"
+            # Optional additional context (README, architecture docs, team notes)
+            ctx_field = form.get("context")
+            if ctx_field:
+                if hasattr(ctx_field, "read"):
+                    additional_context = (await ctx_field.read()).decode("utf-8", errors="replace")
+                else:
+                    additional_context = str(ctx_field)
         else:
             file_bytes = await request.body()
             filename = request.headers.get("x-filename", "upload.zip")
+            additional_context = request.headers.get("x-migration-context", "")
 
         if len(file_bytes) > 50 * 1024 * 1024:
             raise HTTPException(400, "File too large (max 50MB)")
         if len(file_bytes) < 10:
             raise HTTPException(400, "File is empty or too small")
+
+        # Cap context at 50KB to avoid blowing up the agent prompt
+        if len(additional_context) > 50_000:
+            additional_context = additional_context[:50_000] + "\n... (truncated)"
 
         migration = MigrationRecord(
             migration_name=os.path.splitext(filename)[0],
@@ -3383,10 +3398,11 @@ def create_app(
             uploaded_by=caller.get("username", "unknown"),
             upload_filename=filename,
             upload_size_bytes=len(file_bytes),
+            additional_context=additional_context,
         )
 
-        # Parse the archive
-        parsed_dags, parse_errors = parse_archive(file_bytes, filename)
+        # Parse the archive (Phase 1: AST + config heuristics, Phase 2: repo scan for agent)
+        parsed_dags, parse_errors, repo_scan = parse_archive(file_bytes, filename)
         migration.parsed_dags = parsed_dags
         migration.parse_errors = parse_errors
         migration.total_dags_found = len(parsed_dags)
@@ -3403,6 +3419,11 @@ def create_app(
                 "message": "No valid Airflow DAGs found.",
             }
 
+        # Inject user-provided context into the repo scan for agent analysis
+        if additional_context:
+            repo_scan = repo_scan or {}
+            repo_scan["user_provided_context"] = additional_context
+
         # Analyze with agent
         migration.status = MigrationStatus.ANALYZING
         await store.save_migration(migration)
@@ -3416,12 +3437,14 @@ def create_app(
                 {"connector_name": c.connector_name, "connector_type": c.connector_type.value, "source_target_type": c.source_target_type}
                 for c in existing_c
             ],
+            repo_scan=repo_scan,
         )
 
         migration.status = MigrationStatus.REVIEW
         migration.analysis = analysis
         migration.proposed_pipelines = analysis.get("proposed_pipelines", [])
         migration.proposed_transforms = analysis.get("proposed_transforms", [])
+        migration.proposed_custom_steps = analysis.get("proposed_custom_steps", [])
         migration.proposed_connectors = analysis.get("proposed_connectors", [])
         migration.proposed_dependencies = analysis.get("proposed_dependencies", [])
         migration.unmapped_tasks = analysis.get("unmapped_tasks", [])
@@ -3438,6 +3461,7 @@ def create_app(
             "total_tasks": migration.total_tasks_found,
             "proposed_pipelines": len(migration.proposed_pipelines),
             "proposed_transforms": len(migration.proposed_transforms),
+            "proposed_custom_steps": len(migration.proposed_custom_steps),
             "proposed_connectors": len(migration.proposed_connectors),
             "unmapped_tasks": len(migration.unmapped_tasks),
             "warnings": analysis.get("warnings", []),
@@ -3463,6 +3487,7 @@ def create_app(
                 "confidence": m.confidence,
                 "proposed_pipelines": len(m.proposed_pipelines),
                 "proposed_transforms": len(m.proposed_transforms),
+                "proposed_custom_steps": len(m.proposed_custom_steps),
                 "unmapped_tasks": len(m.unmapped_tasks),
                 "created_at": m.created_at,
             }
@@ -3525,6 +3550,73 @@ def create_app(
         await store.save_migration(m)
         return {"status": "rejected", "migration_id": migration_id}
 
+    @app.post("/api/migration/{migration_id}/reanalyze")
+    @limiter.limit("5/minute")
+    async def reanalyze_migration(
+        request: Request,
+        migration_id: str,
+        caller: dict = Depends(auth_dep),
+    ):
+        """Re-run agent analysis on an existing migration's parsed DAGs."""
+        require_role(caller, "admin", "operator")
+        m = await store.get_migration(migration_id)
+        if not m:
+            raise HTTPException(404, "Migration not found")
+        if not m.parsed_dags:
+            raise HTTPException(400, "No parsed DAGs to analyze")
+
+        # Allow updating context on re-analyze via optional JSON body or form field
+        try:
+            body = await request.json()
+            if body.get("context"):
+                ctx = str(body["context"])[:50_000]
+                m.additional_context = ctx
+        except Exception:
+            pass
+
+        m.status = MigrationStatus.ANALYZING
+        await store.save_migration(m)
+
+        # Build repo_scan with user context if available
+        repo_scan = None
+        if m.additional_context:
+            repo_scan = {"user_provided_context": m.additional_context}
+
+        existing_p = await store.list_pipelines()
+        existing_c = await store.list_connectors(status="active")
+        analysis = await agent.analyze_airflow_migration(
+            m.parsed_dags,
+            existing_pipelines=[_pipeline_summary(p) for p in existing_p],
+            existing_connectors=[
+                {"connector_name": c.connector_name, "connector_type": c.connector_type.value, "source_target_type": c.source_target_type}
+                for c in existing_c
+            ],
+            repo_scan=repo_scan,
+        )
+
+        m.status = MigrationStatus.REVIEW
+        m.analysis = analysis
+        m.proposed_pipelines = analysis.get("proposed_pipelines", [])
+        m.proposed_transforms = analysis.get("proposed_transforms", [])
+        m.proposed_custom_steps = analysis.get("proposed_custom_steps", [])
+        m.proposed_connectors = analysis.get("proposed_connectors", [])
+        m.proposed_dependencies = analysis.get("proposed_dependencies", [])
+        m.unmapped_tasks = analysis.get("unmapped_tasks", [])
+        m.agent_reasoning = analysis.get("reasoning", "")
+        m.confidence = analysis.get("confidence", 0.0)
+        await store.save_migration(m)
+
+        return {
+            "migration_id": migration_id,
+            "status": "review",
+            "summary": analysis.get("summary", ""),
+            "confidence": m.confidence,
+            "proposed_pipelines": len(m.proposed_pipelines),
+            "proposed_transforms": len(m.proposed_transforms),
+            "proposed_custom_steps": len(m.proposed_custom_steps),
+            "unmapped_tasks": len(m.unmapped_tasks),
+        }
+
     @app.post("/api/migration/{migration_id}/execute")
     @limiter.limit("5/minute")
     async def execute_migration(
@@ -3532,7 +3624,7 @@ def create_app(
         migration_id: str,
         caller: dict = Depends(auth_dep),
     ):
-        """Execute an approved migration — create pipelines, transforms, dependencies."""
+        """Execute an approved migration — create connectors, pipelines, transforms, custom steps, dependencies."""
         require_role(caller, "admin", "operator")
         m = await store.get_migration(migration_id)
         if not m:
@@ -3543,32 +3635,131 @@ def create_app(
         m.status = MigrationStatus.EXECUTING
         await store.save_migration(m)
 
+        created_connectors = []
         created_pipelines = []
         created_transforms = []
         exec_log = []
 
         try:
-            # Create pipelines
+            # ── 1. Create connector stubs ──
+            # Stub connectors are created in DRAFT status with empty code.
+            # The user configures credentials and the agent generates code on demand.
+            existing_connectors = await store.list_connectors(status="active")
+            existing_names = {c.connector_name for c in existing_connectors}
+            # Also include draft connectors to avoid duplicates
+            draft_connectors = await store.list_connectors(status="draft")
+            existing_names |= {c.connector_name for c in draft_connectors}
+
+            for pc in m.proposed_connectors:
+                try:
+                    cname = pc.get("connector_name", f"migrated-{new_id()[:8]}")
+                    if cname in existing_names:
+                        exec_log.append({"action": "create_connector", "name": cname, "status": "skipped", "reason": "already exists"})
+                        continue
+                    ct_str = pc.get("source_target_type", "source")
+                    ct = ConnectorType.SOURCE if ct_str == "source" else ConnectorType.TARGET
+                    stub = ConnectorRecord(
+                        connector_name=cname,
+                        connector_type=ct,
+                        source_target_type=pc.get("connector_type", pc.get("type", "")),
+                        generated_by="migration",
+                        interface_version="1.0",
+                        code="",  # Stub — user configures, agent generates code
+                        status=ConnectorStatus.DRAFT,
+                    )
+                    await store.save_connector(stub)
+                    created_connectors.append(stub.connector_id)
+                    existing_names.add(cname)
+                    exec_log.append({
+                        "action": "create_connector",
+                        "name": cname,
+                        "id": stub.connector_id,
+                        "type": pc.get("connector_type", ""),
+                        "source_target": ct_str,
+                        "status": "ok",
+                        "note": f"Draft connector created — configure credentials and generate code via chat: 'generate {cname} connector'",
+                    })
+                except Exception as e:
+                    exec_log.append({"action": "create_connector", "name": pc.get("connector_name", "?"), "status": "error", "error": str(e)})
+
+            # Also create connectors from connection_mapping if present
+            conn_mapping = m.analysis.get("connection_mapping", {})
+            for airflow_conn_id, mapping in conn_mapping.items():
+                try:
+                    dapos_type = mapping.get("dapos_connector_type", "")
+                    cname = f"{dapos_type}-source-v1" if dapos_type else f"migrated-{airflow_conn_id}"
+                    if cname in existing_names:
+                        exec_log.append({"action": "create_connector", "name": cname, "status": "skipped", "reason": f"already exists (maps Airflow conn: {airflow_conn_id})"})
+                        continue
+                    stub = ConnectorRecord(
+                        connector_name=cname,
+                        connector_type=ConnectorType.SOURCE,
+                        source_target_type=dapos_type or airflow_conn_id,
+                        generated_by="migration",
+                        code="",
+                        status=ConnectorStatus.DRAFT,
+                    )
+                    await store.save_connector(stub)
+                    created_connectors.append(stub.connector_id)
+                    existing_names.add(cname)
+                    exec_log.append({
+                        "action": "create_connector",
+                        "name": cname,
+                        "id": stub.connector_id,
+                        "airflow_connection": airflow_conn_id,
+                        "status": "ok",
+                        "note": mapping.get("notes", f"Maps Airflow connection '{airflow_conn_id}' — configure credentials"),
+                    })
+                except Exception as e:
+                    exec_log.append({"action": "create_connector", "name": airflow_conn_id, "status": "error", "error": str(e)})
+
+            # ── 2. Create pipelines ──
             for pp in m.proposed_pipelines:
                 try:
-                    from contracts.models import PipelineContract
                     p = PipelineContract(
                         pipeline_name=pp.get("name", f"migrated-{new_id()[:8]}"),
-                        source_connector_type=pp.get("source_type", ""),
-                        target_connector_type=pp.get("target_type", ""),
-                        schedule_cron=pp.get("schedule_cron", ""),
+                        schedule_cron=pp.get("schedule_cron", "0 * * * *"),
                         refresh_type=pp.get("refresh_type", "full"),
                         load_type=pp.get("load_type", "append"),
                         tier=pp.get("tier", 2),
-                        description=pp.get("description", f"Migrated from Airflow DAG: {pp.get('source_dag_id', '')}"),
+                        status=PipelineStatus.PAUSED,  # Start paused — user configures credentials first
+                        tags={"migrated_from": pp.get("source_dag_id", ""), "source_type": pp.get("source_type", ""), "target_type": pp.get("target_type", "")},
+                        business_context={"description": pp.get("description", f"Migrated from Airflow DAG: {pp.get('source_dag_id', '')}")},
                     )
+                    # Attach custom steps if the pipeline has them
+                    pipeline_steps = []
+                    for cs in m.proposed_custom_steps:
+                        if cs.get("source_dag_id") == pp.get("source_dag_id"):
+                            pipeline_steps.append(StepDefinition(
+                                step_name=cs.get("name", f"step-{new_id()[:6]}"),
+                                step_type=StepType.CUSTOM,
+                                config={
+                                    "language": cs.get("language", "python"),
+                                    "code": cs.get("converted_code", ""),
+                                    "original_operator": cs.get("original_operator", ""),
+                                    "conversion_notes": cs.get("conversion_notes", ""),
+                                },
+                            ))
+                    if pipeline_steps:
+                        p.steps = pipeline_steps
+
                     await store.save_pipeline(p)
                     created_pipelines.append(p.pipeline_id)
-                    exec_log.append({"action": "create_pipeline", "name": p.pipeline_name, "id": p.pipeline_id, "status": "ok"})
+                    needs_config = []
+                    if pp.get("needs_new_connector"):
+                        needs_config.append(f"source connector ({pp.get('source_type', '?')})")
+                    exec_log.append({
+                        "action": "create_pipeline",
+                        "name": p.pipeline_name,
+                        "id": p.pipeline_id,
+                        "status": "ok",
+                        "paused": True,
+                        "note": f"Created paused — configure: {', '.join(needs_config)}" if needs_config else "Created paused — configure credentials to activate",
+                    })
                 except Exception as e:
                     exec_log.append({"action": "create_pipeline", "name": pp.get("name", "?"), "status": "error", "error": str(e)})
 
-            # Create transforms
+            # ── 3. Create SQL transforms ──
             for pt in m.proposed_transforms:
                 try:
                     t = SqlTransform(
@@ -3583,12 +3774,47 @@ def create_app(
                 except Exception as e:
                     exec_log.append({"action": "create_transform", "name": pt.get("name", "?"), "status": "error", "error": str(e)})
 
-            # Create dependencies
+            # ── 4. Create standalone custom steps (not attached to pipelines) ──
+            # Custom steps that don't belong to a proposed pipeline get their own single-step pipeline
+            pipeline_dag_ids = {pp.get("source_dag_id") for pp in m.proposed_pipelines}
+            for cs in m.proposed_custom_steps:
+                if cs.get("source_dag_id") in pipeline_dag_ids:
+                    continue  # Already attached to a pipeline above
+                try:
+                    step_pipeline = PipelineContract(
+                        pipeline_name=cs.get("name", f"custom-step-{new_id()[:8]}"),
+                        status=PipelineStatus.PAUSED,
+                        tags={"migrated_from": cs.get("source_dag_id", ""), "original_operator": cs.get("original_operator", "")},
+                        business_context={"description": cs.get("description", f"Custom step migrated from {cs.get('original_operator', 'Airflow')}")},
+                        steps=[StepDefinition(
+                            step_name=cs.get("name", "main"),
+                            step_type=StepType.CUSTOM,
+                            config={
+                                "language": cs.get("language", "python"),
+                                "code": cs.get("converted_code", ""),
+                                "original_operator": cs.get("original_operator", ""),
+                                "conversion_notes": cs.get("conversion_notes", ""),
+                            },
+                        )],
+                    )
+                    await store.save_pipeline(step_pipeline)
+                    created_pipelines.append(step_pipeline.pipeline_id)
+                    exec_log.append({
+                        "action": "create_custom_step",
+                        "name": step_pipeline.pipeline_name,
+                        "id": step_pipeline.pipeline_id,
+                        "language": cs.get("language", "python"),
+                        "status": "ok",
+                        "note": "Created as paused step-DAG pipeline — review converted code before activating",
+                    })
+                except Exception as e:
+                    exec_log.append({"action": "create_custom_step", "name": cs.get("name", "?"), "status": "error", "error": str(e)})
+
+            # ── 5. Create dependencies ──
+            all_p = await store.list_pipelines()
+            name_to_id = {p.pipeline_name: p.pipeline_id for p in all_p}
             for dep in m.proposed_dependencies:
                 try:
-                    # Resolve pipeline names to IDs
-                    all_p = await store.list_pipelines()
-                    name_to_id = {p.pipeline_name: p.pipeline_id for p in all_p}
                     from_id = name_to_id.get(dep.get("from", ""), "")
                     to_id = name_to_id.get(dep.get("to", ""), "")
                     if from_id and to_id:
@@ -3599,18 +3825,27 @@ def create_app(
                         )
                         await store.save_dependency(d)
                         exec_log.append({"action": "create_dependency", "from": dep.get("from"), "to": dep.get("to"), "status": "ok"})
+                    else:
+                        missing = []
+                        if not from_id:
+                            missing.append(f"upstream '{dep.get('from')}'")
+                        if not to_id:
+                            missing.append(f"downstream '{dep.get('to')}'")
+                        exec_log.append({"action": "create_dependency", "from": dep.get("from"), "to": dep.get("to"), "status": "skipped", "reason": f"Pipeline not found: {', '.join(missing)}"})
                 except Exception as e:
                     exec_log.append({"action": "create_dependency", "status": "error", "error": str(e)})
 
             m.status = MigrationStatus.COMPLETE
             m.created_pipeline_ids = created_pipelines
             m.created_transform_ids = created_transforms
+            m.created_connector_ids = created_connectors
             m.execution_log = exec_log
             m.completed_at = now_iso()
             await store.save_migration(m)
 
             return {
                 "status": "complete",
+                "created_connectors": len(created_connectors),
                 "created_pipelines": len(created_pipelines),
                 "created_transforms": len(created_transforms),
                 "execution_log": exec_log,

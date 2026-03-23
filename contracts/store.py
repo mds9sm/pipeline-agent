@@ -1895,12 +1895,12 @@ class ContractStore:
                 migration_id, migration_name, status, uploaded_by,
                 upload_filename, upload_size_bytes,
                 parsed_dags, parse_errors, total_dags_found, total_tasks_found,
-                analysis, proposed_pipelines, proposed_transforms,
+                analysis, proposed_pipelines, proposed_transforms, proposed_custom_steps,
                 proposed_connectors, proposed_dependencies, unmapped_tasks,
                 agent_reasoning, confidence,
                 created_pipeline_ids, created_transform_ids, created_connector_ids,
-                execution_log, created_at, updated_at, completed_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+                additional_context, execution_log, created_at, updated_at, completed_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
             ON CONFLICT (migration_id) DO UPDATE SET
                 migration_name=EXCLUDED.migration_name, status=EXCLUDED.status,
                 parsed_dags=EXCLUDED.parsed_dags, parse_errors=EXCLUDED.parse_errors,
@@ -1908,6 +1908,7 @@ class ContractStore:
                 analysis=EXCLUDED.analysis,
                 proposed_pipelines=EXCLUDED.proposed_pipelines,
                 proposed_transforms=EXCLUDED.proposed_transforms,
+                proposed_custom_steps=EXCLUDED.proposed_custom_steps,
                 proposed_connectors=EXCLUDED.proposed_connectors,
                 proposed_dependencies=EXCLUDED.proposed_dependencies,
                 unmapped_tasks=EXCLUDED.unmapped_tasks,
@@ -1915,6 +1916,7 @@ class ContractStore:
                 created_pipeline_ids=EXCLUDED.created_pipeline_ids,
                 created_transform_ids=EXCLUDED.created_transform_ids,
                 created_connector_ids=EXCLUDED.created_connector_ids,
+                additional_context=EXCLUDED.additional_context,
                 execution_log=EXCLUDED.execution_log,
                 updated_at=EXCLUDED.updated_at, completed_at=EXCLUDED.completed_at
         """,
@@ -1923,11 +1925,13 @@ class ContractStore:
             json.dumps(m.parsed_dags), json.dumps(m.parse_errors),
             m.total_dags_found, m.total_tasks_found,
             json.dumps(m.analysis), json.dumps(m.proposed_pipelines),
-            json.dumps(m.proposed_transforms), json.dumps(m.proposed_connectors),
-            json.dumps(m.proposed_dependencies), json.dumps(m.unmapped_tasks),
+            json.dumps(m.proposed_transforms), json.dumps(m.proposed_custom_steps),
+            json.dumps(m.proposed_connectors), json.dumps(m.proposed_dependencies),
+            json.dumps(m.unmapped_tasks),
             m.agent_reasoning, m.confidence,
             json.dumps(m.created_pipeline_ids), json.dumps(m.created_transform_ids),
-            json.dumps(m.created_connector_ids), json.dumps(m.execution_log),
+            json.dumps(m.created_connector_ids), m.additional_context,
+            json.dumps(m.execution_log),
             m.created_at, m.updated_at, m.completed_at,
         )
 
@@ -2930,6 +2934,7 @@ CREATE TABLE IF NOT EXISTS migrations (
     analysis JSONB NOT NULL DEFAULT '{}',
     proposed_pipelines JSONB NOT NULL DEFAULT '[]',
     proposed_transforms JSONB NOT NULL DEFAULT '[]',
+    proposed_custom_steps JSONB NOT NULL DEFAULT '[]',
     proposed_connectors JSONB NOT NULL DEFAULT '[]',
     proposed_dependencies JSONB NOT NULL DEFAULT '[]',
     unmapped_tasks JSONB NOT NULL DEFAULT '[]',
@@ -2938,6 +2943,7 @@ CREATE TABLE IF NOT EXISTS migrations (
     created_pipeline_ids JSONB NOT NULL DEFAULT '[]',
     created_transform_ids JSONB NOT NULL DEFAULT '[]',
     created_connector_ids JSONB NOT NULL DEFAULT '[]',
+    additional_context TEXT NOT NULL DEFAULT '',
     execution_log JSONB NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -2983,6 +2989,9 @@ CREATE TABLE IF NOT EXISTS business_knowledge (
     updated_at TEXT NOT NULL DEFAULT '',
     updated_by TEXT NOT NULL DEFAULT ''
 );
+-- Build 34: Migration custom steps
+ALTER TABLE migrations ADD COLUMN IF NOT EXISTS proposed_custom_steps JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE migrations ADD COLUMN IF NOT EXISTS additional_context TEXT NOT NULL DEFAULT '';
 """
 
 def _row_to_migration(row: asyncpg.Record) -> MigrationRecord:
@@ -3005,6 +3014,7 @@ def _row_to_migration(row: asyncpg.Record) -> MigrationRecord:
         analysis=json.loads(row["analysis"]) if row.get("analysis") else {},
         proposed_pipelines=json.loads(row["proposed_pipelines"]) if row.get("proposed_pipelines") else [],
         proposed_transforms=json.loads(row["proposed_transforms"]) if row.get("proposed_transforms") else [],
+        proposed_custom_steps=json.loads(row["proposed_custom_steps"]) if row.get("proposed_custom_steps") else [],
         proposed_connectors=json.loads(row["proposed_connectors"]) if row.get("proposed_connectors") else [],
         proposed_dependencies=json.loads(row["proposed_dependencies"]) if row.get("proposed_dependencies") else [],
         unmapped_tasks=json.loads(row["unmapped_tasks"]) if row.get("unmapped_tasks") else [],
@@ -3013,6 +3023,7 @@ def _row_to_migration(row: asyncpg.Record) -> MigrationRecord:
         created_pipeline_ids=json.loads(row["created_pipeline_ids"]) if row.get("created_pipeline_ids") else [],
         created_transform_ids=json.loads(row["created_transform_ids"]) if row.get("created_transform_ids") else [],
         created_connector_ids=json.loads(row["created_connector_ids"]) if row.get("created_connector_ids") else [],
+        additional_context=row.get("additional_context", ""),
         execution_log=json.loads(row["execution_log"]) if row.get("execution_log") else [],
         created_at=row.get("created_at", ""),
         updated_at=row.get("updated_at", ""),

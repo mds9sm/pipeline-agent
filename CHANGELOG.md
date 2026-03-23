@@ -29,17 +29,55 @@ Format: Each entry records what changed, why, and test results at the time of th
 | 28 | Context API enrichment | **Done** | Auto-context on pipeline runs, cross-pipeline context propagation |
 | 32 | Business context, agent knowledge & metrics reasoning | **Done** | Business knowledge, glossary, KPI definitions feed into agent reasoning |
 | 33 | UI redesign, branding & platform usage | **Done** | Dark sidebar, SVG icons, tier labels, custom branding, GitHub-style usage dashboard |
-| 34 | Pipeline versioning + rollback | Planned | GitOps one-click revert to any prior config, version history UI, diff view, restore with validation |
-| 35 | Webhooks (inbound + outbound) | Planned | Outbound event delivery (run complete, halt, drift) with retry + signatures. Inbound webhook triggers (e.g., Stripe event → trigger sync) |
-| 36 | Freshness SLA dashboards | Planned | Visual SLA burn-down per contract, historical compliance, breach forecasting, per-consumer freshness view |
-| 37 | Multi-worker + resource pools | Planned | Distribute runs across processes/containers + per-source concurrency limits (e.g., max 2 against prod MySQL) |
-| 38 | CDC + streaming ingestion | Planned | Debezium/binlog/WAL capture, micro-batch staging, continuous quality gate, streaming-aware scheduling |
-| 39 | PII detection + column masking | Planned | Agent auto-detects PII via semantic tags (email, SSN, phone), recommends hash/mask at ingest. GDPR/CCPA compliance |
-| 40 | SCD Type 2 + soft deletes | Planned | First-class load strategies: `scd2` (_valid_from/_valid_to columns) and `soft_delete` (_deleted_at). Agent recommends based on table shape |
+| 34 | Airflow migration — context, custom steps, Jinja, YAML parsing | **Done** | Additional context uploads, Python/Bash→custom steps, Jinja conversion, YAML template DAGs, auto-create on execute |
+| 35 | Pipeline versioning + rollback | Planned | GitOps one-click revert to any prior config, version history UI, diff view, restore with validation |
+| 36 | Webhooks (inbound + outbound) | Planned | Outbound event delivery (run complete, halt, drift) with retry + signatures. Inbound webhook triggers (e.g., Stripe event → trigger sync) |
+| 37 | Freshness SLA dashboards | Planned | Visual SLA burn-down per contract, historical compliance, breach forecasting, per-consumer freshness view |
+| 38 | Multi-worker + resource pools | Planned | Distribute runs across processes/containers + per-source concurrency limits (e.g., max 2 against prod MySQL) |
+| 39 | CDC + streaming ingestion | Planned | Debezium/binlog/WAL capture, micro-batch staging, continuous quality gate, streaming-aware scheduling |
+| 40 | PII detection + column masking | Planned | Agent auto-detects PII via semantic tags (email, SSN, phone), recommends hash/mask at ingest. GDPR/CCPA compliance |
+| 41 | SCD Type 2 + soft deletes | Planned | First-class load strategies: `scd2` (_valid_from/_valid_to columns) and `soft_delete` (_deleted_at). Agent recommends based on table shape |
 
 ---
 
 ## [Unreleased]
+
+### Build 34: Airflow Migration — Additional Context, Custom Steps, Jinja Conversion — 2026-03-22 (Claude Opus 4.6)
+
+**Full-featured Airflow migration with additional context uploads, Python/Bash operator conversion, Jinja template mapping, YAML template DAG parsing, and auto-creation of all DAPOS resources on execute.**
+
+#### Added
+- **Additional context on upload** — Upload endpoint accepts optional `context` field (multipart form) or `x-migration-context` header alongside the archive. Allows users to provide README, architecture docs, team notes, or any supplementary information that helps the agent produce more accurate migration plans. Capped at 50KB, stored on MigrationRecord, passed to agent prompt.
+- **Context update on re-analyze** — Re-analyze endpoint accepts optional `context` field in JSON body to update the stored additional context before re-running analysis.
+- **Python/Bash operator conversion** — PythonOperator and BashOperator code is now analyzed and converted to DAPOS custom steps instead of being flagged as unmapped. Airflow-specific code (Variable.get, XCom, hooks) is mapped to DAPOS equivalents.
+- **Jinja template conversion** — 15+ Airflow template variable mappings (`{{ ds }}` → `{{run_date}}`, `{{ execution_date }}` → `{{watermark_after}}`, etc.) plus macro conversion and `{% if/for/set %}` block handling.
+- **YAML template DAG parser** — Parses enterprise YAML-configured DAGs (steps, views, downstream_dags, env params, SQL file references). Generic heuristic detection via config keywords.
+- **Agentic repo scanning** — `scan_archive()` extracts file tree, file counts, config files, SQL files, README for agent context. 3-phase architecture: (1) Python AST, (2) YAML heuristic, (3) agentic analysis with full repo scan.
+- **Auto-create on execute** — Execute endpoint creates all resources: connector stubs (DRAFT), pipelines (PAUSED with custom steps as StepDefinitions), SQL transforms, standalone custom step pipelines, and inter-pipeline dependencies.
+- **Dynamic batch sizing** — Agent prompt batches DAGs based on complexity (5/10/15 batch limit based on total task count) to avoid token truncation.
+- **Increased token limits** — `max_tokens=8192` and `timeout=300s` for migration analysis to handle large repos.
+- **Custom Steps tab in UI** — Migration detail shows converted code with operator badges, language pills, and conversion notes.
+- **Additional Context UI** — "+ Add Context" toggle button with expandable textarea in migration upload area. Context displayed in migration detail overview.
+- **`proposed_custom_steps`** — New field on MigrationRecord, stored in JSONB, included in analysis response and UI.
+- **`additional_context`** — New TEXT field on MigrationRecord and migrations table.
+
+#### Changed
+- `parse_archive()` now returns 3-tuple: `(parsed_dags, parse_errors, repo_scan)` instead of 2-tuple
+- `analyze_airflow_migration()` accepts `repo_scan` parameter with file tree, configs, SQL, README, and user-provided context
+- `_call_claude()` accepts `timeout` and `max_tokens` parameters
+- DAG deduplication by dag_id before agent analysis
+- Migration execution log includes detailed notes, reasons, and skip status per entity
+
+#### Fixed
+- Claude API response truncation (max_tokens=4096 too small for large repos) causing JSON parse failure and silent fallback to rule-based analysis
+- httpx timeout (120s default) too short for large migration analysis
+- `PipelineContract` constructor errors (no `description` field, no `source_connector_type` field)
+- `asdict()` failure on plain dicts passed as steps (now uses proper StepDefinition objects)
+
+#### Tests
+- 7 new migration tests: upload with context, list, get detail, additional_context field, re-analyze with context update, approve, delete
+
+---
 
 ### Build 33: UI Redesign, Branding & Platform Usage Dashboard — 2026-03-22 (Claude Opus 4.6)
 

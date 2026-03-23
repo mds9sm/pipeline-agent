@@ -54,6 +54,28 @@ All endpoints require JWT authentication unless noted. Pass the token as `Author
 | POST | `/api/connectors/{id}/test` | Test connector | operator+ |
 | POST | `/api/connectors/{id}/deprecate` | Deprecate connector | admin |
 
+## Airflow Migration
+
+| Method | Endpoint | Description | Role |
+|--------|----------|-------------|------|
+| GET | `/api/migration` | List all migrations | viewer+ |
+| POST | `/api/migration/upload` | Upload Airflow archive with optional `context` form field | operator+ |
+| GET | `/api/migration/{id}` | Migration detail (parsed DAGs, analysis, proposals, context) | viewer+ |
+| POST | `/api/migration/{id}/approve` | Approve migration plan | operator+ |
+| POST | `/api/migration/{id}/reject` | Reject migration | operator+ |
+| POST | `/api/migration/{id}/reanalyze` | Re-run agent analysis (optional `context` in JSON body) | operator+ |
+| POST | `/api/migration/{id}/execute` | Execute — create connectors, pipelines, transforms, steps | operator+ |
+| DELETE | `/api/migration/{id}` | Delete migration | admin |
+
+**Upload with context:**
+```bash
+curl -X POST /api/migration/upload \
+  -F "file=@airflow_dags.zip" \
+  -F "context=README content, architecture docs, team notes..."
+```
+
+The `context` field is optional (max 50KB). It provides additional knowledge to the agent about the repo's conventions, connections, patterns, etc. that may not be discoverable from the code alone.
+
 ## Approvals
 
 | Method | Endpoint | Description | Role |

@@ -493,6 +493,19 @@ When pgvector embeddings are enabled (set `VOYAGE_API_KEY`), preferences are emb
 | `PUT` | `/api/settings/business-knowledge` | Update business knowledge |
 | `POST` | `/api/settings/business-knowledge/parse-kpis` | Parse free-text KPIs |
 
+### Airflow Migration
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/migration` | List all migrations |
+| `POST` | `/api/migration/upload` | Upload Airflow archive (zip/tar.gz) with optional `context` field for additional docs |
+| `GET` | `/api/migration/{id}` | Migration detail (parsed DAGs, analysis, proposed resources) |
+| `POST` | `/api/migration/{id}/approve` | Approve migration plan (optional: filter pipeline/transform selections) |
+| `POST` | `/api/migration/{id}/reject` | Reject migration |
+| `POST` | `/api/migration/{id}/reanalyze` | Re-run agent analysis (optional: update `context` in JSON body) |
+| `POST` | `/api/migration/{id}/execute` | Execute approved migration — creates connectors, pipelines, transforms, custom steps, dependencies |
+| `DELETE` | `/api/migration/{id}` | Delete migration |
+
 ### Connector Migrations
 
 | Method | Path | Description |
@@ -571,6 +584,9 @@ pipeline-agent/
 ├── transforms/
 │   └── engine.py            # SQL transform engine — ref/var resolution, materialization
 │
+├── migration/
+│   └── airflow_parser.py    # Airflow migration — AST + YAML heuristic + repo scan (3-phase)
+│
 ├── mcp_server.py            # MCP server — 12 resources, 24 tools, 3 prompts
 │
 ├── docs/                    # Structured documentation
@@ -639,6 +655,7 @@ Connection pooling is managed via asyncpg with configurable min/max pool sizes (
 | `business_knowledge` | Company context, glossary, KPI definitions (singleton) |
 | `interactions` | Chat interaction audit log |
 | `changelog` | Pipeline change history with reasons |
+| `migrations` | Airflow migration lifecycle (parsed DAGs, analysis, proposed resources, additional context) |
 
 ### Migrations
 

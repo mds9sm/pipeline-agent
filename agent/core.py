@@ -252,6 +252,8 @@ class AgentCore:
         pipeline_id: str = "",
         operation: str = "",
         temperature: float = 0.1,
+        max_tokens: int = 4096,
+        timeout: int = 120,
     ) -> str:
         """Call Claude API, track token usage via AgentCostLog, return content text."""
         if not self.has_api:
@@ -264,7 +266,7 @@ class AgentCore:
             system = _SYSTEM_PROMPT + self._bk_cache
 
         t0 = time.monotonic()
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -274,7 +276,7 @@ class AgentCore:
                 },
                 json={
                     "model": self.config.model,
-                    "max_tokens": 4096,
+                    "max_tokens": max_tokens,
                     "temperature": temperature,
                     "system": system,
                     "messages": [{"role": "user", "content": user_msg}],
@@ -615,8 +617,14 @@ Design the topology and respond with JSON:
         parsed_dags: list[dict],
         existing_pipelines: Optional[list[dict]] = None,
         existing_connectors: Optional[list[dict]] = None,
+        repo_scan: Optional[dict] = None,
     ) -> dict:
         """Analyze parsed Airflow DAGs and propose DAPOS equivalents.
+
+        The repo_scan (if provided) gives the agent structural context about the
+        repo — file tree, config files, SQL files, README — so it can understand
+        non-standard DAG patterns (YAML templates, config factories, etc.) that
+        the AST parser can't capture.
 
         Returns a structured migration plan with proposed pipelines, transforms,
         connectors, dependencies, and unmapped tasks.
@@ -632,9 +640,57 @@ Design the topology and respond with JSON:
             lines = [f"  - {c.get('connector_name', '?')} ({c.get('connector_type', '?')}, {c.get('source_target_type', '?')})" for c in existing_connectors[:20]]
             existing_text += "\n\nAvailable DAPOS connectors:\n" + "\n".join(lines)
 
+        # Include repo structure context for agent to understand non-standard patterns
+        repo_context = ""
+        if repo_scan:
+            file_counts = repo_scan.get("file_counts", {})
+            total = repo_scan.get("total_files", 0)
+            repo_context += f"\n\nRepo structure ({total} files): {json.dumps(file_counts)}"
+            # Include file tree (truncated)
+            tree = repo_scan.get("file_tree", [])
+            if tree:
+                repo_context += "\n\nFile tree (sample):\n" + "\n".join(f"  {f}" for f in tree[:80])
+            # Include README if present
+            readme = repo_scan.get("readme", "")
+            if readme:
+                repo_context += f"\n\nREADME:\n{readme[:2000]}"
+            # Include sample config files the AST parser couldn't handle
+            configs = repo_scan.get("config_files", [])
+            unmatched_configs = [c for c in configs if not any(
+                kw in c.get("content", "") for kw in ("schedule_interval", "steps:", "conn_id")
+            )]
+            if unmatched_configs:
+                repo_context += "\n\nConfig files not matched by parser (may define DAGs via custom patterns):"
+                for cfg in unmatched_configs[:5]:
+                    repo_context += f"\n--- {cfg['path']} ---\n{cfg['content'][:1000]}"
+            # Include sample SQL files (for context on what the DAGs do)
+            sqls = repo_scan.get("sql_files", [])
+            if sqls:
+                repo_context += f"\n\nSQL files ({len(sqls)} total, showing samples):"
+                for sf in sqls[:5]:
+                    repo_context += f"\n--- {sf['path']} ---\n{sf['content'][:500]}"
+            # Include user-provided additional context (README, architecture docs, team notes)
+            user_ctx = repo_scan.get("user_provided_context", "")
+            if user_ctx:
+                repo_context += f"\n\n=== USER-PROVIDED CONTEXT (architecture docs, README, team notes) ===\n{user_ctx[:5000]}"
+
         # Summarize parsed DAGs for the prompt (truncate raw_code)
+        # Deduplicate by dag_id (old buggy parser could create duplicates)
+        seen_ids = set()
+        unique_dags = []
+        for dag in parsed_dags:
+            did = dag.get("dag_id", "")
+            if did and did in seen_ids:
+                continue
+            seen_ids.add(did)
+            unique_dags.append(dag)
+
+        # Scale batch size based on total tasks to avoid output truncation
+        total_tasks = sum(len(d.get("tasks", [])) for d in unique_dags)
+        batch_limit = 5 if total_tasks > 50 else 10 if total_tasks > 20 else 15
+
         dag_summaries = []
-        for dag in parsed_dags[:30]:  # Limit to 30 DAGs per analysis batch
+        for dag in unique_dags[:batch_limit]:
             summary = {
                 "dag_id": dag.get("dag_id", ""),
                 "file_path": dag.get("file_path", ""),
@@ -643,8 +699,17 @@ Design the topology and respond with JSON:
                 "connections": dag.get("connections_referenced", []),
                 "variables": dag.get("variables_referenced", []),
             }
+            # Include YAML template metadata if present
+            if dag.get("template_type"):
+                summary["template_type"] = dag["template_type"]
+            if dag.get("refill_days"):
+                summary["refill_days"] = dag["refill_days"]
+            if dag.get("delta_load"):
+                summary["delta_load"] = dag["delta_load"]
+            if dag.get("env_params"):
+                summary["env_params"] = dag["env_params"]
             for task in dag.get("tasks", []):
-                summary["tasks"].append({
+                task_summary = {
                     "task_id": task.get("task_id", ""),
                     "operator_class": task.get("operator_class", ""),
                     "sql": task.get("sql", "")[:500],
@@ -653,7 +718,19 @@ Design the topology and respond with JSON:
                     "connection_id": task.get("connection_id", ""),
                     "depends_on": task.get("depends_on", []),
                     "dapos_mapping": task.get("dapos_mapping", {}),
-                })
+                }
+                # Include function source code for Python operators
+                if task.get("python_source"):
+                    task_summary["python_source"] = task["python_source"][:1500]
+                # Include Jinja template conversion warnings
+                if task.get("jinja_warnings"):
+                    task_summary["jinja_warnings"] = task["jinja_warnings"]
+                # YAML template metadata
+                if task.get("batch_processing"):
+                    task_summary["batch_processing"] = True
+                if task.get("sql_file_ref"):
+                    task_summary["sql_file_ref"] = task["sql_file_ref"]
+                summary["tasks"].append(task_summary)
             dag_summaries.append(summary)
 
         user_prompt = f"""
@@ -664,12 +741,38 @@ DAPOS capabilities:
 - Pipelines: source connector -> target connector, with schedule_cron, quality gates
 - SQL Transforms: ref() for dependencies, var() for variables, 4 materialization strategies (table, view, incremental, ephemeral)
 - Step DAGs: compose steps (extract, transform, quality_gate, promote, cleanup, hook, sensor, custom)
+- Custom steps: execute Python or Bash code as part of a step DAG (perfect for PythonOperator/BashOperator migration)
+- Post-promotion hooks: SQL executed after pipeline runs, with template variables ({{watermark_after}}, {{run_id}}, etc.)
 - Dependencies: pipelines can trigger downstream pipelines on completion
 - Data contracts: formalize producer/consumer relationships with freshness SLAs
+
+YAML Template DAG patterns (common in enterprise Airflow repos):
+- YAML config files define DAGs with steps, schedule, env-specific params
+- SQL files contain the actual transform logic
+- template_type "transform" → DAPOS SQL Transforms with appropriate materialization
+- template_type "domo_refresh" → Custom step (S3 UNLOAD + API call)
+- template_type "dq_sync" → DAPOS quality gate checks
+- batch_processing: true → DAPOS incremental materialization with lookback window
+- refill_days → watermark lookback window
+- delta_load: true → incremental refresh, false → full refresh
+- downstream_dags → DAPOS pipeline dependencies (data_triggered)
+- env_params (nonprod/prd schemas) → DAPOS template variables
+
+Airflow-to-DAPOS conversion rules for Python/Bash code:
+- Variable.get("key") → DAPOS template var {{var_key}} or pipeline config
+- XCom pull/push → DAPOS run context (upstream_metadata, template variables)
+- airflow.hooks.* (PostgresHook, S3Hook, etc.) → DAPOS connector execution (already handled by pipeline steps)
+- airflow.models.Connection → DAPOS connector credentials
+- context["ds"], context["execution_date"] → DAPOS template vars {{run_date}}, {{watermark_after}}
+- ti.xcom_push/pull → DAPOS run context propagation (automatic between pipeline steps)
+- PythonOperator with simple data logic → often convertible to SQL Transform
+- PythonOperator with API calls/notifications → custom step with cleaned-up Python
+- BashOperator with simple commands → custom step or post-promotion hook
 
 Parsed Airflow DAGs:
 {json.dumps(dag_summaries, indent=2, default=str)}
 {existing_text}
+{repo_context}
 
 For each Airflow DAG, propose the DAPOS equivalent. Respond with JSON:
 {{
@@ -716,12 +819,26 @@ For each Airflow DAG, propose the DAPOS equivalent. Respond with JSON:
       "type": "data_triggered or scheduled"
     }}
   ],
+  "proposed_custom_steps": [
+    {{
+      "name": "step-name",
+      "description": "what this step does",
+      "source_dag_id": "original dag_id",
+      "source_task_id": "original task_id",
+      "original_operator": "PythonOperator/BashOperator/etc",
+      "step_type": "custom",
+      "language": "python or bash",
+      "converted_code": "cleaned-up code with Airflow imports replaced by DAPOS equivalents",
+      "conversion_notes": "what was changed and why",
+      "refs": ["upstream step/transform/pipeline names this depends on"]
+    }}
+  ],
   "unmapped_tasks": [
     {{
       "dag_id": "source dag",
       "task_id": "task that couldn't be mapped",
       "operator_class": "original operator",
-      "reason": "why it can't be mapped",
+      "reason": "why it TRULY can't be converted (e.g. deep Airflow internals, external system dependency)",
       "suggestion": "what the user should do manually"
     }}
   ],
@@ -739,19 +856,28 @@ IMPORTANT:
 - Convert Airflow schedule presets: @daily -> "0 0 * * *", @hourly -> "0 * * * *", etc.
 - SQL operators map to DAPOS SQL Transforms
 - Transfer operators (S3ToRedshift, etc.) map to DAPOS pipelines
-- PythonOperator/BashOperator should be flagged as unmapped with suggestions
+- PythonOperator/BashOperator: ALWAYS attempt conversion to proposed_custom_steps with translated code. Airflow is open source — all patterns are known. Replace Airflow imports/APIs with DAPOS equivalents. Only flag as unmapped if the code has truly unconvertible external dependencies.
 - Sensors map to DAPOS event-driven triggers or dependencies
 - Preserve the dependency graph structure
+- Keep SQL in proposed_transforms SHORT — just the core logic, not full verbose queries
+- Keep converted_code concise — just the essential logic with DAPOS equivalents
+- Keep descriptions concise (1 sentence max)
+- Analyzing {len(unique_dags)} unique DAGs total{f' (showing first {batch_limit})' if len(unique_dags) > batch_limit else ''}
+- If repo structure context is provided, use it to understand patterns the parser may have missed — look for config-driven DAGs, template factories, SQL files that reveal the actual data pipeline logic
+- The repo README often explains the architecture, refresh patterns, and data flow — use it for better migration decisions
 """
         try:
             text = await self._call_claude(
                 self._system_prompt(), user_prompt,
                 operation="analyze_airflow_migration",
                 temperature=0.2,
+                max_tokens=8192,
+                timeout=300,
             )
             result = self._extract_json(text)
             result.setdefault("proposed_pipelines", [])
             result.setdefault("proposed_transforms", [])
+            result.setdefault("proposed_custom_steps", [])
             result.setdefault("proposed_connectors", [])
             result.setdefault("proposed_dependencies", [])
             result.setdefault("unmapped_tasks", [])
@@ -760,7 +886,7 @@ IMPORTANT:
             result.setdefault("reasoning", "")
             return result
         except Exception as e:
-            log.warning("Claude API error in analyze_airflow_migration: %s", e)
+            log.warning("Claude API error in analyze_airflow_migration: %s: %s", type(e).__name__, e)
             return self._rule_based_airflow_migration(parsed_dags)
 
     def _rule_based_airflow_migration(self, parsed_dags: list[dict]) -> dict:
@@ -769,6 +895,7 @@ IMPORTANT:
 
         proposed_pipelines = []
         proposed_transforms = []
+        proposed_custom_steps = []
         unmapped = []
 
         schedule_map = {
@@ -776,6 +903,23 @@ IMPORTANT:
             "@weekly": "0 0 * * 0", "@monthly": "0 0 1 * *",
             "@yearly": "0 0 1 1 *", "@once": "",
         }
+
+        # Airflow → DAPOS code conversion patterns
+        AIRFLOW_REPLACEMENTS = [
+            ("from airflow", "# (airflow import removed)"),
+            ("Variable.get(", "os.environ.get("),
+            ("ti.xcom_push(", "# xcom_push → DAPOS run context propagates automatically\n# "),
+            ("ti.xcom_pull(", "# xcom_pull → use DAPOS template vars: {{upstream_metadata.*}}\n# "),
+            ("context['ds']", "# use DAPOS template var: {{run_date}}"),
+            ("context['execution_date']", "# use DAPOS template var: {{watermark_after}}"),
+        ]
+
+        def _convert_python_code(source: str) -> str:
+            """Mechanically convert Airflow-specific Python to DAPOS-compatible code."""
+            code = source
+            for old, new in AIRFLOW_REPLACEMENTS:
+                code = code.replace(old, new)
+            return code
 
         for dag in parsed_dags:
             dag_id = dag.get("dag_id", "unknown")
@@ -809,26 +953,61 @@ IMPORTANT:
                         "sql": task.get("sql", ""),
                         "materialization": "table",
                     })
-                elif dapos_type in ("custom", "unsupported"):
+                elif dapos_type == "custom":
+                    # Convert Python/Bash operators to custom steps
+                    python_source = task.get("python_source", "")
+                    bash_cmd = task.get("bash_command", "")
+                    if python_source or bash_cmd:
+                        lang = "bash" if bash_cmd and not python_source else "python"
+                        original_code = bash_cmd if lang == "bash" else python_source
+                        converted = _convert_python_code(original_code) if lang == "python" else original_code
+                        proposed_custom_steps.append({
+                            "name": f"{dag_id}-{task_id}",
+                            "description": f"Converted from {op}",
+                            "source_dag_id": dag_id,
+                            "source_task_id": task_id,
+                            "original_operator": op,
+                            "step_type": "custom",
+                            "language": lang,
+                            "converted_code": converted[:2000],
+                            "conversion_notes": "Mechanical conversion — review Airflow-specific patterns.",
+                            "refs": task.get("depends_on", []),
+                        })
+                    else:
+                        # No source code available — still mark as custom step with placeholder
+                        proposed_custom_steps.append({
+                            "name": f"{dag_id}-{task_id}",
+                            "description": f"Converted from {op} (callable: {task.get('python_callable', 'unknown')})",
+                            "source_dag_id": dag_id,
+                            "source_task_id": task_id,
+                            "original_operator": op,
+                            "step_type": "custom",
+                            "language": "python",
+                            "converted_code": f"# TODO: Implement logic from {task.get('python_callable', op)}",
+                            "conversion_notes": "Function source not available in parsed file — implement manually.",
+                            "refs": task.get("depends_on", []),
+                        })
+                elif dapos_type == "unsupported":
                     unmapped.append({
                         "dag_id": dag_id,
                         "task_id": task_id,
                         "operator_class": op,
-                        "reason": mapping.get("reason", f"{op} requires manual review"),
-                        "suggestion": "Implement as a custom step or external process",
+                        "reason": mapping.get("reason", f"{op} has no DAPOS equivalent"),
+                        "suggestion": "Implement as external process or custom step",
                     })
                 # omit and sensor/hook handled separately
 
         return {
-            "summary": f"Rule-based analysis: {len(parsed_dags)} DAGs parsed. API key required for detailed analysis.",
+            "summary": f"Rule-based analysis: {len(parsed_dags)} DAGs parsed. API key required for full agent analysis.",
             "confidence": 0.3,
             "proposed_pipelines": proposed_pipelines,
             "proposed_transforms": proposed_transforms,
+            "proposed_custom_steps": proposed_custom_steps,
             "proposed_connectors": [],
             "proposed_dependencies": [],
             "unmapped_tasks": unmapped,
-            "reasoning": "Rule-based fallback (no API key). Operator types mapped mechanically.",
-            "warnings": ["Agent-based analysis unavailable — results are approximate."],
+            "reasoning": "Rule-based fallback (no API key). Operator types mapped mechanically. Python/Bash operators converted to custom steps.",
+            "warnings": ["Agent-based analysis unavailable — results are approximate. Custom step conversions need manual review."],
         }
 
     # ------------------------------------------------------------------

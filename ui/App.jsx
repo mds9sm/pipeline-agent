@@ -3956,6 +3956,8 @@ function MigrationView() {
   const [uploadMsg, setUploadMsg] = useState("");
   const [selected, setSelected] = useState(null);
   const [detail, setDetail] = useState(null);
+  const [contextText, setContextText] = useState("");
+  const [showContext, setShowContext] = useState(false);
   const fileRef = useRef(null);
 
   const load = useCallback(async () => {
@@ -3976,6 +3978,7 @@ function MigrationView() {
     try {
       const formData = new FormData();
       formData.append("file", file);
+      if (contextText.trim()) formData.append("context", contextText.trim());
       const token = getToken();
       const res = await fetch("/api/migration/upload", {
         method: "POST",
@@ -4026,6 +4029,19 @@ function MigrationView() {
     }
   };
 
+  const handleReanalyze = async () => {
+    if (!selected) return;
+    setUploadMsg("Re-analyzing with agent...");
+    try {
+      const result = await api("POST", `/api/migration/${selected}/reanalyze`);
+      setUploadMsg(`Re-analysis complete. Confidence: ${((result.confidence || 0) * 100).toFixed(0)}%. ${result.proposed_pipelines || 0} pipelines, ${result.proposed_transforms || 0} transforms, ${result.proposed_custom_steps || 0} custom steps proposed.`);
+      api("GET", `/api/migration/${selected}`).then(setDetail);
+      load();
+    } catch (err) {
+      setUploadMsg("Error: " + err.message);
+    }
+  };
+
   const statusColor = (s) => {
     const map = { review: "amber", complete: "green", approved: "blue", executing: "blue", failed: "red", rejected: "red" };
     return map[s] || "gray";
@@ -4036,6 +4052,12 @@ function MigrationView() {
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-lg font-semibold text-slate-800">Airflow Migration</h1>
         <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowContext(!showContext)}
+            className="text-xs px-3 py-2 border border-slate-300 text-slate-600 rounded-lg hover:bg-slate-50 font-medium"
+          >
+            {showContext ? "Hide Context" : "+ Add Context"}
+          </button>
           <button
             onClick={() => fileRef.current?.click()}
             disabled={uploading}
@@ -4052,6 +4074,18 @@ function MigrationView() {
           />
         </div>
       </div>
+      {showContext && (
+        <div className="mb-4">
+          <label className="block text-xs font-medium text-slate-500 mb-1">Additional Context (README, architecture docs, team notes)</label>
+          <textarea
+            value={contextText}
+            onChange={(e) => setContextText(e.target.value)}
+            placeholder="Paste any additional context about the Airflow repo here — README, architecture docs, team conventions, connection details, etc. This helps the agent produce more accurate migration plans."
+            className="w-full h-32 text-xs font-mono border border-slate-300 rounded-lg p-3 text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-y"
+          />
+          <div className="text-xs text-slate-400 mt-1">{contextText.length > 0 ? `${contextText.length} characters` : "Optional — improves analysis accuracy for non-standard DAG patterns"}</div>
+        </div>
+      )}
       {uploadMsg && (
         <div className={`text-xs mb-4 px-3 py-2 rounded-lg ${uploadMsg.startsWith("Error") ? "bg-red-50 text-red-600 border border-red-200" : "bg-blue-50 text-blue-700 border border-blue-200"}`}>
           {uploadMsg}
@@ -4097,14 +4131,14 @@ function MigrationView() {
               Select a migration or upload a new Airflow archive
             </div>
           )}
-          {detail && <MigrationDetail detail={detail} onApprove={() => handleAction("approve")} onReject={() => handleAction("reject")} onExecute={handleExecute} />}
+          {detail && <MigrationDetail detail={detail} onApprove={() => handleAction("approve")} onReject={() => handleAction("reject")} onExecute={handleExecute} onReanalyze={handleReanalyze} />}
         </div>
       </div>
     </div>
   );
 }
 
-function MigrationDetail({ detail, onApprove, onReject, onExecute }) {
+function MigrationDetail({ detail, onApprove, onReject, onExecute, onReanalyze }) {
   const [tab, setTab] = useState("overview");
   const d = detail;
   const status = typeof d.status === "string" ? d.status : d.status?.value || "";
@@ -4121,6 +4155,9 @@ function MigrationDetail({ detail, onApprove, onReject, onExecute }) {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {(status === "review" || status === "complete" || status === "rejected") && (
+              <button onClick={onReanalyze} className="text-xs px-3 py-1.5 bg-slate-100 text-slate-500 rounded-lg hover:bg-slate-200">Re-analyze</button>
+            )}
             {status === "review" && (
               <React.Fragment>
                 <button onClick={onApprove} className="text-xs px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium">Approve</button>
@@ -4153,6 +4190,10 @@ function MigrationDetail({ detail, onApprove, onReject, onExecute }) {
             <div className="text-lg font-semibold text-purple-600">{(d.proposed_transforms || []).length}</div>
           </div>
           <div className="bg-slate-50 rounded-lg px-3 py-2">
+            <div className="text-slate-400">Custom Steps</div>
+            <div className="text-lg font-semibold text-teal-600">{(d.proposed_custom_steps || []).length}</div>
+          </div>
+          <div className="bg-slate-50 rounded-lg px-3 py-2">
             <div className="text-slate-400">Unmapped</div>
             <div className="text-lg font-semibold text-amber-600">{(d.unmapped_tasks || []).length}</div>
           </div>
@@ -4169,6 +4210,7 @@ function MigrationDetail({ detail, onApprove, onReject, onExecute }) {
           { id: "overview", label: "Overview" },
           { id: "pipelines", label: `Pipelines (${(d.proposed_pipelines || []).length})` },
           { id: "transforms", label: `Transforms (${(d.proposed_transforms || []).length})` },
+          { id: "custom", label: `Custom Steps (${(d.proposed_custom_steps || []).length})` },
           { id: "unmapped", label: `Unmapped (${(d.unmapped_tasks || []).length})` },
           { id: "dags", label: `Parsed DAGs (${(d.parsed_dags || []).length})` },
           ...(d.execution_log?.length ? [{ id: "log", label: "Execution Log" }] : []),
@@ -4201,6 +4243,12 @@ function MigrationDetail({ detail, onApprove, onReject, onExecute }) {
                 <ul className="text-xs text-slate-600 space-y-1">
                   {d.analysis.warnings.map((w, i) => <li key={i} className="flex gap-1"><span className="text-amber-500">⚠</span> {w}</li>)}
                 </ul>
+              </div>
+            )}
+            {d.additional_context && (
+              <div>
+                <div className="text-xs font-medium text-slate-500 mb-1">User-Provided Context</div>
+                <div className="text-xs text-slate-600 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 max-h-40 overflow-y-auto font-mono">{d.additional_context}</div>
               </div>
             )}
             {d.analysis?.connection_mapping && Object.keys(d.analysis.connection_mapping).length > 0 && (
@@ -4270,6 +4318,27 @@ function MigrationDetail({ detail, onApprove, onReject, onExecute }) {
           </div>
         )}
 
+        {tab === "custom" && (
+          <div className="space-y-3">
+            {(d.proposed_custom_steps || []).length === 0 && <div className="text-xs text-slate-400">No custom steps proposed.</div>}
+            {(d.proposed_custom_steps || []).map((cs, i) => (
+              <div key={i} className="border border-teal-200 bg-teal-50 rounded-lg p-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-sm font-medium text-slate-700">{cs.name}</span>
+                  <Pill label={cs.language || "python"} color="teal" />
+                  <Pill label={cs.original_operator} color="slate" />
+                </div>
+                {cs.description && <div className="text-xs text-slate-500 mb-1">{cs.description}</div>}
+                {cs.converted_code && (
+                  <pre className="text-xs bg-slate-50 border border-slate-200 rounded p-2 mt-1 overflow-x-auto whitespace-pre-wrap">{cs.converted_code}</pre>
+                )}
+                {cs.conversion_notes && <div className="text-xs text-blue-600 mt-1">{cs.conversion_notes}</div>}
+                <div className="text-xs text-slate-400 mt-1 italic">from: {cs.source_dag_id}/{cs.source_task_id}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
         {tab === "unmapped" && (
           <div className="space-y-3">
             {(d.unmapped_tasks || []).length === 0 && <div className="text-xs text-slate-400">All tasks mapped successfully.</div>}
@@ -4319,11 +4388,16 @@ function MigrationDetail({ detail, onApprove, onReject, onExecute }) {
         {tab === "log" && (
           <div className="space-y-1">
             {(d.execution_log || []).map((entry, i) => (
-              <div key={i} className="flex items-center gap-2 text-xs py-1">
-                <StatusDot status={entry.status === "ok" ? "complete" : "failed"} />
-                <span className="text-slate-600">{entry.action}</span>
-                <span className="font-mono text-slate-500">{entry.name || ""}</span>
-                {entry.error && <span className="text-red-500">{entry.error}</span>}
+              <div key={i} className="border border-slate-100 rounded-lg p-2">
+                <div className="flex items-center gap-2 text-xs">
+                  <StatusDot status={entry.status === "ok" ? "complete" : entry.status === "skipped" ? "pending" : "failed"} />
+                  <span className="text-slate-600 font-medium">{entry.action}</span>
+                  <span className="font-mono text-slate-500">{entry.name || ""}</span>
+                  {entry.status === "skipped" && <Pill label="skipped" color="amber" />}
+                  {entry.error && <span className="text-red-500">{entry.error}</span>}
+                </div>
+                {entry.note && <div className="text-xs text-slate-400 mt-0.5 ml-5">{entry.note}</div>}
+                {entry.reason && <div className="text-xs text-amber-500 mt-0.5 ml-5">{entry.reason}</div>}
               </div>
             ))}
           </div>

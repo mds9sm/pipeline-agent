@@ -93,6 +93,7 @@ PostgreSQL 16 + pgvector (all state: connectors, pipelines, runs, gates, prefere
 | `gitops/repo.py` | Separate git repo manager for pipeline YAML + connector code versioning |
 | `cli/__main__.py` | CLI interface — 14 commands, token caching, fuzzy pipeline resolution |
 | `transforms/engine.py` | SQL transform engine — ref/var resolution, materialization, validation, lineage parsing |
+| `migration/airflow_parser.py` | Airflow migration parser — Python AST + YAML heuristic + repo scan. 3-phase: deterministic parse, config detection, agentic analysis |
 | `mcp_server.py` | MCP server — 12 resources, 24 tools, 3 prompts; exposes DAPOS to AI agents via Model Context Protocol (incl. metrics) |
 | `docs/` | Structured documentation — quickstart, architecture, concepts, API/CLI reference |
 
@@ -198,6 +199,7 @@ Docker services: `demo-mysql` (e-commerce data), `demo-mongo` (analytics events)
 | Metrics / KPIs | 8 | suggest, create, list, get, update, trend, delete, chat routing (Build 31) |
 | Context API | 5 | context chain, run context, detail field, PATCH toggle, 404 handling (Build 28) |
 | Business context & agent knowledge | 9 | system prompt, business knowledge GET/PUT/persist, parse-kpis, metrics suggest reasoning, metric create with reasoning, reasoning_history, reasoning update on PATCH (Build 32) |
+| Airflow migration | 7 | upload with context, list, get detail, additional_context field, re-analyze with context update, approve, delete (Build 34) |
 
 ### Adding New Tests
 

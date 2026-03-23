@@ -121,6 +121,7 @@ These methods use Claude to reason about signals in context. Each has a `_rule_b
 | `analyze_impact` | Downstream impact if a pipeline breaks |
 | `reason_about_anomalies` | Platform-wide anomaly detection (orchestrates per-pipeline evaluation) |
 | `design_topology` | Multi-pipeline architecture from business description |
+| `analyze_airflow_migration` | Analyze parsed Airflow DAGs, propose DAPOS pipelines/transforms/connectors/custom steps with repo context |
 | `parse_schedule` | Natural language → cron expression |
 | `guided_pipeline_response` | Multi-turn pipeline creation conversation |
 | `suggest_metrics` | Suggest KPI metrics for a pipeline's target table |

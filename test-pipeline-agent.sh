@@ -3112,6 +3112,127 @@ fi
 fi # --api (Build 32)
 
 # ============================================================================
+# Airflow Migration API (Build 34)
+# ============================================================================
+
+section "Airflow Migration API"
+
+# Create a minimal test DAG archive for migration testing
+MIGRATION_ZIP="/tmp/test_migration_dags.zip"
+MIGRATION_DIR="/tmp/test_migration_dags"
+rm -rf "$MIGRATION_DIR" "$MIGRATION_ZIP"
+mkdir -p "$MIGRATION_DIR/dags"
+cat > "$MIGRATION_DIR/dags/test_dag.py" << 'PYEOF'
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime
+
+def my_task():
+    print("hello")
+
+dag = DAG("test_migration_dag", start_date=datetime(2024,1,1), schedule_interval="@daily")
+t1 = PythonOperator(task_id="run_task", python_callable=my_task, dag=dag)
+PYEOF
+(cd "$MIGRATION_DIR" && zip -r "$MIGRATION_ZIP" dags/ > /dev/null 2>&1)
+
+# Test 1: Upload migration with additional context
+test_name "POST /api/migration/upload with context"
+MIGRATION_RESP=$(curl -s -m 120 \
+    -X POST \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    -F "file=@$MIGRATION_ZIP" \
+    -F "context=This is a test repo with a simple DAG that runs a Python function daily." \
+    "$API_URL/api/migration/upload")
+MIG_ID=$(echo "$MIGRATION_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('migration_id',''))" 2>/dev/null)
+MIG_STATUS=$(echo "$MIGRATION_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+if [ -n "$MIG_ID" ] && [ "$MIG_STATUS" != "failed" ]; then
+    pass "Upload migration with context returned migration_id=$MIG_ID"
+else
+    warn "Migration upload returned status=$MIG_STATUS (agent may be unavailable)"
+    # Try to extract ID even on failure
+    MIG_ID=$(echo "$MIGRATION_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('migration_id',''))" 2>/dev/null)
+fi
+
+# Test 2: List migrations
+test_name "GET /api/migration"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    "$API_URL/api/migration")
+if [ "$CODE" = "200" ]; then
+    pass "GET /api/migration returns 200"
+else
+    fail "Expected 200 for migration list, got $CODE"
+fi
+
+# Test 3: Get migration detail
+if [ -n "$MIG_ID" ]; then
+    test_name "GET /api/migration/{id} detail"
+    DETAIL_RESP=$(curl -s -m 10 \
+        -H "Authorization: Bearer $AUTH_TOKEN" \
+        "$API_URL/api/migration/$MIG_ID")
+    HAS_CONTEXT=$(echo "$DETAIL_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('additional_context') else 'no')" 2>/dev/null)
+    if [ "$HAS_CONTEXT" = "yes" ]; then
+        pass "Migration detail includes additional_context field"
+    else
+        warn "Migration detail missing additional_context"
+    fi
+
+    # Test 4: Verify additional_context content
+    test_name "Migration additional_context preserved"
+    CTX_VAL=$(echo "$DETAIL_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('additional_context','')[:20])" 2>/dev/null)
+    if echo "$CTX_VAL" | grep -q "test repo"; then
+        pass "additional_context contains uploaded text"
+    else
+        warn "additional_context content mismatch: '$CTX_VAL'"
+    fi
+
+    # Test 5: Re-analyze with updated context
+    test_name "POST /api/migration/{id}/reanalyze with context update"
+    REANALYZE_CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 120 \
+        -X POST \
+        -H "Authorization: Bearer $AUTH_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"context":"Updated context: this repo uses Redshift as the data warehouse."}' \
+        "$API_URL/api/migration/$MIG_ID/reanalyze")
+    if [ "$REANALYZE_CODE" = "200" ]; then
+        pass "Re-analyze with context update returns 200"
+    else
+        warn "Re-analyze returned $REANALYZE_CODE (agent may be slow)"
+    fi
+
+    # Test 6: Approve migration (if in review status)
+    test_name "POST /api/migration/{id}/approve"
+    APPROVE_CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
+        -X POST \
+        -H "Authorization: Bearer $AUTH_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{}' \
+        "$API_URL/api/migration/$MIG_ID/approve")
+    if [ "$APPROVE_CODE" = "200" ]; then
+        pass "Approve migration returns 200"
+    else
+        warn "Approve returned $APPROVE_CODE (migration may not be in review status)"
+    fi
+
+    # Test 7: Delete migration
+    test_name "DELETE /api/migration/{id}"
+    DEL_CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
+        -X DELETE \
+        -H "Authorization: Bearer $AUTH_TOKEN" \
+        "$API_URL/api/migration/$MIG_ID")
+    if [ "$DEL_CODE" = "200" ]; then
+        pass "Delete migration returns 200"
+    else
+        fail "Expected 200 for delete migration, got $DEL_CODE"
+    fi
+else
+    skip "No migration ID — skipping detail/reanalyze/approve/delete tests"
+fi
+
+# Cleanup temp files
+rm -rf "$MIGRATION_DIR" "$MIGRATION_ZIP"
+
+# ============================================================================
 # Summary
 # ============================================================================
 END_TIME=$(date +%s)
@@ -3182,6 +3303,7 @@ echo "  - Pipeline changelog: per-pipeline, global, in detail response (Build 21
 echo "  - Interaction audit: list, export (Build 21)"
 echo "  - Context API: context chain, run context, detail field, PATCH toggle, 404 (Build 28)"
 echo "  - Business context & agent knowledge: system prompt, business knowledge CRUD, parse-kpis, metric reasoning (Build 32)"
+echo "  - Airflow migration: upload with context, list, get detail, additional_context, re-analyze, approve, delete"
 echo ""
 
 exit $FAIL_COUNT
