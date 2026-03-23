@@ -2064,8 +2064,10 @@ function ExecutionLogWithCode({ log, sourceConnectorId, targetConnectorId }) {
   );
 }
 
-function ActivityRunDetail({ r }) {
+function ActivityRunDetail({ r, onNavigate }) {
   const [expanded, setExpanded] = useState(false);
+  const [diagnosis, setDiagnosis] = useState(null);
+  const [diagnosing, setDiagnosing] = useState(false);
   const duration = r.started_at && r.completed_at
     ? Math.round((new Date(r.completed_at) - new Date(r.started_at)) / 1000)
     : null;
@@ -2234,22 +2236,102 @@ function ActivityRunDetail({ r }) {
           {/* Error detail */}
           {r.error && (
             <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-              <div className="text-[10px] uppercase text-red-400 font-semibold mb-1">Error</div>
+              <div className="flex items-center justify-between mb-1">
+                <div className="text-[10px] uppercase text-red-400 font-semibold">Error</div>
+                {!diagnosis && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setDiagnosing(true);
+                      api("POST", `/api/pipelines/${r.pipeline_id}/diagnose`)
+                        .then((d) => setDiagnosis(d))
+                        .catch((err) => setDiagnosis({ error: err.message }))
+                        .finally(() => setDiagnosing(false));
+                    }}
+                    disabled={diagnosing}
+                    className="text-xs px-2.5 py-1 bg-red-100 text-red-700 border border-red-200 rounded-lg hover:bg-red-200 font-medium disabled:opacity-50"
+                  >
+                    {diagnosing ? "Diagnosing..." : "Diagnose with Agent"}
+                  </button>
+                )}
+              </div>
               <div className="text-xs text-red-700 font-mono whitespace-pre-wrap">{r.error}</div>
             </div>
           )}
 
-          {/* Run ID */}
-          <div className="text-[10px] font-mono text-slate-400">Run ID: {r.run_id}</div>
+          {/* Agent diagnosis result */}
+          {diagnosis && !diagnosis.error && (
+            <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase text-indigo-400 font-semibold mb-2">Agent Diagnosis</div>
+              {diagnosis.classification && (
+                <div className="flex items-center gap-2 mb-2">
+                  <Pill label={diagnosis.classification} color={diagnosis.is_transient ? "amber" : "red"} />
+                  {diagnosis.is_transient != null && <span className="text-xs text-slate-500">{diagnosis.is_transient ? "Transient — may auto-recover" : "Persistent — needs attention"}</span>}
+                </div>
+              )}
+              {diagnosis.root_cause && (
+                <div className="mb-2">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-0.5">Root Cause</div>
+                  <div className="text-xs text-slate-600">{diagnosis.root_cause}</div>
+                </div>
+              )}
+              {diagnosis.recommended_action && (
+                <div className="mb-2">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-0.5">Recommended Action</div>
+                  <div className="text-xs text-slate-600">{diagnosis.recommended_action}</div>
+                </div>
+              )}
+              {diagnosis.reasoning && (
+                <div>
+                  <div className="text-[10px] text-slate-400 font-semibold mb-0.5">Full Reasoning</div>
+                  <div className="text-xs text-slate-600 whitespace-pre-wrap">{diagnosis.reasoning}</div>
+                </div>
+              )}
+            </div>
+          )}
+          {diagnosis && diagnosis.error && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-700">
+              Diagnosis failed: {diagnosis.error}
+            </div>
+          )}
+
+          {/* Action row: View Pipeline + Run ID */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              {onNavigate && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onNavigate("pipelines"); }}
+                  className="text-xs px-2.5 py-1 bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200 font-medium"
+                >
+                  View Pipeline
+                </button>
+              )}
+              {(r.status === "failed" || r.status === "halted") && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    api("POST", `/api/pipelines/${r.pipeline_id}/trigger`)
+                      .then(() => alert("Pipeline triggered for re-run"))
+                      .catch((err) => alert("Error: " + err.message));
+                  }}
+                  className="text-xs px-2.5 py-1 bg-blue-50 text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-100 font-medium"
+                >
+                  Re-run
+                </button>
+              )}
+            </div>
+            <div className="text-[10px] font-mono text-slate-400">Run ID: {r.run_id}</div>
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function ActivityView({ searchQuery }) {
+function ActivityView({ searchQuery, onNavigate }) {
   const [runs, setRuns] = useState([]);
   const [filter, setFilter] = useState("all");
+  const [pipelineFilter, setPipelineFilter] = useState("all");
   useEffect(() => {
     api("GET", "/api/pipelines")
       .then(async (pipelines) => {
@@ -2266,34 +2348,47 @@ function ActivityView({ searchQuery }) {
       .catch(console.error);
   }, []);
 
+  const pipelineNames = [...new Set(runs.map((r) => r.pipeline_name).filter(Boolean))].sort();
+
   const searched = searchQuery ? runs.filter((r) => r.pipeline_name?.toLowerCase().includes(searchQuery)) : runs;
-  const filtered = filter === "all" ? searched
-    : filter === "failed" ? searched.filter((r) => r.status === "failed" || r.status === "halted")
-    : filter === "complete" ? searched.filter((r) => r.status === "complete")
-    : searched;
+  const filtered = searched
+    .filter((r) => filter === "all" ? true : filter === "failed" ? (r.status === "failed" || r.status === "halted") : r.status === filter)
+    .filter((r) => pipelineFilter === "all" || r.pipeline_name === pipelineFilter);
 
   return (
     <div className="px-6 py-4">
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-lg font-semibold text-slate-800">Activity</h1>
-        <div className="flex gap-1">
-          {["all", "complete", "failed"].map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
-                filter === f
-                  ? "bg-slate-800 text-white"
-                  : "bg-slate-100 text-slate-500 hover:bg-slate-200"
-              }`}
+        <div className="flex items-center gap-3">
+          {pipelineNames.length > 1 && (
+            <select
+              value={pipelineFilter}
+              onChange={(e) => setPipelineFilter(e.target.value)}
+              className="text-xs px-2 py-1 border border-slate-300 rounded-lg bg-white text-slate-600 outline-none"
             >
-              {f === "all" ? `All (${runs.length})` : f === "complete" ? "Completed" : "Failed/Halted"}
-            </button>
-          ))}
+              <option value="all">All pipelines</option>
+              {pipelineNames.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          )}
+          <div className="flex gap-1">
+            {["all", "complete", "failed"].map((f) => (
+              <button
+                key={f}
+                onClick={() => setFilter(f)}
+                className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                  filter === f
+                    ? "bg-slate-800 text-white"
+                    : "bg-slate-100 text-slate-500 hover:bg-slate-200"
+                }`}
+              >
+                {f === "all" ? `All (${runs.length})` : f === "complete" ? "Completed" : "Failed/Halted"}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        {filtered.map((r) => <ActivityRunDetail key={r.run_id} r={r} />)}
+        {filtered.map((r) => <ActivityRunDetail key={r.run_id} r={r} onNavigate={onNavigate} />)}
         {filtered.length === 0 && (
           <div className="text-sm text-slate-400 py-8 text-center">No activity yet.</div>
         )}
@@ -2930,51 +3025,61 @@ function ApprovalCard({ p, isPending, note, setNote, onResolve, connectorCode, s
 }
 
 function ApprovalsView({ searchQuery }) {
-  const [pending, setPending] = useState([]);
-  const [resolved, setResolved] = useState([]);
+  const [approvals, setApprovals] = useState([]);
   const [note, setNote] = useState({});
   const [connectorCode, setConnectorCode] = useState({});
   const [expandedCode, setExpandedCode] = useState({});
   const [testResults, setTestResults] = useState({});
   const [testing, setTesting] = useState({});
-  const [showResolved, setShowResolved] = useState(false);
+  const [statusFilter, setStatusFilter] = useState("pending");
+  const [typeFilter, setTypeFilter] = useState("all");
 
-  useEffect(() => {
-    api("GET", "/api/approvals?status=pending").then(setPending).catch(console.error);
-    // Fetch all non-pending: applied, approved, rejected, rolled_back
-    api("GET", "/api/approvals")
-      .then((all) => setResolved(all.filter((p) => p.status !== "pending")))
-      .catch(console.error);
-  }, []);
+  const load = useCallback(() => {
+    const qs = statusFilter === "all" ? "" : `?status=${statusFilter}`;
+    api("GET", `/api/approvals${qs}`).then(setApprovals).catch(console.error);
+  }, [statusFilter]);
+
+  useEffect(() => { load(); }, [load]);
 
   async function handleResolve(id, action) {
     await api("POST", `/api/approvals/${id}`, { action, note: note[id] || "" });
-    const resolved_item = pending.find((x) => x.proposal_id === id);
-    setPending((p) => p.filter((x) => x.proposal_id !== id));
-    if (resolved_item) {
-      setResolved((r) => [{ ...resolved_item, status: action === "approve" ? "applied" : "rejected", resolved_at: new Date().toISOString() }, ...r]);
-    }
+    load();
   }
 
-  const matchApproval = (p) => !searchQuery ||
-    (p.reasoning || "").toLowerCase().includes(searchQuery) ||
-    (p.change_type || "").toLowerCase().includes(searchQuery) ||
-    (p.pipeline_name || "").toLowerCase().includes(searchQuery) ||
-    (p.connector_name || "").toLowerCase().includes(searchQuery);
-  const filteredPending = pending.filter(matchApproval);
-  const filteredResolved = resolved.filter(matchApproval);
+  // Derive filter options from data
+  const allTypes = [...new Set(approvals.map((p) => p.change_type).filter(Boolean))];
+  const allResolvedBy = [...new Set(approvals.map((p) => p.resolved_by).filter(Boolean))];
 
-  const breakingCount = filteredPending.filter((p) => p.impact_analysis?.breaking_change).length;
+  const filtered = approvals
+    .filter((p) => typeFilter === "all" || p.change_type === typeFilter)
+    .filter((p) => !searchQuery ||
+      (p.reasoning || "").toLowerCase().includes(searchQuery) ||
+      (p.change_type || "").toLowerCase().includes(searchQuery) ||
+      (p.pipeline_name || "").toLowerCase().includes(searchQuery) ||
+      (p.connector_name || "").toLowerCase().includes(searchQuery) ||
+      (p.resolved_by || "").toLowerCase().includes(searchQuery)
+    );
+
+  const pendingCount = approvals.filter((p) => p.status === "pending").length;
+  const breakingCount = filtered.filter((p) => p.impact_analysis?.breaking_change).length;
   const sharedProps = { note, setNote, connectorCode, setConnectorCode, expandedCode, setExpandedCode, testResults, setTestResults, testing, setTesting };
+
+  const statusOptions = [
+    { value: "pending", label: "Pending", count: null },
+    { value: "approved", label: "Approved" },
+    { value: "applied", label: "Applied" },
+    { value: "rejected", label: "Rejected" },
+    { value: "all", label: "All" },
+  ];
 
   return (
     <div className="px-6 py-4">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
           <h1 className="text-lg font-semibold text-slate-800">Approvals</h1>
-          {filteredPending.length > 0 && (
+          {pendingCount > 0 && (
             <span className="text-xs px-2.5 py-1 bg-amber-100 text-amber-700 rounded-full font-medium">
-              {filteredPending.length} pending
+              {pendingCount} pending
             </span>
           )}
           {breakingCount > 0 && (
@@ -2983,39 +3088,50 @@ function ApprovalsView({ searchQuery }) {
             </span>
           )}
         </div>
-        <button
-          onClick={() => setShowResolved(!showResolved)}
-          className={`text-xs px-3 py-1 rounded-lg font-medium transition-colors ${
-            showResolved ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"
-          }`}
-        >
-          {showResolved ? "Hide" : "Show"} Resolved ({filteredResolved.length})
-        </button>
       </div>
 
-      {/* Pending */}
-      {filteredPending.length > 0 ? (
-        <div className="space-y-3 mb-6">
-          {filteredPending.map((p) => (
-            <ApprovalCard key={p.proposal_id} p={p} isPending={true} onResolve={handleResolve} {...sharedProps} />
+      {/* Filter bar */}
+      <div className="flex items-center gap-3 mb-4 flex-wrap">
+        {/* Status pills */}
+        <div className="flex gap-1">
+          {statusOptions.map((opt) => (
+            <button
+              key={opt.value}
+              onClick={() => setStatusFilter(opt.value)}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                statusFilter === opt.value
+                  ? "bg-slate-800 text-white"
+                  : "bg-slate-100 text-slate-500 hover:bg-slate-200"
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        {/* Change type dropdown */}
+        {allTypes.length > 1 && (
+          <select
+            value={typeFilter}
+            onChange={(e) => setTypeFilter(e.target.value)}
+            className="text-xs px-2 py-1 border border-slate-300 rounded-lg bg-white text-slate-600 outline-none"
+          >
+            <option value="all">All types</option>
+            {allTypes.map((t) => <option key={t} value={t}>{t.replace(/_/g, " ")}</option>)}
+          </select>
+        )}
+        <span className="text-xs text-slate-400">{filtered.length} result{filtered.length !== 1 ? "s" : ""}</span>
+      </div>
+
+      {/* Results */}
+      {filtered.length > 0 ? (
+        <div className="space-y-3">
+          {filtered.map((p) => (
+            <ApprovalCard key={p.proposal_id} p={p} isPending={p.status === "pending"} onResolve={handleResolve} {...sharedProps} />
           ))}
         </div>
       ) : (
-        <div className="text-sm text-slate-400 py-8 text-center mb-6 bg-green-50 border border-green-200 rounded-xl">
-          No pending approvals — all structural changes reviewed.
-        </div>
-      )}
-
-      {/* Resolved */}
-      {showResolved && (
-        <div>
-          <div className="text-sm font-medium text-slate-400 mb-3">Resolved</div>
-          <div className="space-y-2">
-            {filteredResolved.map((p) => (
-              <ApprovalCard key={p.proposal_id} p={p} isPending={false} onResolve={handleResolve} {...sharedProps} />
-            ))}
-            {filteredResolved.length === 0 && <div className="text-xs text-slate-300 text-center py-4">No resolved proposals yet.</div>}
-          </div>
+        <div className="text-sm text-slate-400 py-8 text-center bg-slate-50 border border-slate-200 rounded-xl">
+          {statusFilter === "pending" ? "No pending approvals — all structural changes reviewed." : "No matching approvals."}
         </div>
       )}
     </div>
@@ -5803,7 +5919,7 @@ function App() {
   const sq = searchQuery.toLowerCase();
   const otherViews = {
     pipelines: <PipelinesView tierFilter={tierFilter} searchQuery={sq} />,
-    activity: <ActivityView searchQuery={sq} />,
+    activity: <ActivityView searchQuery={sq} onNavigate={setView} />,
     freshness: <FreshnessView tierFilter={tierFilter} searchQuery={sq} />,
     quality: <QualityView tierFilter={tierFilter} searchQuery={sq} />,
     approvals: <ApprovalsView searchQuery={sq} />,
